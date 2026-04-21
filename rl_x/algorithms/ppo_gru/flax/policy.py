@@ -18,7 +18,6 @@ def get_policy(config, env):
         return (Policy(
                     env.single_action_space.shape,
                     config.algorithm.std_dev,
-                    config.algorithm.nr_hidden_units,
                     config.algorithm.obs_encoding_dim,
                     config.algorithm.gru_hidden_dim,
                     config.algorithm.gru_obs_combine_method,
@@ -34,7 +33,6 @@ def get_policy(config, env):
 class Policy(nn.Module):
     as_shape: Sequence[int]
     std_dev: float
-    nr_hidden_units: int
     obs_encoding_dim: int
     gru_hidden_dim: int
     gru_obs_combine_method: str
@@ -58,8 +56,10 @@ class Policy(nn.Module):
             self.gru_film_gamma = nn.Dense(self.obs_encoding_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
             self.gru_film_beta = nn.Dense(self.obs_encoding_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
 
-        self.torso_dense1 = nn.Dense(self.nr_hidden_units, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
-        self.torso_dense2 = nn.Dense(self.nr_hidden_units, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.torso_dense1 = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.torso_ln1 = nn.LayerNorm()
+        self.torso_dense2 = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.torso_dense3 = nn.Dense(128, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
 
         self.mean_head = nn.Dense(act_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))
         self.logstd = self.param("policy_logstd", constant(jnp.log(self.std_dev)), (1, np.prod(self.as_shape).item()))
@@ -73,7 +73,7 @@ class Policy(nn.Module):
         x = obs[..., self.policy_observation_indices]
         x = self.obs_encoder_dense(x)
         x = self.obs_encoder_ln(x)
-        x = nn.tanh(x)
+        x = nn.elu(x)
         return x
 
 
@@ -81,13 +81,13 @@ class Policy(nn.Module):
         x = obs[..., self.policy_observation_indices]
         x = self.gru_obs_encoder_dense(x)
         x = self.gru_obs_encoder_ln(x)
-        x = nn.tanh(x)
+        x = nn.elu(x)
         return x
 
 
     def decode(self, obs_latent, gru_latent):
         gru_latent = self.gru_ln(gru_latent)
-        gru_latent = nn.tanh(gru_latent)
+        gru_latent = nn.elu(gru_latent)
 
         if self.gru_obs_combine_method == "concat":
             torso_in = jnp.concatenate([obs_latent, gru_latent], axis=-1)
@@ -97,9 +97,12 @@ class Policy(nn.Module):
             torso_in = obs_latent * gamma + beta
 
         h = self.torso_dense1(torso_in)
-        h = nn.tanh(h)
+        h = self.torso_ln1(h)
+        h = nn.elu(h)
         h = self.torso_dense2(h)
-        h = nn.tanh(h)
+        h = nn.elu(h)
+        h = self.torso_dense3(h)
+        h = nn.elu(h)
 
         mean = self.mean_head(h)
 

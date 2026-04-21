@@ -148,13 +148,11 @@ class DummyEnv:
         self.policy_observation_indices = jnp.array(policy_observation_indices, dtype=jnp.int32)
 
 
-def build_initial_states(config, env):
+def build_initial_policy_state(config, env):
     key = jax.random.PRNGKey(config.environment.seed)
-    key, policy_key, critic_key = jax.random.split(key, 3)
+    key, policy_key = jax.random.split(key, 2)
 
     policy, _ = get_policy(config, env)
-    critic = get_critic(config, env)
-
     batch_size = config.environment.nr_envs * config.algorithm.nr_steps
     nr_updates = config.algorithm.total_timesteps // batch_size
     nr_minibatches = batch_size // config.algorithm.minibatch_size
@@ -186,16 +184,7 @@ def build_initial_states(config, env):
         ),
     )
 
-    critic_state = TrainState.create(
-        apply_fn=critic.apply,
-        params=critic.init(critic_key, dummy_obs),
-        tx=optax.chain(
-            optax.clip_by_global_norm(config.algorithm.max_grad_norm),
-            optax.inject_hyperparams(optax.adam)(learning_rate=learning_rate),
-        ),
-    )
-
-    return policy_state, critic_state
+    return policy_state
 
 
 def main():
@@ -255,16 +244,15 @@ def main():
             policy_observation_indices=policy_observation_indices,
         )
 
-        policy_state, critic_state = build_initial_states(config, dummy_env)
+        policy_state = build_initial_policy_state(config, dummy_env)
 
         target = {
             "policy": policy_state,
-            "critic": critic_state,
         }
 
         restore_args = orbax_utils.restore_args_from_target(target)
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-        restored = checkpointer.restore(str(tmpdir), item=target, restore_args=restore_args)
+        restored = checkpointer.restore(str(tmpdir), item=target, restore_args=restore_args, partial_restore=True)
 
         policy_state = restored["policy"]
         flax_policy_params = policy_state.params["params"]
