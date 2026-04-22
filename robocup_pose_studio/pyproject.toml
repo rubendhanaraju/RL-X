@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robocup-pose-studio"
+version = "0.1.0"
+description = "Standalone pose and keyframe editor for the RoboCup Booster T1 MuJoCo robot."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mujoco",
+  "numpy",
+  "scipy",
+  "glfw",
+  "pygame",
+]
+
+[project.scripts]
+robocup-pose-studio = "robocup_pose_studio.editor:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+robocup_pose_studio = [
+  "assets/plane.xml",
+  "assets/assets/*",
+]
