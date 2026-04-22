@@ -1,4 +1,5 @@
 import os
+
 os.environ["JAX_PLATFORMS"] = "cpu"
 
 import argparse
@@ -24,7 +25,6 @@ from rl_x.environments.action_space_type import ActionSpaceType
 from rl_x.environments.observation_space_type import ObservationSpaceType
 
 from torch_policy import TorchPolicyGRU
-
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -65,10 +65,8 @@ def convert_policy(flax_policy_params, policy_observation_indices):
     gru_obs_combine_method = "film" if "gru_film_gamma" in p else "concat"
 
     if len(policy_observation_indices) != expected_policy_obs_dim:
-        raise ValueError(
-            f"policy_observation_indices length {len(policy_observation_indices)} does not match "
-            f"expected policy obs dim {expected_policy_obs_dim}."
-        )
+        raise ValueError(f"policy_observation_indices length {len(policy_observation_indices)} does not match "
+                         f"expected policy obs dim {expected_policy_obs_dim}.")
 
     state_dict = {}
 
@@ -115,6 +113,7 @@ def convert_policy(flax_policy_params, policy_observation_indices):
 
 
 class SimpleBox:
+
     def __init__(self, low, high, shape, dtype=np.float32):
         self.shape = tuple(shape)
         self.dtype = dtype
@@ -128,6 +127,7 @@ class DummyGeneralProperties:
 
 
 class DummyEnv:
+
     def __init__(self, obs_dim, action_dim, policy_observation_indices=None):
         self.single_observation_space = SimpleBox(
             low=-np.inf,
@@ -161,11 +161,7 @@ def build_initial_policy_state(config, env):
         fraction = 1.0 - (count // (nr_minibatches * config.algorithm.nr_epochs)) / nr_updates
         return config.algorithm.learning_rate * fraction
 
-    learning_rate = (
-        linear_schedule
-        if config.algorithm.anneal_learning_rate
-        else config.algorithm.learning_rate
-    )
+    learning_rate = (linear_schedule if config.algorithm.anneal_learning_rate else config.algorithm.learning_rate)
 
     dummy_obs = jnp.zeros((1, env.single_observation_space.shape[0]), dtype=jnp.float32)
     dummy_policy_gru_carry = policy.initialize_carry(1)
