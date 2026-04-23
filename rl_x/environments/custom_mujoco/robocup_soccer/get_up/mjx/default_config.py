@@ -1,3 +1,4 @@
+import numpy as np
 from ml_collections import config_dict
 
 
@@ -16,8 +17,8 @@ def get_config(environment_name):
         "action_scale": 0.9,
         "observation": {
             "history_length": 0,
-            "joint_velocity_scale": 15.0,
-            "imu_angular_velocity_scale": 10.0,
+            "joint_velocity_scale": float(np.deg2rad(15.0)),
+            "imu_angular_velocity_scale": float(np.deg2rad(10.0)),
         },
         "reset": {
             "root_position_xyz": [-3.5, 0.0, 0.65],
