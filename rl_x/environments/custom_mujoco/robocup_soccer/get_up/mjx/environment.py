@@ -32,6 +32,7 @@ class GetUpEnv:
         xml_handle.option.iterations = 100
         xml_handle.option.ls_iterations = 50
         xml_handle.option.flag.eulerdamp = "enable"
+        self._enable_full_body_floor_contacts(xml_handle)
 
         self.initial_mj_model = mujoco.MjModel.from_xml_string(
             xml=xml_handle.to_xml_string(),
@@ -158,6 +159,26 @@ class GetUpEnv:
         if self.should_render:
             self.viewer = MujocoViewer(self.initial_mj_model, self.dt)
             pygame.init()
+
+    @staticmethod
+    def _enable_full_body_floor_contacts(xml_handle):
+        floor_name = "floor"
+        auto_collision_index = 0
+        for geom in xml_handle.find_all("geom"):
+            geom_class = geom.dclass.dclass if geom.dclass else None
+
+            if geom.name == floor_name:
+                continue
+            if geom_class in ("visual", "reward_collision_sphere", "foot"):
+                continue
+            if geom_class != "collision":
+                continue
+
+            if not geom.name:
+                geom.name = f"auto_floor_collision_{auto_collision_index}"
+                auto_collision_index += 1
+
+            xml_handle.contact.add("pair", geom1=geom.name, geom2=floor_name)
 
     def render(self, state):
         data = mjx.get_data(self.viewer.model, state.data)[0]

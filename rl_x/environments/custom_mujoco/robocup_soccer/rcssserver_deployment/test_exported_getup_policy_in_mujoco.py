@@ -13,7 +13,10 @@ from rl_x.environments.custom_mujoco.robocup_soccer.get_up.mujoco.environment im
     GetUpEnv,
 )
 from rl_x.environments.custom_mujoco.robocup_soccer.rcssserver_deployment.torch_policy import (
-    load_policy_from_files,
+    load_policy_from_files as load_gru_policy_from_files,
+)
+from rl_x.environments.custom_mujoco.robocup_soccer.rcssserver_deployment.torch_policy_feedforward import (
+    load_policy_from_files as load_feedforward_policy_from_files,
 )
 
 
@@ -43,7 +46,7 @@ def format_vec(vec):
 class TorchPolicyRunner:
     def __init__(self, weights_path, meta_path, device_name):
         self.device = torch.device(device_name)
-        self.model, self.meta = load_policy_from_files(weights_path, meta_path, self.device)
+        self.model, self.meta = load_gru_policy_from_files(weights_path, meta_path, self.device)
         self.runtime_name = f"torch:{self.device.type}"
 
     def initialize_carry(self):
@@ -54,6 +57,27 @@ class TorchPolicyRunner:
         with torch.no_grad():
             action_mean, _, next_carry = self.model.forward_step(policy_obs_tensor, carry)
         return action_mean.squeeze(0).cpu().numpy(), next_carry
+
+
+class TorchFeedforwardPolicyRunner:
+    def __init__(self, weights_path, meta_path, device_name):
+        self.device = torch.device(device_name)
+        self.model, self.meta = load_feedforward_policy_from_files(
+            weights_path,
+            meta_path,
+            self.device,
+        )
+        self.runtime_name = f"torch:{self.device.type}"
+
+    def initialize_carry(self):
+        return None
+
+    def act(self, policy_obs, carry):
+        del carry
+        policy_obs_tensor = torch.from_numpy(policy_obs).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            action_mean = self.model(policy_obs_tensor)
+        return action_mean.squeeze(0).cpu().numpy(), None
 
 
 class OnnxPolicyRunner:
@@ -96,9 +120,56 @@ class OnnxPolicyRunner:
         return action, next_carry
 
 
+class OnnxFeedforwardPolicyRunner:
+    def __init__(self, onnx_path, meta_path):
+        with meta_path.open("r", encoding="utf-8") as f:
+            self.meta = json.load(f)
+
+        try:
+            import onnxruntime as ort
+
+            self.session = ort.InferenceSession(
+                onnx_path.as_posix(),
+                providers=["CPUExecutionProvider"],
+            )
+            self.input_names = [tensor.name for tensor in self.session.get_inputs()]
+            self.output_names = [tensor.name for tensor in self.session.get_outputs()]
+            self.runtime_name = "onnxruntime"
+        except ImportError:
+            import onnx
+            from onnx.reference import ReferenceEvaluator
+
+            self.session = ReferenceEvaluator(onnx.load(onnx_path.as_posix()))
+            self.input_names = ["obs"]
+            self.output_names = ["action"]
+            self.runtime_name = "onnx-reference"
+
+    def initialize_carry(self):
+        return None
+
+    def act(self, policy_obs, carry):
+        del carry
+        output_values = self.session.run(
+            self.output_names,
+            {
+                self.input_names[0]: policy_obs[None, :].astype(np.float32),
+            },
+        )
+        action = np.asarray(output_values[0][0], dtype=np.float32)
+        return action, None
+
+
 def build_policy_runner(args):
+    with args.meta.open("r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    is_feedforward = meta.get("architecture") == "feedforward"
     if args.backend == "onnx":
+        if is_feedforward:
+            return OnnxFeedforwardPolicyRunner(args.onnx, args.meta)
         return OnnxPolicyRunner(args.onnx, args.meta)
+    if is_feedforward:
+        return TorchFeedforwardPolicyRunner(args.weights, args.meta, args.device)
     return TorchPolicyRunner(args.weights, args.meta, args.device)
 
 
