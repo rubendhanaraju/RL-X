@@ -22,3 +22,12 @@ More specifically, the example uses the Ant robot and defines as the task to tra
 | Robot Locomotion | Flat value | Continuous | Numpy |
 | Robot Locomotion MJX | Flat value | Continuous | JAX |
 | Robot Locomotion MJX PyTorch | Flat value | Continuous | Torch |
+| D3IL MJX tasks | Flat value | Continuous | JAX |
+
+The D3IL MJX tasks are registered as:
+- ```custom_mujoco.d3il.avoiding.mjx```
+- ```custom_mujoco.d3il.pushing.mjx```
+- ```custom_mujoco.d3il.aligning.mjx```
+- ```custom_mujoco.d3il.sorting.mjx```
+- ```custom_mujoco.d3il.stacking.mjx```
+- ```custom_mujoco.d3il.inserting.mjx```

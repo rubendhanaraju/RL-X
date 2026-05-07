@@ -38,6 +38,7 @@ A framework for Reinforcement Learning research.
 - [Fast Twin Delayed Deep Deterministic Gradient (FastTD3)](https://github.com/nico-bohlinger/RL-X/blob/master/rl_x/algorithms/fasttd3) in PyTorch, Flax
 - [Soft Actor Critic (SAC)](https://github.com/nico-bohlinger/RL-X/blob/master/rl_x/algorithms/sac) in PyTorch, Flax
 - [Fast Soft Actor Critic (FastSAC)](https://github.com/nico-bohlinger/RL-X/blob/master/rl_x/algorithms/fastsac) in PyTorch, Flax
+- [Diffusion-Based Maximum Entropy Reinforcement Learning (DIME)](https://github.com/nico-bohlinger/RL-X/blob/master/rl_x/algorithms/dime) in Flax
 - [Randomized Ensembled Double Q-Learning (REDQ)](https://github.com/nico-bohlinger/RL-X/blob/master/rl_x/algorithms/redq) in Flax
 - [Dropout Q-Functions (DroQ)](https://github.com/nico-bohlinger/RL-X/blob/master/rl_x/algorithms/droq) in Flax
 - [CrossQ](https://github.com/nico-bohlinger/RL-X/blob/master/rl_x/algorithms/crossq) in Flax
@@ -68,6 +69,8 @@ A framework for Reinforcement Learning research.
 - [Custom MuJoCo](https://github.com/nico-bohlinger/RL-X/tree/master/rl_x/environments/custom_mujoco)
     - Example of a custom MuJoCo environment
     - Example of a custom MuJoCo XLA (MJX) environment
+- [Custom JAX](https://github.com/nico-bohlinger/RL-X/tree/master/rl_x/environments/custom_jax)
+    - Example of a small fully JIT-able custom JAX environment
 - [Custom Robot Learning](https://github.com/nico-bohlinger/RL-X/tree/master/rl_x/environments/custom_mujoco/robot_locomotion)
     - Example of custom MuJoCo and MJX environments for quadruped and humanoid locomotion learning and real robot deployment
 - [Custom RoboCup Soccer](https://github.com/nico-bohlinger/RL-X/tree/master/rl_x/environments/custom_mujoco/robocup_soccer)

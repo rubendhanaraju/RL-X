@@ -1,0 +1,8 @@
+from rl_x.environments.environment_manager import extract_environment_name_from_file, register_environment
+from rl_x.environments.custom_jax.multi_goal.create_env import create_train_and_eval_env
+from rl_x.environments.custom_jax.multi_goal.default_config import get_config
+from rl_x.environments.custom_jax.multi_goal.general_properties import GeneralProperties
+
+
+CUSTOM_JAX_MULTI_GOAL = extract_environment_name_from_file(__file__)
+register_environment(CUSTOM_JAX_MULTI_GOAL, get_config, create_train_and_eval_env, GeneralProperties)

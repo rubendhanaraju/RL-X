@@ -10,3 +10,7 @@ experiments/*.sh
 !experiments/start_experiment.sh
 !experiments/stop_experiment.sh
 fcp/
+d3il/
+DIME_code
+reppo/
+robocup_pose_studio

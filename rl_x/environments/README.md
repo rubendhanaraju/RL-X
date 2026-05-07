@@ -77,6 +77,8 @@ An example for using RL-X in a different project can be found [here](https://git
 
 For concrete implementations of provided frameworks, look into the ```rl_x/environments/gym``` and ```rl_x/environments/envpool``` directories.
 
+Small fully JIT-able custom environments can be found in ```rl_x/environments/custom_jax```.
+
 Multiple examples for custom mujoco environments can be found in ```rl_x/environments/custom_mujoco```.
 
 A prototype for a custom environment interface with simple socket communication can be found in ```rl_x/environments/custom_interface```.
