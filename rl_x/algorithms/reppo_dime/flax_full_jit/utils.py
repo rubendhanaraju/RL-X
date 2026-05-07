@@ -35,7 +35,7 @@ def tanh_normal_log_prob_from_raw(raw_action, mean, std, action_scale):
     log_prob -= 0.5 * LOG_2_PI
     squashed_action = jnp.tanh(raw_action)
     log_prob -= jnp.log(1.0 - jnp.square(squashed_action) + 1e-6)
-    log_prob -= jnp.log(action_scale + 1e-6)
+    log_prob -= jnp.log(jnp.maximum(action_scale, 1e-8))
     return jnp.sum(log_prob, axis=-1)
 
 

@@ -43,7 +43,7 @@ def get_config(algorithm_name):
     config.nr_actor_layers = 3
     config.actor_min_std = 0.0
     config.use_actor_skip = False
-    config.use_env_action_scale = True
+    config.use_env_action_scale = False
 
     config.kl_start = 0.01
     config.kl_bound = 0.1

@@ -83,6 +83,9 @@ class ScoreNet(nn.Module):
         cos_embed = jnp.cos((self.timestep_coeff * timestep) + self.timestep_phase)
         return jnp.concatenate([sin_embed, cos_embed], axis=-1)
 
+    def output_kernel_init(self, key, shape, dtype=jnp.float32):
+        return nn.initializers.lecun_normal()(key, shape, dtype) * self.weight_init
+
     @nn.compact
     def __call__(self, action, observation, timestep, target_score):
         timestep = jnp.asarray(timestep, dtype=jnp.float32)
@@ -90,19 +93,19 @@ class ScoreNet(nn.Module):
         if action.ndim == 1:
             time_features = time_features[0]
 
-        time_state = nn.Dense(self.nr_hidden_units)(time_features)
+        time_state = nn.Dense(self.nr_time_hidden_units)(time_features)
         time_state = nn.gelu(time_state)
         time_state = nn.Dense(self.time_coder_out)(time_state)
 
         x = jnp.concatenate([action, observation, time_state], axis=-1)
-        for _ in range(self.nr_layers):
+        for layer_id in range(max(self.nr_layers - 1, 0)):
             x = nn.Dense(self.nr_hidden_units)(x)
-            if self.layer_norm:
+            if self.layer_norm and layer_id > 0:
                 x = nn.LayerNorm()(x)
             x = nn.gelu(x)
         out_state = nn.Dense(
             self.action_dim,
-            kernel_init=nn.initializers.constant(self.weight_init),
+            kernel_init=self.output_kernel_init,
             bias_init=nn.initializers.constant(self.bias_init),
         )(x)
         out_state = jnp.clip(out_state, -self.outer_clip, self.outer_clip)
@@ -286,7 +289,7 @@ class DIMEPolicy(nn.Module):
         squashed_action = jnp.tanh(final_raw_action)
         final_action = squashed_action * self.action_scale
         tanh_log_det = jnp.sum(jnp.log(1.0 - jnp.square(squashed_action) + 1e-6))
-        scale_log_det = jnp.sum(jnp.log(self.action_scale + 1e-6))
+        scale_log_det = jnp.sum(jnp.log(jnp.maximum(self.action_scale, 1e-8)))
         running_cost = -(log_ratio + tanh_log_det + scale_log_det)
         stochastic_cost = jnp.zeros_like(running_cost)
         terminal_cost = self.prior_log_prob(init_x, params).reshape(running_cost.shape)

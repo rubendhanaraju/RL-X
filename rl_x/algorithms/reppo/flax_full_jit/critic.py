@@ -74,6 +74,12 @@ class Critic(nn.Module):
             input_activation=not self.use_simplical_embedding,
             output_activation="multi_softmax" if self.use_simplical_embedding else None,
         )
+        if self.hl_gauss:
+            self.zero_dist = self.param(
+                "zero_dist",
+                lambda key, shape: hl_gauss(jnp.zeros((1, 1), dtype=jnp.float32), self.nr_bins, self.v_min, self.v_max).reshape(shape),
+                (self.nr_bins,),
+            )
 
     def features(self, observation, action):
         observation = select_observation(observation, self.critic_observation_indices)
@@ -84,12 +90,7 @@ class Critic(nn.Module):
         features = self.features(observation, action)
         logits_or_value = self.critic_module(features)
         if self.hl_gauss:
-            zero_dist = self.param(
-                "zero_dist",
-                lambda key, shape: hl_gauss(jnp.zeros((1, 1), dtype=jnp.float32), self.nr_bins, self.v_min, self.v_max).reshape(shape),
-                (self.nr_bins,),
-            )
-            logits_or_value = logits_or_value + zero_dist * 40.0
+            logits_or_value = logits_or_value + self.zero_dist * 40.0
         return logits_or_value
 
     def critic(self, observation, action):
@@ -105,12 +106,7 @@ class Critic(nn.Module):
         features = self.features(observation, action)
         logits_or_value = self.critic_module(features)
         if self.hl_gauss:
-            zero_dist = self.param(
-                "zero_dist",
-                lambda key, shape: hl_gauss(jnp.zeros((1, 1), dtype=jnp.float32), self.nr_bins, self.v_min, self.v_max).reshape(shape),
-                (self.nr_bins,),
-            )
-            logits_or_value = logits_or_value + zero_dist * 40.0
+            logits_or_value = logits_or_value + self.zero_dist * 40.0
             value_probs = jax.nn.softmax(logits_or_value, axis=-1)
             atoms = jnp.linspace(self.v_min, self.v_max, self.nr_bins, endpoint=True)
             value = value_probs.dot(atoms)

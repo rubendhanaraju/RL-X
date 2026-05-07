@@ -306,12 +306,20 @@ class Runner:
             wandb.config["python_packages"] = python_packages
             # Log git diff and commit hash
             try:
-                project_dir = os.path.abspath(os.path.join(os.getcwd(), ".."))
-                git_diff = subprocess.check_output(["git", "diff"], cwd=project_dir).decode()
+                project_dir = subprocess.check_output(
+                    ["git", "rev-parse", "--show-toplevel"],
+                    cwd=os.getcwd(),
+                    stderr=subprocess.DEVNULL,
+                ).decode().strip()
+                git_diff = subprocess.check_output(["git", "diff"], cwd=project_dir, stderr=subprocess.DEVNULL).decode()
                 with open(os.path.join(run_path, "diff.patch"), "w") as f:
                     f.write(git_diff)
                 wandb.save(os.path.join(run_path, "diff.patch"), base_path=run_path)
-                git_commit_hash = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=project_dir).decode().strip()
+                git_commit_hash = subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=project_dir,
+                    stderr=subprocess.DEVNULL,
+                ).decode().strip()
                 wandb.config["git_commit_hash"] = git_commit_hash
             except Exception as e:
                 rlx_logger.warning(f"Could not log git diff and commit hash: {e}")
