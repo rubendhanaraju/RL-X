@@ -1,0 +1,1 @@
+from rl_x.environments.custom_mujoco.d3il.common_mjx.general_properties import GeneralProperties
