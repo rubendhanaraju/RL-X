@@ -7,9 +7,9 @@ metric:
   goal: maximize
 
 parameters:
-  ent_start:
+  algorithm.ent_start:
     values: [1.0, 2.0]
-  ent_target_mult:
+  algorithm.ent_target_mult:
     values: [1.0, 2.0, 3.0, 4.0]
 
 command:
@@ -29,9 +29,7 @@ command:
   - --runner.wandb_entity=rubendhanaraju-university-of-porto
   - --runner.project_name=rlx-reppo-dime
   - --runner.exp_name=avoiding_massive
-  - --runner.run_name=reppo_dime_avoiding_2d_4096_ent_${ent_start}_target_${ent_target_mult}
   - --environment.obstacle_layer_1_enabled=False
   - --environment.obstacle_layer_2_enabled=True
   - --environment.obstacle_layer_3_enabled=False
-  - --algorithm.ent_start=${ent_start}
-  - --algorithm.ent_target_mult=${ent_target_mult}
+  - ${args}
