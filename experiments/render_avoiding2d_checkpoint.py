@@ -1,0 +1,222 @@
+import argparse
+import os
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from ml_collections import config_dict
+
+from rl_x.algorithms.reppo_dime.flax_full_jit.default_config import get_config as get_algorithm_config
+from rl_x.algorithms.reppo_dime.flax_full_jit.reppo_dime import RePPO_DIME
+from rl_x.environments.custom_jax.avoiding_2d.create_env import create_train_and_eval_env
+from rl_x.environments.custom_jax.avoiding_2d.default_config import get_config as get_environment_config
+from rl_x.environments.custom_jax.avoiding_2d.environment import (
+    CENTER_X,
+    FINISH_LINE_HALF_HEIGHT,
+    FINISH_LINE_HALF_WIDTH,
+    GOAL_YPOS,
+    INIT_XY,
+    OBSTACLE_RADIUS,
+    OBSTACLE_XY,
+    VIEW_X_MAX,
+    VIEW_X_MIN,
+    VIEW_Y_MAX,
+    VIEW_Y_MIN,
+)
+from rl_x.runner.default_config import get_config as get_runner_config
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Render many Avoiding2D trajectories from an RL-X RePPO-DIME checkpoint.")
+    parser.add_argument("--checkpoint", required=True, help="Path to an RL-X latest.model checkpoint.")
+    parser.add_argument("--output", default="avoiding2d_rollouts.png", help="PNG path for the rendered trajectories.")
+    parser.add_argument("--npz", default=None, help="Optional path for dense rollout arrays.")
+    parser.add_argument("--num-trajectories", type=int, default=4096, help="Number of parallel trajectories to generate.")
+    parser.add_argument("--plot-max-trajectories", type=int, default=1024, help="Max trajectories to draw. Use 0 to draw all.")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--max-steps", type=int, default=None, help="Override Avoiding2D max_steps.")
+    parser.add_argument("--n-substeps", type=int, default=None, help="Override Avoiding2D n_substeps.")
+    parser.add_argument("--eval-action-mode", choices=("sde", "ode"), default="sde")
+    parser.add_argument("--no-obstacles", action="store_true")
+    parser.add_argument("--show", action="store_true", help="Show the matplotlib window after saving.")
+    return parser.parse_args()
+
+
+def build_config(args):
+    config = config_dict.ConfigDict()
+    config.algorithm = get_algorithm_config("reppo_dime.flax_full_jit")
+    config.environment = get_environment_config("custom_jax.avoiding_2d")
+    config.runner = get_runner_config("test")
+
+    config.runner.load_model = os.path.abspath(args.checkpoint)
+    config.runner.save_model = False
+    config.runner.track_console = False
+    config.runner.track_tb = False
+    config.runner.track_wandb = False
+
+    config.environment.nr_envs = args.num_trajectories
+    config.environment.render = False
+    config.environment.no_obstacles = args.no_obstacles
+    if args.max_steps is not None:
+        config.environment.max_steps = args.max_steps
+    if args.n_substeps is not None:
+        config.environment.n_substeps = args.n_substeps
+
+    config.algorithm.eval_action_mode = args.eval_action_mode
+    config.algorithm.evaluation_active = False
+    config.algorithm.nr_steps = 1
+    config.algorithm.nr_minibatches = 1
+    config.algorithm.nr_epochs = 1
+    config.algorithm.total_timesteps = args.num_trajectories
+    config.algorithm.evaluation_and_save_frequency = args.num_trajectories
+    return config
+
+
+def rollout(model, env, nr_envs, horizon, seed):
+    @jax.jit
+    def rollout_jit(reset_key, action_key):
+        reset_keys = jax.random.split(reset_key, nr_envs)
+        env_state = env.reset(reset_keys, True)
+        initial_points = env_state.actual_next_observation[..., 2:4]
+
+        def step(carry, _):
+            env_state, key = carry
+            key, subkey = jax.random.split(key)
+            observation = model.normalize_observation(
+                env_state.next_observation,
+                model.observation_normalizer_state,
+                "policy",
+            )
+            action = model.select_eval_action(model.actor_state.params, observation, subkey)
+            action = model.clip_action(action)
+            env_state = env.step(env_state, action)
+            done = env_state.terminated | env_state.truncated
+            return (env_state, key), (
+                env_state.actual_next_observation[..., 2:4],
+                done,
+                env_state.reward,
+                env_state.info["rollout/episode_return"],
+                env_state.info["rollout/episode_length"],
+                env_state.mode_encoding,
+            )
+
+        (env_state, _), rollout_data = jax.lax.scan(step, (env_state, action_key), None, horizon)
+        points, done, reward, episode_return, episode_length, mode_encoding = rollout_data
+        points = jnp.concatenate([initial_points[None], points], axis=0)
+        return {
+            "points": points,
+            "done": done,
+            "reward": reward,
+            "episode_return": episode_return,
+            "episode_length": episode_length,
+            "final_mode_encoding": env_state.mode_encoding,
+            "mode_encoding": mode_encoding,
+        }
+
+    key = jax.random.PRNGKey(seed)
+    reset_key, action_key = jax.random.split(key)
+    return jax.device_get(rollout_jit(reset_key, action_key))
+
+
+def trajectory_end(done, env_id):
+    done_for_env = done[:, env_id]
+    if np.any(done_for_env):
+        return int(np.argmax(done_for_env)) + 2
+    return done.shape[0] + 1
+
+
+def render_rollouts(points, done, output_path, plot_max_trajectories, show):
+    if not show:
+        import matplotlib
+
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    nr_trajectories = points.shape[1]
+    if plot_max_trajectories <= 0:
+        plot_count = nr_trajectories
+    else:
+        plot_count = min(plot_max_trajectories, nr_trajectories)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.axis("equal")
+    ax.set_xlim((VIEW_X_MIN, VIEW_X_MAX))
+    ax.set_ylim((VIEW_Y_MIN, VIEW_Y_MAX))
+    ax.set_title(f"Avoiding2D checkpoint rollouts ({plot_count}/{nr_trajectories})")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+
+    for center, radius in zip(np.asarray(OBSTACLE_XY), np.asarray(OBSTACLE_RADIUS)):
+        ax.add_patch(patches.Circle(center, float(radius), color="tab:red", alpha=0.85))
+
+    finish_line = patches.Rectangle(
+        (CENTER_X - FINISH_LINE_HALF_WIDTH, GOAL_YPOS - FINISH_LINE_HALF_HEIGHT),
+        2.0 * FINISH_LINE_HALF_WIDTH,
+        2.0 * FINISH_LINE_HALF_HEIGHT,
+        color="tab:green",
+        alpha=0.35,
+    )
+    ax.add_patch(finish_line)
+    ax.plot(float(INIT_XY[0]), float(INIT_XY[1]), "ko", markersize=4)
+
+    for env_id in range(plot_count):
+        end = trajectory_end(done, env_id)
+        trajectory = points[:end, env_id]
+        ax.plot(trajectory[:, 0], trajectory[:, 1], color="tab:blue", alpha=0.08, linewidth=0.8)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def main():
+    args = parse_args()
+    config = build_config(args)
+    train_env, eval_env = create_train_and_eval_env(config)
+
+    run_path = os.path.abspath("runs/checkpoint_render/avoiding2d")
+    model = RePPO_DIME.load(
+        config,
+        train_env,
+        eval_env,
+        run_path,
+        writer=None,
+        explicitly_set_algorithm_params=[
+            "algorithm.eval_action_mode",
+            "algorithm.nr_steps",
+            "algorithm.nr_minibatches",
+            "algorithm.nr_epochs",
+            "algorithm.total_timesteps",
+            "algorithm.evaluation_and_save_frequency",
+        ],
+    )
+
+    try:
+        data = rollout(model, eval_env, args.num_trajectories, eval_env.horizon, args.seed)
+        points = np.asarray(data["points"], dtype=np.float32)
+        done = np.asarray(data["done"], dtype=np.bool_)
+
+        if args.npz is not None:
+            os.makedirs(os.path.dirname(os.path.abspath(args.npz)), exist_ok=True)
+            np.savez_compressed(args.npz, **data)
+
+        render_rollouts(points, done, args.output, args.plot_max_trajectories, args.show)
+
+        final_modes = np.asarray(data["final_mode_encoding"], dtype=np.float32)
+        reached_modes = final_modes > 0.5
+        print(f"Saved render to {os.path.abspath(args.output)}")
+        if args.npz is not None:
+            print(f"Saved rollout arrays to {os.path.abspath(args.npz)}")
+        print(f"Generated {args.num_trajectories} trajectories for {eval_env.horizon} steps.")
+        print(f"Reached mode counts: {reached_modes.sum(axis=0).astype(int).tolist()}")
+    finally:
+        train_env.close()
+        eval_env.close()
+
+
+if __name__ == "__main__":
+    main()

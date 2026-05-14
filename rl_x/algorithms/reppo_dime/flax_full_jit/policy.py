@@ -24,11 +24,15 @@ def get_policy(config, env):
             diffusion_steps=config.algorithm.diffusion_steps,
             diffusion_init_std=config.algorithm.diffusion_init_std,
             diffusion_friction=config.algorithm.diffusion_friction,
+            learn_forward=config.algorithm.learn_forward,
+            learn_backward=config.algorithm.learn_backward,
             learn_prior=config.algorithm.learn_prior,
+            learn_betas=config.algorithm.learn_betas,
             learn_dt=config.algorithm.learn_dt,
             per_step_dt=config.algorithm.per_step_dt,
             per_dim_friction=config.algorithm.per_dim_friction,
             learn_friction=config.algorithm.learn_friction,
+            learn_mass_matrix=config.algorithm.learn_mass_matrix,
             dt=config.algorithm.dt,
             dt_schedule_min=config.algorithm.dt_schedule_min,
             dt_schedule_s=config.algorithm.dt_schedule_s,
@@ -36,8 +40,10 @@ def get_policy(config, env):
             eval_ode_coef=config.algorithm.eval_ode_coef,
             ent_start=config.algorithm.ent_start,
             kl_start=config.algorithm.kl_start,
+            score_model_use_path_gradient=config.algorithm.score_model_use_path_gradient,
             score_model_use_target_score=config.algorithm.score_model_use_target_score,
             score_model_layer_norm=config.algorithm.score_model_layer_norm,
+            score_model_layer_norm_type=config.algorithm.score_model_layer_norm_type,
             score_model_nr_layers=config.algorithm.score_model_nr_layers,
             score_model_nr_hidden_units=config.algorithm.score_model_nr_hidden_units,
             score_model_nr_time_hidden_units=config.algorithm.score_model_nr_time_hidden_units,
@@ -134,11 +140,15 @@ class DIMEPolicy(nn.Module):
     diffusion_steps: int
     diffusion_init_std: float
     diffusion_friction: float
+    learn_forward: bool
+    learn_backward: bool
     learn_prior: bool
+    learn_betas: bool
     learn_dt: bool
     per_step_dt: bool
     per_dim_friction: bool
     learn_friction: bool
+    learn_mass_matrix: bool
     dt: float
     dt_schedule_min: float
     dt_schedule_s: float
@@ -146,8 +156,10 @@ class DIMEPolicy(nn.Module):
     eval_ode_coef: float
     ent_start: float
     kl_start: float
+    score_model_use_path_gradient: bool
     score_model_use_target_score: bool
     score_model_layer_norm: bool
+    score_model_layer_norm_type: str
     score_model_nr_layers: int
     score_model_nr_hidden_units: int
     score_model_nr_time_hidden_units: int
@@ -171,6 +183,20 @@ class DIMEPolicy(nn.Module):
             weight_init=self.score_model_weight_init,
             bias_init=self.score_model_bias_init,
         )
+        if self.learn_backward:
+            self.backward_score_model = ScoreNet(
+                action_dim=self.action_dim,
+                use_target_score=self.score_model_use_target_score,
+                layer_norm=self.score_model_layer_norm,
+                nr_layers=self.score_model_nr_layers,
+                nr_hidden_units=self.score_model_nr_hidden_units,
+                nr_time_hidden_units=self.score_model_nr_time_hidden_units,
+                time_coder_out=self.score_model_time_coder_out,
+                outer_clip=self.score_model_outer_clip,
+                inner_clip=self.score_model_inner_clip,
+                weight_init=self.score_model_weight_init,
+                bias_init=self.score_model_bias_init,
+            )
 
     def initial_dt(self):
         if self.per_step_dt:
@@ -182,12 +208,20 @@ class DIMEPolicy(nn.Module):
     def __call__(self, action, observation, timestep, target_score):
         self.param("log_temperature", lambda key, shape: jnp.ones(shape, dtype=jnp.float32) * jnp.log(self.ent_start), (1,))
         self.param("log_lagrangian", lambda key, shape: jnp.ones(shape, dtype=jnp.float32) * jnp.log(self.kl_start), (1,))
+        if self.learn_betas:
+            self.param("betas", nn.initializers.ones, (self.diffusion_steps,))
         self.param("prior_mean", nn.initializers.zeros, (self.action_dim,))
         self.param(
             "prior_std",
             lambda key, shape: jnp.ones(shape, dtype=jnp.float32) * inverse_softplus(self.diffusion_init_std),
             (self.action_dim,),
         )
+        if self.learn_mass_matrix:
+            self.param(
+                "mass_std",
+                lambda key, shape: jnp.ones(shape, dtype=jnp.float32) * inverse_softplus(1.0),
+                (1,),
+            )
         self.param("dt", lambda key, shape: self.initial_dt(), (self.diffusion_steps if self.per_step_dt else 1,))
         friction_shape = (self.action_dim,) if self.per_dim_friction else (1,)
         self.param(
@@ -197,7 +231,12 @@ class DIMEPolicy(nn.Module):
         )
 
         observation = select_observation(observation, self.policy_observation_indices)
-        return self.score_model(action, observation, timestep, target_score)
+        forward_score = self.score_model(action, observation, timestep, target_score)
+        if self.learn_backward:
+            self.backward_score_model(action, observation, timestep, target_score)
+        if self.learn_forward:
+            return forward_score
+        return jnp.zeros_like(action)
 
     def temperature(self, params):
         return jnp.exp(params["log_temperature"]).squeeze()
@@ -247,8 +286,31 @@ class DIMEPolicy(nn.Module):
         friction = jax.nn.softplus(params["friction"])
         return friction if self.learn_friction else jax.lax.stop_gradient(friction)
 
+    def mass(self, params):
+        if not self.learn_mass_matrix:
+            return jnp.ones((1,), dtype=jnp.float32)
+        mass_std = jax.nn.softplus(params["mass_std"])
+        return mass_std
+
     def forward_score(self, params, x, observation, step, target_score):
         return self.apply({"params": params}, x, observation, step, target_score)
+
+    def backward_score_apply(self, action, observation, timestep, target_score):
+        if not self.learn_backward:
+            return jnp.zeros_like(action)
+
+        observation = select_observation(observation, self.policy_observation_indices)
+        return self.backward_score_model(action, observation, timestep, target_score)
+
+    def backward_score(self, params, x, observation, step, target_score):
+        return self.apply(
+            {"params": params},
+            x,
+            observation,
+            step,
+            target_score,
+            method=self.backward_score_apply,
+        )
 
     def single_sample(self, key, params, observation, ode=False, ode_coef=1.0):
         key, init_key, scan_key = jax.random.split(key, 3)
@@ -274,7 +336,8 @@ class DIMEPolicy(nn.Module):
                 x_new = fwd_mean + scale * jax.random.normal(noise_key, shape=x.shape)
 
             drift_new = self.prior_score(x_new, params)
-            bwd_mean = x_new + eta * drift_new
+            bwd_score = self.backward_score(params, x_new, observation, step + 1.0, target_score)
+            bwd_mean = x_new + eta * (drift_new + bwd_score)
             fwd_log_prob = normal_diag_log_prob(x_new, fwd_mean, scale)
             bwd_log_prob = normal_diag_log_prob(x, bwd_mean, scale)
             log_ratio = log_ratio + bwd_log_prob - fwd_log_prob

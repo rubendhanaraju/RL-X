@@ -29,7 +29,7 @@ def get_config(algorithm_name):
     config.critic_hidden_dim = 512
     config.actor_hidden_dim = 512
     config.v_min = -100.0
-    config.v_max = 100.0
+    config.v_max = 500.0
     config.nr_bins = 151
     config.hl_gauss = True
     config.use_critic_norm = True
@@ -44,6 +44,8 @@ def get_config(algorithm_name):
     config.actor_min_std = 0.0
     config.use_actor_skip = False
     config.use_env_action_scale = False
+    config.action_clipping = True
+    config.action_clip_value = 0.999
 
     config.kl_start = 0.01
     config.kl_bound = 0.1
@@ -61,19 +63,26 @@ def get_config(algorithm_name):
     config.diffusion_steps = 8
     config.diffusion_init_std = 2.5
     config.diffusion_friction = 1.0
+    config.learn_forward = True
+    config.learn_backward = False
     config.learn_prior = False
+    config.learn_betas = False
     config.learn_dt = False
     config.per_step_dt = False
     config.per_dim_friction = True
     config.learn_friction = True
+    config.learn_mass_matrix = False
     config.dt = 0.125
     config.dt_schedule_min = 0.001
     config.dt_schedule_s = 0.008
     config.dt_schedule_power = 2.0
     config.eval_ode_coef = 1.0
+    config.eval_action_mode = "sde"  # sde, ode
 
+    config.score_model_use_path_gradient = False
     config.score_model_use_target_score = False
     config.score_model_layer_norm = False
+    config.score_model_layer_norm_type = "LayerNorm"
     config.score_model_nr_layers = 4
     config.score_model_nr_hidden_units = 256
     config.score_model_nr_time_hidden_units = 32
@@ -84,7 +93,8 @@ def get_config(algorithm_name):
     config.score_model_bias_init = 0.0
 
     config.enable_observation_normalization = True
-    config.normalizer_epsilon = 1e-8
+    config.normalizer_epsilon = 1e-2
+    config.randomize_initial_episode_steps = True
 
     config.evaluation_and_save_frequency = -1  # evaluate/save once at the end
     config.evaluation_active = True
