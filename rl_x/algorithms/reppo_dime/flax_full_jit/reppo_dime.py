@@ -27,6 +27,102 @@ from rl_x.algorithms.reppo_dime.flax_full_jit.general_properties import GeneralP
 rlx_logger = logging.getLogger("rl_x")
 
 
+def compute_reppo_dime_lambda_targets(rewards, values, terminations, truncations, importance_weights, gamma, lmbda):
+    def compute_nstep_lambda(carry, transition):
+        lambda_return, truncated, importance_weight = carry
+        reward, value, done, current_truncated, current_importance_weight = transition
+        importance_lambda = jnp.exp(importance_weight) * lmbda
+        lambda_sum = importance_lambda * lambda_return + (1.0 - importance_lambda) * value
+        delta = gamma * jnp.where(truncated, value, (1.0 - done) * lambda_sum)
+        lambda_return = reward + delta
+        return (lambda_return, current_truncated, current_importance_weight), lambda_return
+
+    _, target_values = jax.lax.scan(
+        compute_nstep_lambda,
+        (
+            values[-1],
+            jnp.ones_like(truncations[0]),
+            jnp.zeros_like(importance_weights[0]),
+        ),
+        (rewards, values, terminations, truncations, importance_weights),
+        reverse=True,
+    )
+    return target_values
+
+
+def compute_reppo_dime_critic_loss(
+    critic_update_loss,
+    pred_emb,
+    pred_rew,
+    value,
+    target_next_embs,
+    rewards,
+    target_values,
+    terminations,
+    truncations,
+    aux_loss_mult,
+):
+    aux_emb_loss = optax.squared_error(pred_emb, target_next_embs)
+    aux_rew_loss = optax.squared_error(pred_rew, rewards[:, None])
+    aux_loss = jnp.mean(
+        (1.0 - terminations[:, None]) * jnp.concatenate([aux_emb_loss, aux_rew_loss], axis=-1),
+        axis=-1,
+    )
+    value_loss = jnp.mean(optax.squared_error(value, target_values))
+    loss = jnp.mean((1.0 - truncations) * (critic_update_loss + aux_loss_mult * aux_loss))
+    return loss, {
+        "value_loss": value_loss,
+        "critic_update_loss": jnp.mean(critic_update_loss),
+        "aux_loss": jnp.mean(aux_loss),
+        "reward_aux_loss": jnp.mean(aux_rew_loss),
+    }
+
+
+def compute_reppo_dime_actor_loss(
+    policy_log_prob,
+    value,
+    entropy,
+    kl,
+    temperature,
+    lagrangian,
+    action_size_target,
+    kl_bound,
+    reduce_kl,
+    actor_kl_clip_mode,
+    update_entropy_lagrangian,
+    update_kl_lagrangian,
+):
+    sac_loss = policy_log_prob * jax.lax.stop_gradient(temperature) - value
+    if actor_kl_clip_mode == "full":
+        actor_loss = sac_loss + kl * jax.lax.stop_gradient(lagrangian) * reduce_kl
+    elif actor_kl_clip_mode == "clipped":
+        actor_loss = jnp.where(
+            kl < kl_bound,
+            sac_loss,
+            kl * jax.lax.stop_gradient(lagrangian) * reduce_kl,
+        )
+    elif actor_kl_clip_mode == "value":
+        actor_loss = sac_loss
+    else:
+        raise ValueError(f"Unknown actor_kl_clip_mode: {actor_kl_clip_mode}")
+
+    target_entropy_loss = temperature * jax.lax.stop_gradient(action_size_target + entropy)
+    lagrangian_loss = -lagrangian * jax.lax.stop_gradient(kl - kl_bound)
+
+    loss = jnp.mean(actor_loss)
+    if update_entropy_lagrangian:
+        loss = loss + jnp.mean(target_entropy_loss)
+    if update_kl_lagrangian:
+        loss = loss + jnp.mean(lagrangian_loss)
+
+    return loss, {
+        "actor_loss": jnp.mean(actor_loss),
+        "entropy_lagrangian_loss": jnp.mean(target_entropy_loss),
+        "kl_lagrangian_loss": jnp.mean(lagrangian_loss),
+        "sac_loss": jnp.mean(sac_loss),
+    }
+
+
 class RePPO_DIME:
     def __init__(self, config, train_env, eval_env, run_path, writer):
         self.config = config
@@ -477,26 +573,14 @@ class RePPO_DIME:
                         infos,
                     ) = batch
 
-                    def compute_nstep_lambda(carry, transition):
-                        lambda_return, truncated, importance_weight = carry
-                        reward, value, done, current_truncated, current_importance_weight = transition
-                        lambda_sum = (
-                            jnp.exp(importance_weight) * self.lmbda * lambda_return
-                            + (1.0 - jnp.exp(importance_weight) * self.lmbda) * value
-                        )
-                        delta = self.gamma * jnp.where(truncated, value, (1.0 - done) * lambda_sum)
-                        lambda_return = reward + delta
-                        return (lambda_return, current_truncated, current_importance_weight), lambda_return
-
-                    _, target_values = jax.lax.scan(
-                        compute_nstep_lambda,
-                        (
-                            values[-1],
-                            jnp.ones_like(truncations[0]),
-                            jnp.zeros_like(importance_weights[0]),
-                        ),
-                        (soft_rewards, values, terminations, truncations, importance_weights),
-                        reverse=True,
+                    target_values = compute_reppo_dime_lambda_targets(
+                        soft_rewards,
+                        values,
+                        terminations,
+                        truncations,
+                        importance_weights,
+                        self.gamma,
+                        self.lmbda,
                     )
 
                     batch_policy_states = policy_states.reshape((-1,) + self.os_shape)
@@ -550,23 +634,23 @@ class RePPO_DIME:
                             minibatch_actions,
                             method=self.critic.forward,
                         )
-                        aux_emb_loss = optax.squared_error(pred_emb, minibatch_next_embs)
-                        aux_rew_loss = optax.squared_error(pred_rew, minibatch_rewards[:, None])
-                        aux_loss = jnp.mean(
-                            (1.0 - minibatch_terminations[:, None])
-                            * jnp.concatenate([aux_emb_loss, aux_rew_loss], axis=-1),
-                            axis=-1,
-                        )
-                        value_loss = jnp.mean(optax.squared_error(value, minibatch_target_values))
-                        loss = jnp.mean(
-                            (1.0 - minibatch_truncations)
-                            * (critic_update_loss + self.aux_loss_mult * aux_loss)
+                        loss, critic_loss_metrics = compute_reppo_dime_critic_loss(
+                            critic_update_loss,
+                            pred_emb,
+                            pred_rew,
+                            value,
+                            minibatch_next_embs,
+                            minibatch_rewards,
+                            minibatch_target_values,
+                            minibatch_terminations,
+                            minibatch_truncations,
+                            self.aux_loss_mult,
                         )
                         metrics = {
-                            "loss/critic_loss": value_loss,
-                            "loss/critic_update_loss": jnp.mean(critic_update_loss),
-                            "loss/critic_aux_loss": jnp.mean(aux_loss),
-                            "loss/critic_reward_aux_loss": jnp.mean(aux_rew_loss),
+                            "loss/critic_loss": critic_loss_metrics["value_loss"],
+                            "loss/critic_update_loss": critic_loss_metrics["critic_update_loss"],
+                            "loss/critic_aux_loss": critic_loss_metrics["aux_loss"],
+                            "loss/critic_reward_aux_loss": critic_loss_metrics["reward_aux_loss"],
                             "q/value": jnp.mean(value),
                             "q/target_value": jnp.mean(minibatch_target_values),
                             "data/reward": jnp.mean(minibatch_rewards),
@@ -600,34 +684,26 @@ class RePPO_DIME:
                         temperature = self.policy.temperature(actor_params)
                         lagrangian = self.policy.lagrangian(actor_params)
 
-                        sac_loss = policy_log_prob * jax.lax.stop_gradient(temperature) - value
-                        if self.actor_kl_clip_mode == "full":
-                            actor_loss = sac_loss + kl * jax.lax.stop_gradient(lagrangian) * self.reduce_kl
-                        elif self.actor_kl_clip_mode == "clipped":
-                            actor_loss = jnp.where(
-                                kl < self.kl_bound,
-                                sac_loss,
-                                kl * jax.lax.stop_gradient(lagrangian) * self.reduce_kl,
-                            )
-                        elif self.actor_kl_clip_mode == "value":
-                            actor_loss = sac_loss
-                        else:
-                            raise ValueError(f"Unknown actor_kl_clip_mode: {self.actor_kl_clip_mode}")
-
-                        target_entropy_loss = temperature * jax.lax.stop_gradient(self.action_size_target + entropy)
-                        lagrangian_loss = -lagrangian * jax.lax.stop_gradient(kl - self.kl_bound)
-
-                        loss = jnp.mean(actor_loss)
-                        if self.update_entropy_lagrangian:
-                            loss = loss + jnp.mean(target_entropy_loss)
-                        if self.update_kl_lagrangian:
-                            loss = loss + jnp.mean(lagrangian_loss)
+                        loss, actor_loss_metrics = compute_reppo_dime_actor_loss(
+                            policy_log_prob,
+                            value,
+                            entropy,
+                            kl,
+                            temperature,
+                            lagrangian,
+                            self.action_size_target,
+                            self.kl_bound,
+                            self.reduce_kl,
+                            self.actor_kl_clip_mode,
+                            self.update_entropy_lagrangian,
+                            self.update_kl_lagrangian,
+                        )
 
                         metrics = {
-                            "loss/actor_loss": jnp.mean(actor_loss),
+                            "loss/actor_loss": actor_loss_metrics["actor_loss"],
                             "loss/actor_total_loss": loss,
-                            "loss/entropy_lagrangian_loss": jnp.mean(target_entropy_loss),
-                            "loss/kl_lagrangian_loss": jnp.mean(lagrangian_loss),
+                            "loss/entropy_lagrangian_loss": actor_loss_metrics["entropy_lagrangian_loss"],
+                            "loss/kl_lagrangian_loss": actor_loss_metrics["kl_lagrangian_loss"],
                             "entropy/temperature": temperature,
                             "entropy/policy_entropy": jnp.mean(entropy),
                             "policy/kl": jnp.mean(kl),

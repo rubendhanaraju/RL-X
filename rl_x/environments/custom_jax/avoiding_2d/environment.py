@@ -37,6 +37,8 @@ OBSTACLE_RADIUS = jnp.asarray(
     [0.03, 0.025, 0.025, 0.025, 0.025, 0.025],
     dtype=jnp.float32,
 )
+OBSTACLE_LAYER_ID = jnp.asarray([0, 1, 1, 2, 2, 2], dtype=jnp.int32)
+MODE_LAYER_ID = jnp.asarray([0, 0, 1, 1, 1, 2, 2, 2, 2], dtype=jnp.int32)
 VIEW_X_MIN = 0.2
 VIEW_X_MAX = 0.8
 VIEW_Y_MIN = -0.35
@@ -71,12 +73,39 @@ class Avoiding2D:
         self.terminate_on_goal = bool(env_config.terminate_on_goal)
         self.mode_reward_index = int(env_config.mode_reward_index)
 
+        obstacle_layer_enabled = jnp.asarray(
+            [
+                bool(env_config.get("obstacle_layer_1_enabled", True)),
+                bool(env_config.get("obstacle_layer_2_enabled", True)),
+                bool(env_config.get("obstacle_layer_3_enabled", True)),
+            ],
+            dtype=jnp.bool_,
+        )
         if bool(env_config.no_obstacles):
+            obstacle_layer_enabled = jnp.zeros((3,), dtype=jnp.bool_)
+        self.obstacle_layer_enabled = obstacle_layer_enabled
+        self.mode_layer_enabled = obstacle_layer_enabled[MODE_LAYER_ID]
+        self.mode_layer_enabled_float = self.mode_layer_enabled.astype(jnp.float32)
+        self.l1_enabled = bool(obstacle_layer_enabled[0])
+        self.l2_enabled = bool(obstacle_layer_enabled[1])
+        self.l3_enabled = bool(obstacle_layer_enabled[2])
+        self.initial_l1_passed = jnp.asarray(0.0 if self.l1_enabled else 1.0, dtype=jnp.float32)
+        self.initial_l2_passed = jnp.asarray(0.0 if self.l2_enabled else 1.0, dtype=jnp.float32)
+        self.initial_l3_passed = jnp.asarray(0.0 if self.l3_enabled else 1.0, dtype=jnp.float32)
+
+        obstacle_mask = obstacle_layer_enabled[OBSTACLE_LAYER_ID]
+        if not bool(jnp.any(obstacle_mask)):
             self.obstacle_xy = jnp.zeros((0, 2), dtype=jnp.float32)
             self.obstacle_radius = jnp.zeros((0,), dtype=jnp.float32)
         else:
-            self.obstacle_xy = OBSTACLE_XY
-            self.obstacle_radius = OBSTACLE_RADIUS
+            self.obstacle_xy = OBSTACLE_XY[obstacle_mask]
+            self.obstacle_radius = OBSTACLE_RADIUS[obstacle_mask]
+
+        if self.mode_reward_index < -1 or self.mode_reward_index >= self.mode_layer_enabled.shape[0]:
+            raise ValueError(
+                f"mode_reward_index must be -1 or in [0, {self.mode_layer_enabled.shape[0] - 1}], "
+                f"got {self.mode_reward_index}"
+            )
 
         self.single_observation_space = BoxSpace(
             low=jnp.array([VIEW_X_MIN, VIEW_Y_MIN, VIEW_X_MIN, VIEW_Y_MIN], dtype=jnp.float32),
@@ -125,6 +154,9 @@ class Avoiding2D:
         truncated = jnp.zeros((), dtype=jnp.bool_)
         collision = jnp.zeros((), dtype=jnp.float32)
         mode_encoding = jnp.zeros(9, dtype=jnp.float32)
+        l1_passed = self.initial_l1_passed
+        l2_passed = self.initial_l2_passed
+        l3_passed = self.initial_l3_passed
         info = self._info(
             reward,
             reward,
@@ -132,9 +164,9 @@ class Avoiding2D:
             collision,
             point_xy,
             mode_encoding,
-            reward,
-            reward,
-            reward,
+            l1_passed,
+            l2_passed,
+            l3_passed,
             reward,
             reward,
         )
@@ -156,9 +188,9 @@ class Avoiding2D:
             prev_action=point_xy,
             collision=collision,
             mode_encoding=mode_encoding,
-            l1_passed=reward,
-            l2_passed=reward,
-            l3_passed=reward,
+            l1_passed=l1_passed,
+            l2_passed=l2_passed,
+            l3_passed=l3_passed,
         )
 
     @partial(jax.jit, static_argnums=(0,))
@@ -317,8 +349,9 @@ class Avoiding2D:
         reached_goal,
         action_norm,
     ):
-        mode = jnp.sum(mode_encoding * (2.0**jnp.arange(mode_encoding.shape[0], dtype=jnp.float32)))
-        mode_info = {f"env_info/mode_{mode_id}": mode_encoding[mode_id] for mode_id in range(9)}
+        active_mode_encoding = mode_encoding * self.mode_layer_enabled_float
+        mode = jnp.sum(active_mode_encoding * (2.0**jnp.arange(mode_encoding.shape[0], dtype=jnp.float32)))
+        mode_info = {f"env_info/mode_{mode_id}": active_mode_encoding[mode_id] for mode_id in range(9)}
         return {
             "rollout/episode_return": episode_return,
             "rollout/episode_length": episode_length,
@@ -331,6 +364,9 @@ class Avoiding2D:
             "env_info/l1_passed": l1_passed,
             "env_info/l2_passed": l2_passed,
             "env_info/l3_passed": l3_passed,
+            "env_info/l1_active": self.obstacle_layer_enabled[0].astype(jnp.float32),
+            "env_info/l2_active": self.obstacle_layer_enabled[1].astype(jnp.float32),
+            "env_info/l3_active": self.obstacle_layer_enabled[2].astype(jnp.float32),
             **mode_info,
         }
 
@@ -368,27 +404,24 @@ class Avoiding2D:
         reward = (REWARD_PROGRESS_COEFF * goal_progress + REWARD_GOAL_BONUS * goal_bonus -
                   REWARD_OBSTACLE_COEFF * obstacle_penalty - REWARD_CENTERLINE_COEFF * centerline_penalty -
                   REWARD_COLLISION_PENALTY * collision)
-        reward = jnp.where(
-            self.mode_reward_index >= 0,
-            reward + mode_encoding[self.mode_reward_index],
-            reward,
-        )
+        if self.mode_reward_index >= 0:
+            reward = reward + mode_encoding[self.mode_reward_index] * self.mode_layer_enabled_float[self.mode_reward_index]
         return reward
 
     @partial(jax.jit, static_argnums=(0,))
     def _check_mode(self, point_xy, mode_encoding, l1_passed, l2_passed, l3_passed):
         r_x = point_xy[0]
         r_y = point_xy[1]
-        me = mode_encoding
+        me = mode_encoding * self.mode_layer_enabled_float
 
         near_l1 = jnp.logical_and(r_y - 0.03 <= L1_YPOS, L1_YPOS <= r_y + 0.03)
-        l1_trigger = jnp.logical_and(near_l1, l1_passed < 0.5)
+        l1_trigger = jnp.logical_and(jnp.logical_and(self.l1_enabled, near_l1), l1_passed < 0.5)
         me = me.at[0].set(jnp.where(jnp.logical_and(l1_trigger, r_x < L1_XPOS), 1.0, me[0]))
         me = me.at[1].set(jnp.where(jnp.logical_and(l1_trigger, r_x > L1_XPOS), 1.0, me[1]))
         new_l1_passed = jnp.where(l1_trigger, 1.0, l1_passed)
 
         near_l2 = jnp.logical_and(r_y - 0.03 <= L2_YPOS, L2_YPOS <= r_y + 0.03)
-        l2_trigger = jnp.logical_and(near_l2, l2_passed < 0.5)
+        l2_trigger = jnp.logical_and(jnp.logical_and(self.l2_enabled, near_l2), l2_passed < 0.5)
         me = me.at[2].set(jnp.where(jnp.logical_and(l2_trigger, r_x < L2_TOP_XPOS), 1.0, me[2]))
         me = me.at[3].set(
             jnp.where(
@@ -399,7 +432,7 @@ class Avoiding2D:
         me = me.at[4].set(jnp.where(jnp.logical_and(l2_trigger, r_x > L2_BOTTOM_XPOS), 1.0, me[4]))
         new_l2_passed = jnp.where(l2_trigger, 1.0, l2_passed)
 
-        l3_trigger = jnp.logical_and(r_y >= L3_YPOS, l3_passed < 0.5)
+        l3_trigger = jnp.logical_and(jnp.logical_and(self.l3_enabled, r_y >= L3_YPOS), l3_passed < 0.5)
         me = me.at[5].set(jnp.where(jnp.logical_and(l3_trigger, r_x < L3_TOP_XPOS), 1.0, me[5]))
         me = me.at[6].set(
             jnp.where(
@@ -416,7 +449,7 @@ class Avoiding2D:
         me = me.at[8].set(jnp.where(jnp.logical_and(l3_trigger, r_x >= L3_BOTTOM_XPOS), 1.0, me[8]))
         new_l3_passed = jnp.where(l3_trigger, 1.0, l3_passed)
 
-        return me, new_l1_passed, new_l2_passed, new_l3_passed
+        return me * self.mode_layer_enabled_float, new_l1_passed, new_l2_passed, new_l3_passed
 
     def render(self, state):
         if not self.should_render:

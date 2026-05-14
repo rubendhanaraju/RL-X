@@ -31,6 +31,8 @@ FALLBACK_OBSTACLE_XY = np.array(
     dtype=np.float32,
 )
 FALLBACK_OBSTACLE_RADIUS = np.array([0.03, 0.025, 0.025, 0.025, 0.025, 0.025], dtype=np.float32)
+FALLBACK_OBSTACLE_LAYER_ID = np.array([0, 1, 1, 2, 2, 2], dtype=np.int32)
+FALLBACK_MODE_LAYER_ID = np.array([0, 0, 1, 1, 1, 2, 2, 2, 2], dtype=np.int32)
 FALLBACK_VIEW_X_MIN = 0.2
 FALLBACK_VIEW_X_MAX = 0.8
 FALLBACK_VIEW_Y_MIN = -0.35
@@ -40,7 +42,7 @@ FALLBACK_FINISH_LINE_HALF_WIDTH = 0.3
 FALLBACK_FINISH_LINE_HALF_HEIGHT = 0.01
 FALLBACK_REWARD_OBSTACLE_FALLOFF_RADIUS = 0.2
 FALLBACK_REWARD_PROGRESS_COEFF = 1.0
-FALLBACK_REWARD_OBSTACLE_COEFF = 0.2
+FALLBACK_REWARD_OBSTACLE_COEFF = 0.0
 FALLBACK_REWARD_CENTERLINE_COEFF = 0.0
 FALLBACK_REWARD_COLLISION_PENALTY = 1.0
 FALLBACK_REWARD_GOAL_BONUS = 2.0
@@ -57,6 +59,8 @@ try:
         FINISH_LINE_HALF_WIDTH,
         GOAL_YPOS,
         INIT_XY,
+        MODE_LAYER_ID,
+        OBSTACLE_LAYER_ID,
         REWARD_CENTERLINE_COEFF,
         REWARD_COLLISION_PENALTY,
         REWARD_GOAL_BONUS,
@@ -79,6 +83,8 @@ except ModuleNotFoundError as exc:
     jnp = None
     get_config = None
     Avoiding2D = None
+    OBSTACLE_LAYER_ID = FALLBACK_OBSTACLE_LAYER_ID
+    MODE_LAYER_ID = FALLBACK_MODE_LAYER_ID
     CENTER_X = FALLBACK_CENTER_X
     INIT_XY = FALLBACK_INIT_XY
     VIEW_X_MIN = FALLBACK_VIEW_X_MIN
@@ -102,6 +108,7 @@ class Scene:
     env: object | None
     obstacle_xy: np.ndarray
     obstacle_radius: np.ndarray
+    mode_layer_enabled: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -139,24 +146,59 @@ def parse_args() -> argparse.Namespace:
         help="Optional mode id to set to 1 in the mode encoding while plotting.",
     )
     parser.add_argument("--no-obstacles", action="store_true")
+    parser.add_argument(
+        "--obstacle-layer-1",
+        dest="obstacle_layer_1_enabled",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Enable or disable obstacle layer 1.",
+    )
+    parser.add_argument(
+        "--obstacle-layer-2",
+        dest="obstacle_layer_2_enabled",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Enable or disable obstacle layer 2.",
+    )
+    parser.add_argument(
+        "--obstacle-layer-3",
+        dest="obstacle_layer_3_enabled",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Enable or disable obstacle layer 3.",
+    )
     parser.add_argument("--no-sliders", action="store_true", help="Render a static plot without interactive sliders.")
     parser.add_argument("--output", type=pathlib.Path, default=None, help="Optional output image path.")
     parser.add_argument("--no-show", action="store_true", help="Save/prepare the plot without opening a window.")
     return parser.parse_args()
 
 
-def build_scene(no_obstacles: bool, mode_reward_index: int) -> Scene:
+def build_scene(no_obstacles: bool, mode_reward_index: int, obstacle_layer_enabled: tuple[bool, bool, bool]) -> Scene:
+    layer_enabled = np.asarray(obstacle_layer_enabled, dtype=np.bool_)
+    if no_obstacles:
+        layer_enabled = np.zeros((3,), dtype=np.bool_)
+    mode_layer_enabled = layer_enabled[np.asarray(MODE_LAYER_ID, dtype=np.int32)]
+
     if HAS_AVOIDING_2D_ENV:
         env_config = get_config("custom_jax.avoiding_2d")
         env_config.render = False
         env_config.no_obstacles = no_obstacles
+        env_config.obstacle_layer_1_enabled = bool(layer_enabled[0])
+        env_config.obstacle_layer_2_enabled = bool(layer_enabled[1])
+        env_config.obstacle_layer_3_enabled = bool(layer_enabled[2])
         env_config.mode_reward_index = mode_reward_index
         env = Avoiding2D(env_config)
-        return Scene(env, np.asarray(env.obstacle_xy), np.asarray(env.obstacle_radius))
+        return Scene(env, np.asarray(env.obstacle_xy), np.asarray(env.obstacle_radius), np.asarray(env.mode_layer_enabled))
 
     if no_obstacles:
-        return Scene(None, np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.float32))
-    return Scene(None, FALLBACK_OBSTACLE_XY, FALLBACK_OBSTACLE_RADIUS)
+        return Scene(
+            None,
+            np.zeros((0, 2), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+            mode_layer_enabled,
+        )
+    obstacle_mask = layer_enabled[np.asarray(OBSTACLE_LAYER_ID, dtype=np.int32)]
+    return Scene(None, FALLBACK_OBSTACLE_XY[obstacle_mask], FALLBACK_OBSTACLE_RADIUS[obstacle_mask], mode_layer_enabled)
 
 
 def default_reward_params(scene: Scene) -> RewardParams:
@@ -227,7 +269,7 @@ def rewards_at_points(
     }
     rewards = sum(components.values()) if component == "total" else components[component]
     if component == "total" and active_mode is not None:
-        mode_bonus = 1.0 if mode_reward_index == active_mode else 0.0
+        mode_bonus = 1.0 if mode_reward_index == active_mode and scene.mode_layer_enabled[active_mode] else 0.0
         rewards = rewards + mode_bonus
     return rewards
 
@@ -406,7 +448,15 @@ def main() -> None:
     if args.resolution <= 1:
         raise ValueError("--resolution must be greater than 1")
 
-    scene = build_scene(args.no_obstacles, args.mode_reward_index)
+    scene = build_scene(
+        args.no_obstacles,
+        args.mode_reward_index,
+        (
+            args.obstacle_layer_1_enabled,
+            args.obstacle_layer_2_enabled,
+            args.obstacle_layer_3_enabled,
+        ),
+    )
     initial_params = default_reward_params(scene)
     params_state = {"params": initial_params}
     bounds = (args.x_min, args.x_max, args.y_min, args.y_max)

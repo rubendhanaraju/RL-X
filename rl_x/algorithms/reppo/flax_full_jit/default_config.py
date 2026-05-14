@@ -59,7 +59,8 @@ def get_config(algorithm_name):
     config.aux_loss_mult = 1.0
 
     config.enable_observation_normalization = True
-    config.normalizer_epsilon = 1e-8
+    config.normalizer_epsilon = 1e-2
+    config.randomize_initial_episode_steps = True
 
     config.evaluation_and_save_frequency = -1  # evaluate/save once at the end
     config.evaluation_active = True

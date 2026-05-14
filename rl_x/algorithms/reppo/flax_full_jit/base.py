@@ -26,6 +26,102 @@ from rl_x.algorithms.reppo.flax_full_jit.utils import hl_gauss, tree_norm
 rlx_logger = logging.getLogger("rl_x")
 
 
+def compute_reppo_lambda_targets(rewards, values, terminations, truncations, importance_weights, gamma, lmbda):
+    def compute_nstep_lambda(carry, transition):
+        lambda_return, truncated, importance_weight = carry
+        reward, value, done, current_truncated, current_importance_weight = transition
+        importance_lambda = jnp.exp(importance_weight) * lmbda
+        lambda_sum = importance_lambda * lambda_return + (1.0 - importance_lambda) * value
+        delta = gamma * jnp.where(truncated, value, (1.0 - done) * lambda_sum)
+        lambda_return = reward + delta
+        return (lambda_return, current_truncated, current_importance_weight), lambda_return
+
+    _, target_values = jax.lax.scan(
+        compute_nstep_lambda,
+        (
+            values[-1],
+            jnp.ones_like(truncations[0]),
+            jnp.zeros_like(importance_weights[0]),
+        ),
+        (rewards, values, terminations, truncations, importance_weights),
+        reverse=True,
+    )
+    return target_values
+
+
+def compute_reppo_critic_loss(
+    critic_update_loss,
+    pred_emb,
+    pred_rew,
+    value,
+    target_next_embs,
+    rewards,
+    target_values,
+    terminations,
+    truncations,
+    aux_loss_mult,
+):
+    aux_emb_loss = optax.squared_error(pred_emb, target_next_embs)
+    aux_rew_loss = optax.squared_error(pred_rew, rewards[:, None])
+    aux_loss = jnp.mean(
+        (1.0 - terminations[:, None]) * jnp.concatenate([aux_emb_loss, aux_rew_loss], axis=-1),
+        axis=-1,
+    )
+    value_loss = jnp.mean(optax.squared_error(value, target_values))
+    loss = jnp.mean((1.0 - truncations) * (critic_update_loss + aux_loss_mult * aux_loss))
+    return loss, {
+        "value_loss": value_loss,
+        "critic_update_loss": jnp.mean(critic_update_loss),
+        "aux_loss": jnp.mean(aux_loss),
+        "reward_aux_loss": jnp.mean(aux_rew_loss),
+    }
+
+
+def compute_reppo_actor_loss(
+    policy_log_prob,
+    value,
+    entropy,
+    kl,
+    temperature,
+    lagrangian,
+    action_size_target,
+    kl_bound,
+    reduce_kl,
+    actor_kl_clip_mode,
+    update_entropy_lagrangian,
+    update_kl_lagrangian,
+):
+    sac_loss = policy_log_prob * jax.lax.stop_gradient(temperature) - value
+    if actor_kl_clip_mode == "full":
+        actor_loss = sac_loss + kl * jax.lax.stop_gradient(lagrangian) * reduce_kl
+    elif actor_kl_clip_mode == "clipped":
+        actor_loss = jnp.where(
+            kl < kl_bound,
+            sac_loss,
+            kl * jax.lax.stop_gradient(lagrangian) * reduce_kl,
+        )
+    elif actor_kl_clip_mode == "value":
+        actor_loss = sac_loss
+    else:
+        raise ValueError(f"Unknown actor_kl_clip_mode: {actor_kl_clip_mode}")
+
+    target_entropy_loss = temperature * jax.lax.stop_gradient(action_size_target + entropy)
+    lagrangian_loss = -lagrangian * jax.lax.stop_gradient(kl - kl_bound)
+
+    loss = jnp.mean(actor_loss)
+    if update_entropy_lagrangian:
+        loss = loss + jnp.mean(target_entropy_loss)
+    if update_kl_lagrangian:
+        loss = loss + jnp.mean(lagrangian_loss)
+
+    return loss, {
+        "actor_loss": jnp.mean(actor_loss),
+        "entropy_lagrangian_loss": jnp.mean(target_entropy_loss),
+        "kl_lagrangian_loss": jnp.mean(lagrangian_loss),
+        "sac_loss": jnp.mean(sac_loss),
+    }
+
+
 class RePPOBase:
     def __init__(self, config, train_env, eval_env, run_path, writer):
         self.config = config
@@ -95,6 +191,8 @@ class RePPOBase:
         self.as_shape = self.train_env.single_action_space.shape
         self.horizon = self.train_env.horizon
         self.action_size_target = jnp.prod(jnp.asarray(self.as_shape)) * self.ent_target_mult
+        self.policy_observation_indices = getattr(self.train_env, "policy_observation_indices", jnp.arange(self.os_shape[0]))
+        self.critic_observation_indices = getattr(self.train_env, "critic_observation_indices", jnp.arange(self.os_shape[0]))
 
         if self.evaluation_and_save_frequency % self.batch_size != 0:
             raise ValueError("Evaluation and save frequency must be a multiple of batch size.")
@@ -132,15 +230,7 @@ class RePPOBase:
             tx=critic_tx,
         )
 
-        if self.enable_observation_normalization:
-            self.observation_normalizer_state = {
-                "running_mean": jnp.zeros((1, self.os_shape[0]), dtype=jnp.float32),
-                "running_var": jnp.ones((1, self.os_shape[0]), dtype=jnp.float32),
-                "running_std_dev": jnp.ones((1, self.os_shape[0]), dtype=jnp.float32),
-                "count": jnp.zeros((), dtype=jnp.float32),
-            }
-        else:
-            self.observation_normalizer_state = {}
+        self.observation_normalizer_state = self.initialize_observation_normalizer(env_state.next_observation)
 
         if self.save_model:
             os.makedirs(self.save_path, exist_ok=True)
@@ -180,56 +270,171 @@ class RePPOBase:
         base = jnp.ones((self.exploration_base_envs, 1), dtype=jnp.float32) * self.exploration_noise_min
         return jnp.concatenate([base, offset], axis=0)
 
-    def normalize_observation(self, observation, observation_normalizer_state):
+    def initialize_observation_normalizer(self, observation):
+        if not self.enable_observation_normalization:
+            return {}
+
+        policy_observation = observation[..., self.policy_observation_indices]
+        critic_observation = observation[..., self.critic_observation_indices]
+        return {
+            "policy_mean": jnp.mean(policy_observation, axis=0),
+            "policy_var": jnp.var(policy_observation, axis=0),
+            "critic_mean": jnp.mean(critic_observation, axis=0),
+            "critic_var": jnp.var(critic_observation, axis=0),
+            "count": jnp.asarray(observation.shape[0], dtype=jnp.float32),
+        }
+
+    def initialize_legacy_observation_normalizer(self):
+        if not self.enable_observation_normalization:
+            return {}
+
+        return {
+            "running_mean": jnp.zeros((1, self.os_shape[0]), dtype=jnp.float32),
+            "running_var": jnp.ones((1, self.os_shape[0]), dtype=jnp.float32),
+            "running_std_dev": jnp.ones((1, self.os_shape[0]), dtype=jnp.float32),
+            "count": jnp.zeros((), dtype=jnp.float32),
+        }
+
+    def migrate_observation_normalizer(self, observation_normalizer_state):
+        if not self.enable_observation_normalization or "running_mean" not in observation_normalizer_state:
+            return observation_normalizer_state
+
+        running_mean = jnp.asarray(observation_normalizer_state["running_mean"])
+        running_var = jnp.asarray(observation_normalizer_state["running_var"])
+        if running_mean.ndim > 1:
+            running_mean = running_mean.reshape((-1, self.os_shape[0]))[0]
+        if running_var.ndim > 1:
+            running_var = running_var.reshape((-1, self.os_shape[0]))[0]
+
+        return {
+            "policy_mean": running_mean[self.policy_observation_indices],
+            "policy_var": running_var[self.policy_observation_indices],
+            "critic_mean": running_mean[self.critic_observation_indices],
+            "critic_var": running_var[self.critic_observation_indices],
+            "count": observation_normalizer_state["count"],
+        }
+
+    def normalize_observation(self, observation, observation_normalizer_state, observation_type):
         if self.enable_observation_normalization:
-            return (observation - observation_normalizer_state["running_mean"]) / (
-                observation_normalizer_state["running_std_dev"] + self.normalizer_epsilon
-            )
+            if observation_type == "policy":
+                indices = self.policy_observation_indices
+                mean = observation_normalizer_state["policy_mean"]
+                var = observation_normalizer_state["policy_var"]
+            elif observation_type == "critic":
+                indices = self.critic_observation_indices
+                mean = observation_normalizer_state["critic_mean"]
+                var = observation_normalizer_state["critic_var"]
+            else:
+                raise ValueError(f"Unknown observation_type: {observation_type}")
+
+            normalized_selected_observation = (observation[..., indices] - mean) / jnp.sqrt(var + self.normalizer_epsilon)
+            return observation.at[..., indices].set(normalized_selected_observation)
         return observation
 
-    def update_observation_normalizer(self, observation_normalizer_state, states, next_states):
-        if not self.enable_observation_normalization:
-            return observation_normalizer_state, states, next_states
-
-        combined_states = jnp.concatenate(
-            [states.reshape(-1, self.os_shape[0]), next_states.reshape(-1, self.os_shape[0])],
-            axis=0,
-        )
-        batch_mean = jnp.mean(combined_states, axis=0, keepdims=True)
-        batch_var = jnp.var(combined_states, axis=0, keepdims=True)
-        batch_count = combined_states.shape[0]
-        old_count = observation_normalizer_state["count"]
-        new_count = old_count + batch_count
-        delta = batch_mean - observation_normalizer_state["running_mean"]
-        new_mean = observation_normalizer_state["running_mean"] + delta * batch_count / new_count
-        delta2 = batch_mean - new_mean
-        m_a = observation_normalizer_state["running_var"] * old_count
+    def update_normalizer_stats(self, mean, var, count, observation):
+        batch_mean = jnp.mean(observation, axis=0)
+        batch_var = jnp.var(observation, axis=0)
+        batch_count = observation.shape[0]
+        total_count = count + batch_count
+        delta = batch_mean - mean
+        new_mean = mean + delta * batch_count / total_count
+        m_a = var * count
         m_b = batch_var * batch_count
-        m2 = m_a + m_b + jnp.square(delta2) * old_count * batch_count / new_count
-        new_var = m2 / new_count
-        new_std = jnp.sqrt(new_var)
-        new_state = {
-            "running_mean": new_mean,
-            "running_var": new_var,
-            "running_std_dev": new_std,
-            "count": new_count,
+        m2 = m_a + m_b + jnp.square(delta) * count * batch_count / total_count
+        new_var = m2 / total_count
+        return new_mean, new_var
+
+    def update_observation_normalizer(self, observation_normalizer_state, observation):
+        if not self.enable_observation_normalization:
+            return observation_normalizer_state
+
+        policy_observation = observation[..., self.policy_observation_indices]
+        critic_observation = observation[..., self.critic_observation_indices]
+        count = observation_normalizer_state["count"]
+        policy_mean, policy_var = self.update_normalizer_stats(
+            observation_normalizer_state["policy_mean"],
+            observation_normalizer_state["policy_var"],
+            count,
+            policy_observation,
+        )
+        critic_mean, critic_var = self.update_normalizer_stats(
+            observation_normalizer_state["critic_mean"],
+            observation_normalizer_state["critic_var"],
+            count,
+            critic_observation,
+        )
+        return {
+            "policy_mean": policy_mean,
+            "policy_var": policy_var,
+            "critic_mean": critic_mean,
+            "critic_var": critic_var,
+            "count": count + observation.shape[0],
         }
-        normalized_states = (states - new_mean) / (new_std + self.normalizer_epsilon)
-        normalized_next_states = (next_states - new_mean) / (new_std + self.normalizer_epsilon)
-        return new_state, normalized_states, normalized_next_states
+
+    def random_initial_episode_steps(self, key, counter):
+        return jax.random.randint(
+            key,
+            counter.shape,
+            0,
+            self.horizon,
+        ).astype(counter.dtype)
+
+    def randomize_counter_dict(self, counter_dict, key, counter_names):
+        for counter_name in counter_names:
+            if counter_name in counter_dict:
+                return {
+                    **counter_dict,
+                    counter_name: self.random_initial_episode_steps(key, counter_dict[counter_name]),
+                }, True
+        return counter_dict, False
+
+    def randomize_episode_counters(self, env_state, key):
+        changed = False
+
+        if hasattr(env_state, "info_episode_store"):
+            info_episode_store, store_changed = self.randomize_counter_dict(
+                env_state.info_episode_store,
+                key,
+                ("episode_length", "episode_step"),
+            )
+            if store_changed:
+                env_state = env_state.replace(info_episode_store=info_episode_store)
+                changed = True
+
+        if hasattr(env_state, "info"):
+            info, info_changed = self.randomize_counter_dict(env_state.info, key, ("steps",))
+            if info_changed:
+                env_state = env_state.replace(info=info)
+                changed = True
+
+        if hasattr(env_state, "env_state"):
+            nested_env_state, nested_changed = self.randomize_episode_counters(env_state.env_state, key)
+            if nested_changed:
+                env_state = env_state.replace(env_state=nested_env_state)
+                changed = True
+
+        return env_state, changed
+
+    def randomize_initial_episode_steps_if_enabled(self, env_state, key):
+        if not getattr(self.config.algorithm, "randomize_initial_episode_steps", True):
+            return env_state
+
+        env_state, _ = self.randomize_episode_counters(env_state, key)
+        return env_state
 
     def train(self):
         exploration_scale = self.exploration_scale()
 
         def jitable_train_function(key, parallel_seed_id):
-            key, reset_key = jax.random.split(key, 2)
+            key, reset_key, randomize_steps_key = jax.random.split(key, 3)
             reset_keys = jax.random.split(reset_key, self.nr_envs)
             env_state = self.train_env.reset(reset_keys, False)
+            env_state = self.randomize_initial_episode_steps_if_enabled(env_state, randomize_steps_key)
 
             actor_state = self.actor_state
             target_actor_state = self.target_actor_state
             critic_state = self.critic_state
-            observation_normalizer_state = self.observation_normalizer_state
+            observation_normalizer_state = self.initialize_observation_normalizer(env_state.next_observation)
 
             def multi_learning_and_eval_save_iteration(carry, multi_learning_iteration_step):
                 actor_state, target_actor_state, critic_state, observation_normalizer_state, env_state, key = carry
@@ -242,16 +447,17 @@ class RePPOBase:
                         key, action_key, next_action_key = jax.random.split(key, 3)
 
                         observation = env_state.next_observation
-                        normalized_observation = self.normalize_observation(observation, observation_normalizer_state)
+                        policy_observation = self.normalize_observation(observation, observation_normalizer_state, "policy")
+                        critic_observation = self.normalize_observation(observation, observation_normalizer_state, "critic")
                         action, _, _, sample_info = self.policy.sample_action(
                             actor_state.params,
-                            normalized_observation,
+                            policy_observation,
                             action_key,
                             exploration_scale,
                         )
                         importance_weight = self.policy.behavior_importance_weight(
                             actor_state.params,
-                            normalized_observation,
+                            policy_observation,
                             sample_info,
                             exploration_scale,
                             self.lmbda_min,
@@ -259,16 +465,29 @@ class RePPOBase:
 
                         env_state = self.train_env.step(env_state, action)
                         next_observation = env_state.actual_next_observation
-                        normalized_next_observation = self.normalize_observation(next_observation, observation_normalizer_state)
+                        observation_normalizer_state = self.update_observation_normalizer(
+                            observation_normalizer_state,
+                            next_observation,
+                        )
+                        next_policy_observation = self.normalize_observation(
+                            next_observation,
+                            observation_normalizer_state,
+                            "policy",
+                        )
+                        next_critic_observation = self.normalize_observation(
+                            next_observation,
+                            observation_normalizer_state,
+                            "critic",
+                        )
                         next_action, next_policy_log_prob, _, _ = self.policy.sample_action(
                             actor_state.params,
-                            normalized_next_observation,
+                            next_policy_observation,
                             next_action_key,
                             1.0,
                         )
                         next_emb, _, _, value = self.critic.apply(
                             {"params": critic_state.params},
-                            normalized_next_observation,
+                            next_critic_observation,
                             next_action,
                             method=self.critic.forward,
                         )
@@ -276,8 +495,8 @@ class RePPOBase:
                         soft_reward = env_state.reward - self.gamma * next_policy_log_prob * temperature
 
                         transition = (
-                            observation,
-                            next_observation,
+                            policy_observation,
+                            critic_observation,
                             action,
                             env_state.reward,
                             soft_reward,
@@ -305,8 +524,8 @@ class RePPOBase:
                     )
                     actor_state, critic_state, observation_normalizer_state, env_state, key = rollout_carry
                     (
-                        states,
-                        next_states,
+                        policy_states,
+                        critic_states,
                         actions,
                         rewards,
                         soft_rewards,
@@ -318,35 +537,18 @@ class RePPOBase:
                         infos,
                     ) = batch
 
-                    observation_normalizer_state, states, next_states = self.update_observation_normalizer(
-                        observation_normalizer_state,
-                        states,
-                        next_states,
+                    target_values = compute_reppo_lambda_targets(
+                        soft_rewards,
+                        values,
+                        terminations,
+                        truncations,
+                        importance_weights,
+                        self.gamma,
+                        self.lmbda,
                     )
 
-                    def compute_nstep_lambda(carry, transition):
-                        lambda_return, truncated, importance_weight = carry
-                        reward, value, done, current_truncated, current_importance_weight = transition
-                        lambda_sum = (
-                            jnp.exp(importance_weight) * self.lmbda * lambda_return
-                            + (1.0 - jnp.exp(importance_weight) * self.lmbda) * value
-                        )
-                        delta = self.gamma * jnp.where(truncated, value, (1.0 - done) * lambda_sum)
-                        lambda_return = reward + delta
-                        return (lambda_return, current_truncated, current_importance_weight), lambda_return
-
-                    _, target_values = jax.lax.scan(
-                        compute_nstep_lambda,
-                        (
-                            values[-1],
-                            jnp.ones_like(truncations[0]),
-                            jnp.zeros_like(importance_weights[0]),
-                        ),
-                        (soft_rewards, values, terminations, truncations, importance_weights),
-                        reverse=True,
-                    )
-
-                    batch_states = states.reshape((-1,) + self.os_shape)
+                    batch_policy_states = policy_states.reshape((-1,) + self.os_shape)
+                    batch_critic_states = critic_states.reshape((-1,) + self.os_shape)
                     batch_actions = actions.reshape((-1,) + self.as_shape)
                     batch_next_embs = next_embs.reshape((self.batch_size, -1))
                     batch_rewards = rewards.reshape(-1)
@@ -358,7 +560,7 @@ class RePPOBase:
 
                     def critic_loss_fn(critic_params, minibatch):
                         (
-                            minibatch_states,
+                            minibatch_critic_states,
                             minibatch_actions,
                             minibatch_next_embs,
                             minibatch_rewards,
@@ -370,7 +572,7 @@ class RePPOBase:
                         if self.hl_gauss:
                             critic_pred = self.critic.apply(
                                 {"params": critic_params},
-                                minibatch_states,
+                                minibatch_critic_states,
                                 minibatch_actions,
                                 method=self.critic.critic_cat,
                             )
@@ -384,7 +586,7 @@ class RePPOBase:
                         else:
                             critic_pred = self.critic.apply(
                                 {"params": critic_params},
-                                minibatch_states,
+                                minibatch_critic_states,
                                 minibatch_actions,
                                 method=self.critic.critic,
                             )
@@ -392,27 +594,27 @@ class RePPOBase:
 
                         _, pred_emb, pred_rew, value = self.critic.apply(
                             {"params": critic_params},
-                            minibatch_states,
+                            minibatch_critic_states,
                             minibatch_actions,
                             method=self.critic.forward,
                         )
-                        aux_emb_loss = optax.squared_error(pred_emb, minibatch_next_embs)
-                        aux_rew_loss = optax.squared_error(pred_rew, minibatch_rewards[:, None])
-                        aux_loss = jnp.mean(
-                            (1.0 - minibatch_terminations[:, None])
-                            * jnp.concatenate([aux_emb_loss, aux_rew_loss], axis=-1),
-                            axis=-1,
-                        )
-                        value_loss = jnp.mean(optax.squared_error(value, minibatch_target_values))
-                        loss = jnp.mean(
-                            (1.0 - minibatch_truncations)
-                            * (critic_update_loss + self.aux_loss_mult * aux_loss)
+                        loss, critic_loss_metrics = compute_reppo_critic_loss(
+                            critic_update_loss,
+                            pred_emb,
+                            pred_rew,
+                            value,
+                            minibatch_next_embs,
+                            minibatch_rewards,
+                            minibatch_target_values,
+                            minibatch_terminations,
+                            minibatch_truncations,
+                            self.aux_loss_mult,
                         )
                         metrics = {
-                            "loss/critic_loss": value_loss,
-                            "loss/critic_update_loss": jnp.mean(critic_update_loss),
-                            "loss/critic_aux_loss": jnp.mean(aux_loss),
-                            "loss/critic_reward_aux_loss": jnp.mean(aux_rew_loss),
+                            "loss/critic_loss": critic_loss_metrics["value_loss"],
+                            "loss/critic_update_loss": critic_loss_metrics["critic_update_loss"],
+                            "loss/critic_aux_loss": critic_loss_metrics["aux_loss"],
+                            "loss/critic_reward_aux_loss": critic_loss_metrics["reward_aux_loss"],
                             "q/value": jnp.mean(value),
                             "q/target_value": jnp.mean(minibatch_target_values),
                             "data/reward": jnp.mean(minibatch_rewards),
@@ -421,24 +623,24 @@ class RePPOBase:
                         return loss, metrics
 
                     def actor_loss_fn(actor_params, critic_params, target_actor_params, minibatch, key):
-                        minibatch_states, minibatch_actions, minibatch_rewards, minibatch_target_values = minibatch
+                        minibatch_policy_states, minibatch_critic_states, minibatch_actions, minibatch_rewards, minibatch_target_values = minibatch
                         key, action_key, kl_key = jax.random.split(key, 3)
                         pred_action, policy_log_prob, entropy, sample_info = self.policy.sample_action(
                             actor_params,
-                            minibatch_states,
+                            minibatch_policy_states,
                             action_key,
                             1.0,
                         )
                         value = self.critic.apply(
                             {"params": critic_params},
-                            minibatch_states,
+                            minibatch_critic_states,
                             pred_action,
                             method=self.critic.critic,
                         )
                         kl = self.policy.kl_divergence(
                             actor_params,
                             target_actor_params,
-                            minibatch_states,
+                            minibatch_policy_states,
                             kl_key,
                             self.kl_action_rep,
                             self.reverse_kl,
@@ -446,34 +648,26 @@ class RePPOBase:
                         temperature = self.policy.temperature(actor_params)
                         lagrangian = self.policy.lagrangian(actor_params)
 
-                        sac_loss = policy_log_prob * jax.lax.stop_gradient(temperature) - value
-                        if self.actor_kl_clip_mode == "full":
-                            actor_loss = sac_loss + kl * jax.lax.stop_gradient(lagrangian) * self.reduce_kl
-                        elif self.actor_kl_clip_mode == "clipped":
-                            actor_loss = jnp.where(
-                                kl < self.kl_bound,
-                                sac_loss,
-                                kl * jax.lax.stop_gradient(lagrangian) * self.reduce_kl,
-                            )
-                        elif self.actor_kl_clip_mode == "value":
-                            actor_loss = sac_loss
-                        else:
-                            raise ValueError(f"Unknown actor_kl_clip_mode: {self.actor_kl_clip_mode}")
-
-                        target_entropy_loss = temperature * jax.lax.stop_gradient(self.action_size_target + entropy)
-                        lagrangian_loss = -lagrangian * jax.lax.stop_gradient(kl - self.kl_bound)
-
-                        loss = jnp.mean(actor_loss)
-                        if self.update_entropy_lagrangian:
-                            loss = loss + jnp.mean(target_entropy_loss)
-                        if self.update_kl_lagrangian:
-                            loss = loss + jnp.mean(lagrangian_loss)
+                        loss, actor_loss_metrics = compute_reppo_actor_loss(
+                            policy_log_prob,
+                            value,
+                            entropy,
+                            kl,
+                            temperature,
+                            lagrangian,
+                            self.action_size_target,
+                            self.kl_bound,
+                            self.reduce_kl,
+                            self.actor_kl_clip_mode,
+                            self.update_entropy_lagrangian,
+                            self.update_kl_lagrangian,
+                        )
 
                         metrics = {
-                            "loss/actor_loss": jnp.mean(actor_loss),
+                            "loss/actor_loss": actor_loss_metrics["actor_loss"],
                             "loss/actor_total_loss": loss,
-                            "loss/entropy_lagrangian_loss": jnp.mean(target_entropy_loss),
-                            "loss/kl_lagrangian_loss": jnp.mean(lagrangian_loss),
+                            "loss/entropy_lagrangian_loss": actor_loss_metrics["entropy_lagrangian_loss"],
+                            "loss/kl_lagrangian_loss": actor_loss_metrics["kl_lagrangian_loss"],
                             "entropy/temperature": temperature,
                             "entropy/policy_entropy": jnp.mean(entropy),
                             "policy/kl": jnp.mean(kl),
@@ -493,7 +687,7 @@ class RePPOBase:
                         key, actor_key = jax.random.split(key)
 
                         critic_minibatch = (
-                            batch_states[minibatch_indices],
+                            batch_critic_states[minibatch_indices],
                             batch_actions[minibatch_indices],
                             batch_next_embs[minibatch_indices],
                             batch_rewards[minibatch_indices],
@@ -502,7 +696,8 @@ class RePPOBase:
                             batch_truncations[minibatch_indices],
                         )
                         actor_minibatch = (
-                            batch_states[minibatch_indices],
+                            batch_policy_states[minibatch_indices],
+                            batch_critic_states[minibatch_indices],
                             batch_actions[minibatch_indices],
                             batch_rewards[minibatch_indices],
                             batch_target_values[minibatch_indices],
@@ -590,7 +785,11 @@ class RePPOBase:
                     def single_eval_rollout(carry, _):
                         actor_state, observation_normalizer_state, eval_env_state, key = carry
                         key, action_key = jax.random.split(key)
-                        eval_observation = self.normalize_observation(eval_env_state.next_observation, observation_normalizer_state)
+                        eval_observation = self.normalize_observation(
+                            eval_env_state.next_observation,
+                            observation_normalizer_state,
+                            "policy",
+                        )
                         eval_action = self.policy.deterministic_action(actor_state.params, eval_observation, action_key)
                         eval_env_state = self.eval_env.step(eval_env_state, eval_action)
                         return (actor_state, observation_normalizer_state, eval_env_state, key), None
@@ -715,22 +914,33 @@ class RePPOBase:
                 config.algorithm[key] = value
         model = cls(config, train_env, eval_env, run_path, writer)
 
-        target = {
-            "actor": model.actor_state,
-            "target_actor": model.target_actor_state,
-            "critic": model.critic_state,
-            "observation_normalizer": model.observation_normalizer_state,
-        }
-        restore_args = orbax_utils.restore_args_from_target(target)
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-        checkpoint = checkpointer.restore(checkpoint_dir, item=target, restore_args=restore_args)
+        try:
+            target = {
+                "actor": model.actor_state,
+                "target_actor": model.target_actor_state,
+                "critic": model.critic_state,
+                "observation_normalizer": model.observation_normalizer_state,
+            }
+            try:
+                restore_args = orbax_utils.restore_args_from_target(target)
+                checkpoint = checkpointer.restore(checkpoint_dir, item=target, restore_args=restore_args)
+            except Exception:
+                target = {
+                    "actor": model.actor_state,
+                    "target_actor": model.target_actor_state,
+                    "critic": model.critic_state,
+                    "observation_normalizer": model.initialize_legacy_observation_normalizer(),
+                }
+                restore_args = orbax_utils.restore_args_from_target(target)
+                checkpoint = checkpointer.restore(checkpoint_dir, item=target, restore_args=restore_args)
 
-        model.actor_state = checkpoint["actor"]
-        model.target_actor_state = checkpoint["target_actor"]
-        model.critic_state = checkpoint["critic"]
-        model.observation_normalizer_state = checkpoint["observation_normalizer"]
-
-        shutil.rmtree(checkpoint_dir)
+            model.actor_state = checkpoint["actor"]
+            model.target_actor_state = checkpoint["target_actor"]
+            model.critic_state = checkpoint["critic"]
+            model.observation_normalizer_state = model.migrate_observation_normalizer(checkpoint["observation_normalizer"])
+        finally:
+            shutil.rmtree(checkpoint_dir)
         return model
 
     def test(self, episodes):
@@ -739,7 +949,11 @@ class RePPOBase:
         @jax.jit
         def rollout(env_state, key):
             key, action_key = jax.random.split(key)
-            observation = self.normalize_observation(env_state.next_observation, self.observation_normalizer_state)
+            observation = self.normalize_observation(
+                env_state.next_observation,
+                self.observation_normalizer_state,
+                "policy",
+            )
             action = self.policy.deterministic_action(self.actor_state.params, observation, action_key)
             env_state = self.train_env.step(env_state, action)
             return env_state, key

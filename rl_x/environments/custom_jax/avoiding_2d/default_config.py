@@ -25,6 +25,9 @@ def get_config(environment_name):
     config.terminate_on_collision = False
     config.terminate_on_goal = False
     config.no_obstacles = False
+    config.obstacle_layer_1_enabled = True
+    config.obstacle_layer_2_enabled = True
+    config.obstacle_layer_3_enabled = True
     config.mode_reward_index = -1  # -1 disables mode reward; 5, 6, 7, 8 match the provided mode variants.
 
     return config
