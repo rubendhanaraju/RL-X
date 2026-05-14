@@ -43,10 +43,10 @@ VIEW_Y_MIN = -0.35
 VIEW_Y_MAX = 0.42
 FINISH_LINE_HALF_WIDTH = 0.3
 FINISH_LINE_HALF_HEIGHT = 0.01
-REWARD_OBSTACLE_FALLOFF_RADIUS = 0.02
-REWARD_PROGRESS_COEFF = 1.5
-REWARD_OBSTACLE_COEFF = 0.5
-REWARD_CENTERLINE_COEFF = 2.0
+REWARD_OBSTACLE_FALLOFF_RADIUS = 0.2
+REWARD_PROGRESS_COEFF = 1.0
+REWARD_OBSTACLE_COEFF = 0.0
+REWARD_CENTERLINE_COEFF = 0.0
 REWARD_COLLISION_PENALTY = 1.0
 REWARD_GOAL_BONUS = 2.0
 
@@ -129,6 +129,7 @@ class Avoiding2D:
             reward,
             reward,
             collision,
+            collision,
             point_xy,
             mode_encoding,
             reward,
@@ -176,7 +177,7 @@ class Avoiding2D:
         action = jnp.clip(action, -self.action_limit, self.action_limit)
 
         target_action = state.prev_action + action
-        point_xy, collision, mode_encoding, l1_passed, l2_passed, l3_passed = self._step_assumed_controller(
+        point_xy, collision, step_collision, mode_encoding, l1_passed, l2_passed, l3_passed = self._step_assumed_controller(
             state.point_xy,
             target_action,
             state.collision,
@@ -185,7 +186,7 @@ class Avoiding2D:
             state.l2_passed,
             state.l3_passed,
         )
-        reward = self._reward(point_xy, collision, mode_encoding)
+        reward = self._reward(point_xy, step_collision, mode_encoding)
 
         episode_length = state.info_episode_store["episode_length"] + 1
         timeout = episode_length >= self.horizon
@@ -200,6 +201,7 @@ class Avoiding2D:
             jnp.where(done, episode_return, state.info["rollout/episode_return"]),
             jnp.where(done, episode_length, state.info["rollout/episode_length"]),
             collision,
+            step_collision,
             point_xy,
             mode_encoding,
             l1_passed,
@@ -259,10 +261,11 @@ class Avoiding2D:
         delta = (target_action - point_xy) / jnp.asarray(self.n_substeps, dtype=jnp.float32)
 
         def scan_step(carry, _):
-            point_xy, collision, mode_encoding, l1_passed, l2_passed, l3_passed, blocked = carry
+            point_xy, collision, step_collision, mode_encoding, l1_passed, l2_passed, l3_passed, blocked = carry
             desired_xy = point_xy + delta
             new_collision = self._check_segment_collision(point_xy, desired_xy)
             collision = jnp.maximum(collision, new_collision)
+            step_collision = jnp.maximum(step_collision, new_collision)
             blocked = jnp.logical_or(
                 blocked,
                 jnp.logical_and(self.block_on_collision, new_collision > 0.5),
@@ -279,22 +282,33 @@ class Avoiding2D:
                 l2_passed,
                 l3_passed,
             )
-            return (point_xy, collision, mode_encoding, l1_passed, l2_passed, l3_passed, blocked), None
+            return (point_xy, collision, step_collision, mode_encoding, l1_passed, l2_passed, l3_passed, blocked), None
 
-        (point_xy, collision, mode_encoding, l1_passed, l2_passed, l3_passed, blocked), _ = jax.lax.scan(
-            scan_step,
-            (point_xy, collision, mode_encoding, l1_passed, l2_passed, l3_passed, jnp.asarray(False)),
-            None,
-            length=self.n_substeps,
-        )
+        (point_xy, collision, step_collision, mode_encoding, l1_passed, l2_passed, l3_passed,
+         blocked), _ = jax.lax.scan(
+             scan_step,
+             (
+                 point_xy,
+                 collision,
+                 jnp.zeros_like(collision),
+                 mode_encoding,
+                 l1_passed,
+                 l2_passed,
+                 l3_passed,
+                 jnp.asarray(False),
+             ),
+             None,
+             length=self.n_substeps,
+         )
         point_xy = jnp.where(blocked, point_xy, target_action)
-        return point_xy, collision, mode_encoding, l1_passed, l2_passed, l3_passed
+        return point_xy, collision, step_collision, mode_encoding, l1_passed, l2_passed, l3_passed
 
     def _info(
         self,
         episode_return,
         episode_length,
         collision,
+        step_collision,
         point_xy,
         mode_encoding,
         l1_passed,
@@ -303,12 +317,13 @@ class Avoiding2D:
         reached_goal,
         action_norm,
     ):
-        mode = jnp.sum(mode_encoding * (2.0 ** jnp.arange(mode_encoding.shape[0], dtype=jnp.float32)))
+        mode = jnp.sum(mode_encoding * (2.0**jnp.arange(mode_encoding.shape[0], dtype=jnp.float32)))
         mode_info = {f"env_info/mode_{mode_id}": mode_encoding[mode_id] for mode_id in range(9)}
         return {
             "rollout/episode_return": episode_return,
             "rollout/episode_length": episode_length,
             "env_info/collision": collision,
+            "env_info/step_collision": step_collision,
             "env_info/goal_y": point_xy[1],
             "env_info/reached_goal": reached_goal,
             "env_info/action_norm": action_norm,
