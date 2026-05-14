@@ -55,17 +55,15 @@ class Avoiding2D:
 
     def __init__(self, env_config):
         self.should_render = env_config.render
-        self.render_only_eval = bool(env_config.get("render_only_eval", True))
         self.render_max_envs = int(env_config.get("render_max_envs", 1))
         self.render_max_trajectories = int(env_config.get("render_max_trajectories", 1))
 
         self.sim_dt = float(env_config.sim_dt)
         self.ctrl_dt = float(env_config.ctrl_dt)
-        self.n_substeps = int(env_config.n_substeps)
-        self.effective_ctrl_dt = jnp.float32(self.sim_dt * self.n_substeps)
+        self.n_substeps = max(int(env_config.n_substeps), 1)
         self.horizon = int(env_config.max_steps)
-        self.action_scale = jnp.float32(env_config.action_scale)
-        self.max_action = jnp.float32(env_config.max_action)
+        self.action_limit = jnp.float32(env_config.get("action_limit", env_config.get("max_action", 0.01)))
+        self.max_action = self.action_limit
         self.point_radius = jnp.float32(env_config.point_radius)
         self.collision_margin = jnp.float32(env_config.collision_margin)
         self.block_on_collision = bool(env_config.block_on_collision)
@@ -87,8 +85,8 @@ class Avoiding2D:
             dtype=jnp.float32,
         )
         self.single_action_space = BoxSpace(
-            low=-self.max_action,
-            high=self.max_action,
+            low=-self.action_limit,
+            high=self.action_limit,
             shape=(2,),
             dtype=jnp.float32,
         )
@@ -175,25 +173,13 @@ class Avoiding2D:
     def _step(self, state, action):
         key, _ = jax.random.split(state.key)
         action = jnp.asarray(action, dtype=jnp.float32)
-        action = jnp.clip(action, -self.max_action, self.max_action)
+        action = jnp.clip(action, -self.action_limit, self.action_limit)
 
-        desired_xy = state.prev_action + action * self.action_scale * self.effective_ctrl_dt
-        desired_xy = jnp.clip(
-            desired_xy,
-            jnp.array([VIEW_X_MIN, VIEW_Y_MIN], dtype=jnp.float32),
-            jnp.array([VIEW_X_MAX, VIEW_Y_MAX], dtype=jnp.float32),
-        )
-
-        new_collision = self._check_segment_collision(state.point_xy, desired_xy)
-        collision = jnp.maximum(state.collision, new_collision)
-        point_xy = jnp.where(
-            self.block_on_collision & (new_collision > 0.5),
+        target_action = state.prev_action + action
+        point_xy, collision, mode_encoding, l1_passed, l2_passed, l3_passed = self._step_assumed_controller(
             state.point_xy,
-            desired_xy,
-        )
-        prev_action = point_xy
-        mode_encoding, l1_passed, l2_passed, l3_passed = self._check_mode(
-            point_xy,
+            target_action,
+            state.collision,
             state.mode_encoding,
             state.l1_passed,
             state.l2_passed,
@@ -209,7 +195,7 @@ class Avoiding2D:
         done = terminated | truncated
         episode_return = state.info_episode_store["episode_return"] + reward
 
-        observation = jnp.concatenate([prev_action, point_xy])
+        observation = jnp.concatenate([target_action, point_xy])
         info = self._info(
             jnp.where(done, episode_return, state.info["rollout/episode_return"]),
             jnp.where(done, episode_length, state.info["rollout/episode_length"]),
@@ -237,7 +223,7 @@ class Avoiding2D:
             key=key,
             eval_mode=state.eval_mode,
             point_xy=point_xy,
-            prev_action=prev_action,
+            prev_action=target_action,
             collision=collision,
             mode_encoding=mode_encoding,
             l1_passed=l1_passed,
@@ -259,6 +245,51 @@ class Avoiding2D:
 
         return jax.lax.cond(done, when_done, lambda _: new_state, None)
 
+    @partial(jax.jit, static_argnums=(0,))
+    def _step_assumed_controller(
+        self,
+        point_xy,
+        target_action,
+        collision,
+        mode_encoding,
+        l1_passed,
+        l2_passed,
+        l3_passed,
+    ):
+        delta = (target_action - point_xy) / jnp.asarray(self.n_substeps, dtype=jnp.float32)
+
+        def scan_step(carry, _):
+            point_xy, collision, mode_encoding, l1_passed, l2_passed, l3_passed, blocked = carry
+            desired_xy = point_xy + delta
+            new_collision = self._check_segment_collision(point_xy, desired_xy)
+            collision = jnp.maximum(collision, new_collision)
+            blocked = jnp.logical_or(
+                blocked,
+                jnp.logical_and(self.block_on_collision, new_collision > 0.5),
+            )
+            point_xy = jnp.where(
+                jnp.logical_and(self.block_on_collision, new_collision > 0.5),
+                point_xy,
+                desired_xy,
+            )
+            mode_encoding, l1_passed, l2_passed, l3_passed = self._check_mode(
+                point_xy,
+                mode_encoding,
+                l1_passed,
+                l2_passed,
+                l3_passed,
+            )
+            return (point_xy, collision, mode_encoding, l1_passed, l2_passed, l3_passed, blocked), None
+
+        (point_xy, collision, mode_encoding, l1_passed, l2_passed, l3_passed, blocked), _ = jax.lax.scan(
+            scan_step,
+            (point_xy, collision, mode_encoding, l1_passed, l2_passed, l3_passed, jnp.asarray(False)),
+            None,
+            length=self.n_substeps,
+        )
+        point_xy = jnp.where(blocked, point_xy, target_action)
+        return point_xy, collision, mode_encoding, l1_passed, l2_passed, l3_passed
+
     def _info(
         self,
         episode_return,
@@ -272,6 +303,7 @@ class Avoiding2D:
         reached_goal,
         action_norm,
     ):
+        mode = jnp.sum(mode_encoding * (2.0 ** jnp.arange(mode_encoding.shape[0], dtype=jnp.float32)))
         mode_info = {f"env_info/mode_{mode_id}": mode_encoding[mode_id] for mode_id in range(9)}
         return {
             "rollout/episode_return": episode_return,
@@ -280,6 +312,7 @@ class Avoiding2D:
             "env_info/goal_y": point_xy[1],
             "env_info/reached_goal": reached_goal,
             "env_info/action_norm": action_norm,
+            "env_info/mode": mode,
             "env_info/l1_passed": l1_passed,
             "env_info/l2_passed": l2_passed,
             "env_info/l3_passed": l3_passed,
@@ -373,11 +406,6 @@ class Avoiding2D:
     def render(self, state):
         if not self.should_render:
             return state
-
-        if self.render_only_eval:
-            eval_mode = np.asarray(state.eval_mode, dtype=np.bool_)
-            if not np.any(eval_mode):
-                return state
 
         import matplotlib.pyplot as plt
 

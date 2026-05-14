@@ -304,23 +304,56 @@ class RePPO_DIME:
             "count": count + observation.shape[0],
         }
 
+    def random_initial_episode_steps(self, key, counter):
+        return jax.random.randint(
+            key,
+            counter.shape,
+            0,
+            self.horizon,
+        ).astype(counter.dtype)
+
+    def randomize_counter_dict(self, counter_dict, key, counter_names):
+        for counter_name in counter_names:
+            if counter_name in counter_dict:
+                return {
+                    **counter_dict,
+                    counter_name: self.random_initial_episode_steps(key, counter_dict[counter_name]),
+                }, True
+        return counter_dict, False
+
+    def randomize_episode_counters(self, env_state, key):
+        changed = False
+
+        if hasattr(env_state, "info_episode_store"):
+            info_episode_store, store_changed = self.randomize_counter_dict(
+                env_state.info_episode_store,
+                key,
+                ("episode_length", "episode_step"),
+            )
+            if store_changed:
+                env_state = env_state.replace(info_episode_store=info_episode_store)
+                changed = True
+
+        if hasattr(env_state, "info"):
+            info, info_changed = self.randomize_counter_dict(env_state.info, key, ("steps",))
+            if info_changed:
+                env_state = env_state.replace(info=info)
+                changed = True
+
+        if hasattr(env_state, "env_state"):
+            nested_env_state, nested_changed = self.randomize_episode_counters(env_state.env_state, key)
+            if nested_changed:
+                env_state = env_state.replace(env_state=nested_env_state)
+                changed = True
+
+        return env_state, changed
+
     def randomize_initial_episode_steps_if_enabled(self, env_state, key):
         if not self.randomize_initial_episode_steps:
             return env_state
-        if "episode_length" not in env_state.info_episode_store:
-            return env_state
 
-        random_steps = jax.random.randint(
-            key,
-            env_state.info_episode_store["episode_length"].shape,
-            0,
-            self.horizon,
-        ).astype(jnp.float32)
-        info_episode_store = {
-            **env_state.info_episode_store,
-            "episode_length": random_steps,
-        }
-        return env_state.replace(info_episode_store=info_episode_store)
+        env_state, _ = self.randomize_episode_counters(env_state, key)
+        return env_state
 
     def select_eval_action(self, actor_params, observation, key):
         if self.eval_action_mode == "sde":
