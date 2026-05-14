@@ -1,0 +1,8 @@
+from rl_x.environments.environment_manager import extract_environment_name_from_file, register_environment
+from rl_x.environments.custom_jax.avoiding_2d.default_config import get_config
+from rl_x.environments.custom_jax.avoiding_2d.create_env import create_train_and_eval_env
+from rl_x.environments.custom_jax.avoiding_2d.general_properties import GeneralProperties
+
+
+AVOIDING_2D = extract_environment_name_from_file(__file__)
+register_environment(AVOIDING_2D, get_config, create_train_and_eval_env, GeneralProperties)

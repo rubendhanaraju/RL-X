@@ -16,7 +16,7 @@ class D3ILTask(ABC):
     mode_state_size = 8
     action_size = 2
     control_mode = "cartesian_delta"
-    cartesian_delta_anchor = "agent_xy"
+    cartesian_delta_anchor = "target_action"
     control_substeps = 35
     control_agent_z = 0.12
     terminate_on_success = True

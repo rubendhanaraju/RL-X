@@ -9,6 +9,7 @@ from rl_x.environments.custom_jax.multi_goal.state import State
 
 
 class MultiGoal:
+
     def __init__(self, env_config):
         self.should_render = env_config.render
         self.horizon = env_config.horizon
@@ -49,6 +50,8 @@ class MultiGoal:
         self._ax = None
         self._env_lines = []
         self._trajectories = None
+        self._goal_success_counts = np.zeros(len(self.goal_positions), dtype=np.int64)
+        self._last_episode_lengths = None
 
     @partial(jax.vmap, in_axes=(None, 0, None))
     @partial(jax.jit, static_argnums=(0, 2))
@@ -67,6 +70,7 @@ class MultiGoal:
             "env_info/closest_goal": closest_goal,
             "env_info/reached_goal": reward,
             "env_info/action_norm": reward,
+            **self._per_goal_success_percentage_info(jnp.zeros(len(self.goal_positions), dtype=jnp.float32)),
         }
         info_episode_store = {
             "episode_return": reward,
@@ -87,6 +91,20 @@ class MultiGoal:
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state, action):
         next_state = jax.vmap(self._step)(state, action)
+        success_percentages = self._per_goal_success_percentages(
+            next_state.info["env_info/closest_goal"],
+            next_state.terminated,
+        )
+        batched_success_percentages = jnp.broadcast_to(
+            success_percentages[:, None],
+            (len(self.goal_positions), next_state.terminated.shape[0]),
+        )
+        next_state = next_state.replace(
+            info={
+                **next_state.info,
+                **self._per_goal_success_percentage_info(batched_success_percentages),
+            }
+        )
 
         if self.should_render:
             jax.debug.callback(lambda render_state: self.render(render_state), next_state)
@@ -120,6 +138,7 @@ class MultiGoal:
             "env_info/closest_goal": closest_goal,
             "env_info/reached_goal": reached_goal.astype(jnp.float32),
             "env_info/action_norm": jnp.linalg.norm(action),
+            **self._per_goal_success_percentage_info(jnp.zeros(len(self.goal_positions), dtype=jnp.float32)),
         }
 
         new_state = State(
@@ -161,9 +180,25 @@ class MultiGoal:
     def _reward(self, observation, action):
         action_cost = self.action_cost_coefficient * jnp.sum(jnp.square(action))
         goal_cost = self.distance_cost_coefficient * jnp.min(
-            jnp.sum(jnp.square(observation[None, :] - self.goal_positions), axis=1)
-        )
+            jnp.sum(jnp.square(observation[None, :] - self.goal_positions), axis=1))
         return -(action_cost + goal_cost)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _per_goal_success_percentages(self, closest_goals, reached_goals):
+        reached_goals = reached_goals.astype(jnp.float32)
+        nr_successes = jnp.sum(reached_goals)
+        goal_ids = jnp.arange(len(self.goal_positions))
+        success_counts = jnp.sum(
+            reached_goals[:, None] * (closest_goals[:, None] == goal_ids[None, :]).astype(jnp.float32),
+            axis=0,
+        )
+        return jnp.where(nr_successes > 0.0, 100.0 * success_counts / nr_successes, 0.0)
+
+    def _per_goal_success_percentage_info(self, success_percentages):
+        return {
+            f"env_info/reached_goal_{goal_id}_percentage": success_percentages[goal_id]
+            for goal_id in range(len(self.goal_positions))
+        }
 
     def render(self, state):
         if not self.should_render:
@@ -182,13 +217,37 @@ class MultiGoal:
         positions = np.asarray(state.actual_next_observation, dtype=np.float32)
         reset_positions = np.asarray(state.next_observation, dtype=np.float32)
         done = np.asarray(state.terminated | state.truncated, dtype=np.bool_)
+        terminated = np.asarray(state.terminated, dtype=np.bool_)
+        closest_goals = np.asarray(state.info["env_info/closest_goal"], dtype=np.int64)
         episode_lengths = np.asarray(state.info_episode_store["episode_length"], dtype=np.float32)
 
         if positions.ndim == 1:
             positions = positions[None, :]
             reset_positions = reset_positions[None, :]
             done = done.reshape(1)
+            terminated = terminated.reshape(1)
+            closest_goals = closest_goals.reshape(1)
             episode_lengths = episode_lengths.reshape(1)
+
+        rollout_restarted = (
+            self._last_episode_lengths is not None
+            and np.all(episode_lengths <= 1)
+            and np.max(self._last_episode_lengths) > 1
+        )
+        if rollout_restarted:
+            self._goal_success_counts = np.zeros(len(self.goal_positions), dtype=np.int64)
+            self._trajectories = [[position.copy()] for position in positions]
+
+        successful_goals = closest_goals[terminated]
+        if successful_goals.size > 0:
+            self._goal_success_counts += np.bincount(
+                successful_goals,
+                minlength=len(self._goal_success_counts),
+            )[:len(self._goal_success_counts)]
+        goal_counts = " | ".join(
+            f"G{goal_id}: {count}" for goal_id, count in enumerate(self._goal_success_counts)
+        )
+        self._ax.set_title(f"Multigoal Environment - successes ({goal_counts})")
 
         nr_rendered_envs = min(self.render_max_envs, positions.shape[0])
         positions = positions[:nr_rendered_envs]
@@ -222,6 +281,8 @@ class MultiGoal:
             if env_done:
                 self._trajectories[env_id] = [reset_positions[env_id].copy()]
 
+        self._last_episode_lengths = episode_lengths.copy()
+
         return state
 
     def close(self):
@@ -233,6 +294,8 @@ class MultiGoal:
             self._ax = None
             self._env_lines = []
             self._trajectories = None
+            self._goal_success_counts = np.zeros(len(self.goal_positions), dtype=np.int64)
+            self._last_episode_lengths = None
 
     def _init_plot(self):
         import matplotlib.pyplot as plt
@@ -261,10 +324,7 @@ class MultiGoal:
         x_grid, y_grid = np.meshgrid(x_values, y_values)
         goal_positions = np.asarray(self.goal_positions, dtype=np.float32)
         goal_costs = np.min(
-            [
-                (x_grid - goal_x) ** 2 + (y_grid - goal_y) ** 2
-                for goal_x, goal_y in goal_positions
-            ],
+            [(x_grid - goal_x)**2 + (y_grid - goal_y)**2 for goal_x, goal_y in goal_positions],
             axis=0,
         )
         contours = self._ax.contour(x_grid, y_grid, goal_costs, 20)

@@ -75,20 +75,49 @@ class D3ILMjx:
 
         self.avoidance_rod_geom_ids_np, self.avoidance_obstacle_geom_ids_np = self._avoidance_collision_geom_ids_np()
 
+        self.control_mj_model = self._build_robot_control_model()
+        self.control_robot_qpos_adrs_np, self.control_robot_dof_adrs_np = self._control_robot_joint_metadata_np()
+        self.control_tcp_body_id = mujoco.mj_name2id(self.control_mj_model, mujoco.mjtObj.mjOBJ_BODY, "tcp")
+        if self.control_tcp_body_id < 0:
+            raise ValueError("D3IL robot control model is missing the tcp body")
+
         self.mjx_model = mjx.put_model(self.mj_model)
         self.mjx_data = mjx.make_data(self.mjx_model)
+        self.control_mjx_model = mjx.put_model(self.control_mj_model)
+        self.control_mjx_data = mjx.make_data(self.control_mjx_model)
         self.initial_qpos = jnp.asarray(self.initial_qpos_np, dtype=self.mjx_data.qpos.dtype)
         self.initial_qvel = jnp.zeros_like(self.mjx_data.qvel)
         self.initial_ctrl = jnp.zeros((self.mj_model.nu,), dtype=self.mjx_data.ctrl.dtype)
         self.initial_agent_xy = jnp.asarray(self.task.initial_agent_xy, dtype=self.mjx_data.qpos.dtype)
         self.robot_qpos_adrs = jnp.asarray(self.robot_qpos_adrs_np, dtype=jnp.int32)
         self.robot_dof_adrs = jnp.asarray(self.robot_dof_adrs_np, dtype=jnp.int32)
+        self.control_robot_qpos_adrs = jnp.asarray(self.control_robot_qpos_adrs_np, dtype=jnp.int32)
+        self.control_robot_dof_adrs = jnp.asarray(self.control_robot_dof_adrs_np, dtype=jnp.int32)
         self.finger_qpos_adrs = jnp.asarray(self.finger_qpos_adrs_np, dtype=jnp.int32)
         self.finger_dof_adrs = jnp.asarray(self.finger_dof_adrs_np, dtype=jnp.int32)
         self.robot_actuator_ids = jnp.asarray(self.robot_actuator_ids_np, dtype=jnp.int32)
         self.finger_actuator_ids = jnp.asarray(self.finger_actuator_ids_np, dtype=jnp.int32)
         self.object_qpos_adrs = tuple(int(adr) for adr in self.object_qpos_adrs_np)
         self.target_qpos_adrs = tuple(int(adr) for adr in self.target_qpos_adrs_np)
+        freejoint_qpos_offsets_np = np.arange(7, dtype=np.int32)
+        pos_qpos_offsets_np = np.arange(3, dtype=np.int32)
+        quat_qpos_offsets_np = 3 + np.arange(4, dtype=np.int32)
+        self.object_freejoint_qpos_adrs = jnp.asarray(
+            self.object_qpos_adrs_np[:, None] + freejoint_qpos_offsets_np[None, :],
+            dtype=jnp.int32,
+        )
+        self.object_pos_qpos_adrs = jnp.asarray(
+            self.object_qpos_adrs_np[:, None] + pos_qpos_offsets_np[None, :],
+            dtype=jnp.int32,
+        )
+        self.object_quat_qpos_adrs = jnp.asarray(
+            self.object_qpos_adrs_np[:, None] + quat_qpos_offsets_np[None, :],
+            dtype=jnp.int32,
+        )
+        self.target_freejoint_qpos_adrs = jnp.asarray(
+            self.target_qpos_adrs_np[:, None] + freejoint_qpos_offsets_np[None, :],
+            dtype=jnp.int32,
+        )
         self.initial_robot_qpos = jnp.asarray(self.initial_qpos_np[self.robot_qpos_adrs_np], dtype=self.mjx_data.qpos.dtype)
         self.control_robot_qpos = jnp.asarray(self.control_qpos_np[self.robot_qpos_adrs_np], dtype=self.mjx_data.qpos.dtype)
         self.robot_joint_ranges = jnp.asarray(self.robot_joint_ranges_np, dtype=self.mjx_data.qpos.dtype)
@@ -115,9 +144,17 @@ class D3ILMjx:
         self.cart_learning_rate = jnp.asarray(0.001, dtype=self.mjx_data.qpos.dtype)
         self.cart_joint_filter = jnp.asarray(1.0, dtype=self.mjx_data.qpos.dtype)
         self.cart_desired_quat = jnp.asarray([0.0, 1.0, 0.0, 0.0], dtype=self.mjx_data.qpos.dtype)
+        self.terminate_on_success = jnp.asarray(self.task.terminate_on_success, dtype=jnp.bool_)
         self.avoidance_rod_geom_ids = jnp.asarray(self.avoidance_rod_geom_ids_np, dtype=jnp.int32)
         self.avoidance_obstacle_geom_ids = jnp.asarray(self.avoidance_obstacle_geom_ids_np, dtype=jnp.int32)
         self.mjx_data = self.mjx_data.replace(qpos=self.initial_qpos, qvel=self.initial_qvel, ctrl=self.initial_ctrl)
+        self.control_mjx_data = mjx.forward(
+            self.control_mjx_model,
+            self.control_mjx_data.replace(
+                qpos=jnp.zeros_like(self.control_mjx_data.qpos),
+                qvel=jnp.zeros_like(self.control_mjx_data.qvel),
+            ),
+        )
 
         self.viewer = None
         if self.should_render:
@@ -202,6 +239,30 @@ class D3ILMjx:
 
         return mujoco.MjModel.from_xml_string(Et.tostring(root, encoding="unicode"), assets)
 
+    def _build_robot_control_model(self):
+        assets = {}
+        robot_root = Et.parse(self.assets_root / "models" / "mj" / "robot" / "panda.xml").getroot()
+        root = Et.Element("mujoco", {"model": "d3il_robot_control"})
+        for child in list(robot_root):
+            if child.tag == "sensor":
+                continue
+            root.append(deepcopy(child))
+
+        asset_dir = self.assets_root / "models" / "mj" / "robot" / "assets"
+        for asset_path in asset_dir.rglob("*"):
+            if asset_path.is_file():
+                assets[asset_path.name] = asset_path.read_bytes()
+
+        model = mujoco.MjModel.from_xml_string(Et.tostring(root, encoding="unicode"), assets)
+        model.geom_margin[:] = 0.0
+        model.geom_gap[:] = 0.0
+        for geom_id in range(model.ngeom):
+            geom = model.geom(geom_id)
+            if geom.type == mujoco.mjtGeom.mjGEOM_MESH or geom.name.endswith("_tip_collision"):
+                model.geom_contype[geom_id] = 0
+                model.geom_conaffinity[geom_id] = 0
+        return model
+
     def _enable_table_surface_collision(self, root):
         for body in root.iter("body"):
             if body.get("name") != "table_plane":
@@ -252,41 +313,57 @@ class D3ILMjx:
 
     def _solve_robot_qpos_np(self, target_xyz):
         data = mujoco.MjData(self.mj_model)
-        qpos = data.qpos.copy()
+        base_qpos = data.qpos.copy()
         default_qpos = np.array(
             [3.57795216e-09, 1.74532920e-01, 3.30500960e-08, -8.72664630e-01, -1.14096181e-07, 1.22173047e00, 7.85398126e-01],
             dtype=np.float64,
         )
         qpos_adrs, dof_adrs, ranges = self._robot_joint_metadata_np()
         if qpos_adrs.size == 0:
-            return qpos
+            return base_qpos
 
-        qpos[qpos_adrs] = default_qpos
-        data.qpos[:] = qpos
         body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "tcp")
         if body_id < 0:
-            return qpos
+            return base_qpos
 
         desired_quat = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64)
-        quat_weight = 0.05
-        damping = 1e-3
-        for _ in range(300):
+        q = default_qpos.copy()
+        for _ in range(400):
+            data.qpos[:] = base_qpos
+            data.qvel[:] = 0.0
+            data.ctrl[:] = 0.0
+            data.qpos[qpos_adrs] = q
             mujoco.mj_forward(self.mj_model, data)
+
             current_quat = data.xquat[body_id]
             signed_desired_quat = desired_quat
             if np.linalg.norm(current_quat - signed_desired_quat) > np.linalg.norm(current_quat + signed_desired_quat):
                 signed_desired_quat = -signed_desired_quat
-            err = np.concatenate([target_xyz - data.xpos[body_id], quat_weight * self._quat_error_np(current_quat, signed_desired_quat)])
-            if np.linalg.norm(err) < 1e-4:
+
+            pos_err = target_xyz - data.xpos[body_id]
+            quat_err = self._quat_error_np(current_quat, signed_desired_quat)
+            if np.linalg.norm(pos_err) < 1e-4 and np.linalg.norm(quat_err) < 1e-4:
                 break
+
+            err = np.concatenate([10.0 * pos_err, quat_err])
             jacp = np.zeros((3, self.mj_model.nv), dtype=np.float64)
             jacr = np.zeros((3, self.mj_model.nv), dtype=np.float64)
-            mujoco.mj_jacBody(self.mj_model, data, jacp, jacr, body_id)
-            jac = np.concatenate([jacp[:, dof_adrs], quat_weight * jacr[:, dof_adrs]], axis=0)
-            lhs = jac @ jac.T + damping * np.eye(6)
+            mujoco.mj_jac(self.mj_model, data, jacp, jacr, data.xpos[body_id], body_id)
+            jac = np.vstack([jacp[:, dof_adrs], jacr[:, dof_adrs]])
+            damping = 1e-4
+            lhs = jac @ jac.T + damping * np.eye(6, dtype=np.float64)
             dq = jac.T @ np.linalg.solve(lhs, err)
-            q = data.qpos[qpos_adrs] + np.clip(dq, -0.05, 0.05)
-            data.qpos[qpos_adrs] = np.clip(q, ranges[:, 0], ranges[:, 1])
+            dq += 0.05 * (default_qpos - q)
+            dq_norm = np.linalg.norm(dq)
+            if dq_norm > 0.2:
+                dq = dq * (0.2 / dq_norm)
+            q = q + 0.2 * dq
+            q = np.clip(q, ranges[:, 0], ranges[:, 1])
+
+        data.qpos[:] = base_qpos
+        data.qvel[:] = 0.0
+        data.ctrl[:] = 0.0
+        data.qpos[qpos_adrs] = q
         mujoco.mj_forward(self.mj_model, data)
         return data.qpos.copy()
 
@@ -304,7 +381,8 @@ class D3ILMjx:
         qpos_adrs = []
         dof_adrs = []
         ranges = []
-        for joint_name in [f"panda_joint{i}" for i in range(1, 8)]:
+        legacy_ranges = self._legacy_robot_joint_ranges_np()
+        for joint_index, joint_name in enumerate([f"panda_joint{i}" for i in range(1, 8)]):
             joint_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
             if joint_id < 0:
                 return (
@@ -314,12 +392,37 @@ class D3ILMjx:
                 )
             qpos_adrs.append(self.mj_model.jnt_qposadr[joint_id])
             dof_adrs.append(self.mj_model.jnt_dofadr[joint_id])
-            ranges.append(self.mj_model.jnt_range[joint_id])
+            ranges.append(legacy_ranges[joint_index])
         return (
             np.asarray(qpos_adrs, dtype=np.int32),
             np.asarray(dof_adrs, dtype=np.int32),
             np.asarray(ranges, dtype=np.float32),
         )
+
+    def _legacy_robot_joint_ranges_np(self):
+        return np.asarray(
+            [
+                [-2.8973, 2.8973],
+                [-1.7628, 1.7628],
+                [-2.8973, 2.0],
+                [-3.0718, -0.0698],
+                [-2.8973, 2.8973],
+                [-0.0175, 3.7525],
+                [-2.8973, 2.8973],
+            ],
+            dtype=np.float32,
+        )
+
+    def _control_robot_joint_metadata_np(self):
+        qpos_adrs = []
+        dof_adrs = []
+        for joint_name in [f"panda_joint{i}" for i in range(1, 8)]:
+            joint_id = mujoco.mj_name2id(self.control_mj_model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+            if joint_id < 0:
+                raise ValueError(f"D3IL robot control model is missing joint {joint_name!r}")
+            qpos_adrs.append(self.control_mj_model.jnt_qposadr[joint_id])
+            dof_adrs.append(self.control_mj_model.jnt_dofadr[joint_id])
+        return np.asarray(qpos_adrs, dtype=np.int32), np.asarray(dof_adrs, dtype=np.int32)
 
     def _finger_joint_metadata_np(self):
         qpos_adrs = []
@@ -498,7 +601,7 @@ class D3ILMjx:
         observation = self.task.observation(target_action, agent_pos, agent_xy, object_pos, object_quat, object_xy, object_yaw, target_pos, target_quat, state.target_xy, state.target_yaw)
         episode_length = state.info_episode_store["episode_length"] + 1
         truncated = episode_length >= self.horizon
-        terminated = success & jnp.asarray(self.task.terminate_on_success, dtype=jnp.bool_)
+        terminated = success & self.terminate_on_success
         done = terminated | truncated
         episode_return = state.info_episode_store["episode_return"] + reward
         info = self._info_dict(done, episode_return, episode_length, success, mean_distance, mode, collision, self.task.extra_info(mode_state, success))
@@ -563,24 +666,16 @@ class D3ILMjx:
     def _set_data_poses(self, data, agent_xy, object_xy, object_yaw, target_xy, target_yaw):
         qpos = self.initial_qpos
         qpos = self._set_robot_qpos(qpos, agent_xy, self.initial_robot_qpos)
-        for object_id, qpos_adr in enumerate(self.object_qpos_adrs):
-            qpos = self._set_freejoint_qpos(
-                qpos,
-                qpos_adr,
-                object_xy[object_id],
-                self.object_zs[object_id],
-                object_yaw[object_id],
-                self.object_base_quats[object_id],
-            )
-        for target_id, qpos_adr in enumerate(self.target_qpos_adrs):
-            qpos = self._set_freejoint_qpos(
-                qpos,
-                qpos_adr,
-                target_xy[target_id],
-                self.target_zs[target_id],
-                target_yaw[target_id],
-                self.target_base_quats[target_id],
-            )
+        if self.nr_objects > 0:
+            object_pos = jnp.concatenate([object_xy.astype(qpos.dtype), self.object_zs[:, None]], axis=1)
+            object_quat = self._yaw_to_quat_batch(object_yaw.astype(qpos.dtype), self.object_base_quats)
+            object_qpos = jnp.concatenate([object_pos, object_quat], axis=1)
+            qpos = qpos.at[self.object_freejoint_qpos_adrs].set(object_qpos)
+        if self.nr_targets > 0:
+            target_pos = jnp.concatenate([target_xy.astype(qpos.dtype), self.target_zs[:, None]], axis=1)
+            target_quat = self._yaw_to_quat_batch(target_yaw.astype(qpos.dtype), self.target_base_quats)
+            target_qpos = jnp.concatenate([target_pos, target_quat], axis=1)
+            qpos = qpos.at[self.target_freejoint_qpos_adrs].set(target_qpos)
         data = data.replace(qpos=qpos, qvel=self.initial_qvel, ctrl=self.initial_ctrl)
         return mjx.forward(self.mjx_model, data)
 
@@ -659,10 +754,7 @@ class D3ILMjx:
     def _joint_tracking_control(self, data, target_robot_qpos, target_robot_qvel, target_robot_qacc, target_fingers, grasp_flag):
         q = data.qpos[self.robot_qpos_adrs]
         qd = data.qvel[self.robot_dof_adrs]
-        robot_mass = jnp.take(jnp.take(data.qM, self.robot_dof_adrs, axis=0), self.robot_dof_adrs, axis=1)
-        feedforward = robot_mass @ target_robot_qacc
-        torque = self.joint_kp * (target_robot_qpos - q) + self.joint_kd * (target_robot_qvel - qd) + feedforward + data.qfrc_bias[self.robot_dof_adrs]
-        torque = jnp.clip(torque, -self.joint_torque_limit, self.joint_torque_limit)
+        torque = self.joint_kp * (target_robot_qpos - q) + self.joint_kd * (target_robot_qvel - qd) + data.qfrc_bias[self.robot_dof_adrs]
 
         ctrl = jnp.zeros((self.mj_model.nu,), dtype=data.ctrl.dtype)
         ctrl = ctrl.at[self.robot_actuator_ids].set(torque)
@@ -677,19 +769,19 @@ class D3ILMjx:
         desired_c_pos = jnp.array([target_xy[0], target_xy[1], self.task.control_agent_z], dtype=data.qpos.dtype)
 
         def ik_iteration(q, _):
-            ik_data = self._robot_kinematics_data(data, q)
-            current_c_pos = ik_data.xpos[self.tcp_body_id]
-            current_c_quat = ik_data.xquat[self.tcp_body_id]
+            ik_data = self._robot_control_data(q)
+            current_c_pos = ik_data.xpos[self.control_tcp_body_id]
+            current_c_quat = ik_data.xquat[self.control_tcp_body_id]
             desired_quat = self._closest_quat(current_c_quat, self.cart_desired_quat)
 
             target_cpos_acc = jnp.clip(desired_c_pos - current_c_pos, -0.01, 0.01)
             target_cquat = jnp.clip(self._quat_error(current_c_quat, desired_quat), -0.1, 0.1)
             target_c_acc = jnp.concatenate([self.cart_pgain_pos * target_cpos_acc, self.cart_pgain_quat * target_cquat])
 
-            jacp, jacr = mjx.jac(self.mjx_model, ik_data, current_c_pos, self.tcp_body_id)
-            jac = jnp.concatenate([jacp[self.robot_dof_adrs].T, jacr[self.robot_dof_adrs].T], axis=0)
+            jacp, jacr = mjx.jac(self.control_mjx_model, ik_data, current_c_pos, self.control_tcp_body_id)
+            jac = jnp.concatenate([jacp[self.control_robot_dof_adrs].T, jacr[self.control_robot_dof_adrs].T], axis=0)
             jac_w = jac @ self.cart_w
-            jac_w_j_reg = jac_w @ jac.T + self.cart_j_reg * jnp.eye(6, dtype=data.qpos.dtype)
+            jac_w_j_reg = jac_w @ jac.T + self.cart_j_reg * jnp.eye(6, dtype=jac.dtype)
             u, s, vh = jnp.linalg.svd(jac_w_j_reg, full_matrices=False)
             s = jnp.clip(s, self.cart_min_svd, self.cart_max_svd)
             jac_w_j_reg = (u * s[None, :]) @ vh
@@ -709,9 +801,12 @@ class D3ILMjx:
         des_acc = self._clip_by_norm(des_acc, 10000.0)
         return q, qd_dsum, des_acc
 
-    def _robot_kinematics_data(self, data, robot_qpos):
-        qpos = data.qpos.at[self.robot_qpos_adrs].set(robot_qpos)
-        return mjx.kinematics(self.mjx_model, data.replace(qpos=qpos))
+    def _robot_control_data(self, robot_qpos, robot_qvel=None):
+        qpos = self.control_mjx_data.qpos.at[self.control_robot_qpos_adrs].set(robot_qpos)
+        qvel = self.control_mjx_data.qvel
+        if robot_qvel is not None:
+            qvel = qvel.at[self.control_robot_dof_adrs].set(robot_qvel)
+        return mjx.forward(self.control_mjx_model, self.control_mjx_data.replace(qpos=qpos, qvel=qvel))
 
     def _legacy_finger_control(self, data, target_fingers, grasp_flag):
         finger_q = data.qpos[self.finger_qpos_adrs]
@@ -758,10 +853,10 @@ class D3ILMjx:
             object_xy = jnp.zeros((0, 2), dtype=jnp.float32)
             object_yaw = jnp.zeros((0,), dtype=jnp.float32)
         else:
-            object_pos = jnp.stack([data.qpos[qpos_adr: qpos_adr + 3] for qpos_adr in self.object_qpos_adrs]).astype(jnp.float32)
-            object_quat = jnp.stack([data.qpos[qpos_adr + 3: qpos_adr + 7] for qpos_adr in self.object_qpos_adrs]).astype(jnp.float32)
+            object_pos = data.qpos[self.object_pos_qpos_adrs].astype(jnp.float32)
+            object_quat = data.qpos[self.object_quat_qpos_adrs].astype(jnp.float32)
             object_xy = object_pos[:, :2]
-            object_yaw = jax.vmap(self._quat_to_yaw)(object_quat)
+            object_yaw = self._quat_to_yaw_batch(object_quat)
 
         target_pos, target_quat = self._target_poses(target_xy, target_yaw)
         return agent_pos, agent_xy, object_pos, object_quat, object_xy, object_yaw, target_pos, target_quat
@@ -770,7 +865,7 @@ class D3ILMjx:
         if self.nr_targets == 0:
             return jnp.zeros((0, 3), dtype=jnp.float32), jnp.zeros((0, 4), dtype=jnp.float32)
         target_pos = jnp.concatenate([target_xy, self.target_zs[:, None]], axis=1).astype(jnp.float32)
-        target_quat = jax.vmap(self._yaw_to_quat)(target_yaw, self.target_base_quats).astype(jnp.float32)
+        target_quat = self._yaw_to_quat_batch(target_yaw, self.target_base_quats).astype(jnp.float32)
         return target_pos, target_quat
 
     def _has_avoidance_collision(self, data):
@@ -795,8 +890,21 @@ class D3ILMjx:
         yaw_quat = jnp.array([jnp.cos(0.5 * yaw), 0.0, 0.0, jnp.sin(0.5 * yaw)], dtype=base_quat.dtype)
         return self._quat_mul(yaw_quat, base_quat)
 
+    def _yaw_to_quat_batch(self, yaw, base_quat):
+        half_yaw = 0.5 * yaw
+        zeros = jnp.zeros_like(half_yaw)
+        yaw_quat = jnp.stack([jnp.cos(half_yaw), zeros, zeros, jnp.sin(half_yaw)], axis=-1).astype(base_quat.dtype)
+        return self._quat_mul_batch(yaw_quat, base_quat)
+
     def _quat_to_yaw(self, quat):
         w, x, y, z = quat
+        return jnp.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+    def _quat_to_yaw_batch(self, quat):
+        w = quat[..., 0]
+        x = quat[..., 1]
+        y = quat[..., 2]
+        z = quat[..., 3]
         return jnp.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
     def _quat_mul(self, a, b):
@@ -811,3 +919,22 @@ class D3ILMjx:
             ],
             dtype=a.dtype,
         )
+
+    def _quat_mul_batch(self, a, b):
+        aw = a[..., 0]
+        ax = a[..., 1]
+        ay = a[..., 2]
+        az = a[..., 3]
+        bw = b[..., 0]
+        bx = b[..., 1]
+        by = b[..., 2]
+        bz = b[..., 3]
+        return jnp.stack(
+            [
+                aw * bw - ax * bx - ay * by - az * bz,
+                aw * bx + ax * bw + ay * bz - az * by,
+                aw * by - ax * bz + ay * bw + az * bx,
+                aw * bz + ax * by - ay * bx + az * bw,
+            ],
+            axis=-1,
+        ).astype(a.dtype)

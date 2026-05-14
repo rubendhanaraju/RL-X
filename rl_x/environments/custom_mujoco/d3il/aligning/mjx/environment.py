@@ -17,6 +17,7 @@ class AligningTask(D3ILTask):
     include_targets_in_observation = True
     initial_agent_xy = np.array([0.525, -0.35], dtype=np.float32)
     initial_agent_z = 0.25
+    control_agent_z = 0.25
 
     def object_base_quats_np(self):
         return np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)

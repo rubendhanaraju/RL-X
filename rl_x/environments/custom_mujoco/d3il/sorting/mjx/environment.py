@@ -15,6 +15,7 @@ class SortingTask(D3ILTask):
     mode_state_size = 12
     initial_agent_xy = np.array([0.525, -0.3], dtype=np.float32)
     initial_agent_z = 0.25
+    control_agent_z = 0.25
     camera_distance = 2.0
 
     def __init__(self, env_config):

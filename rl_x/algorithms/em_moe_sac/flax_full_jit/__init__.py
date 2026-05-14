@@ -1,0 +1,8 @@
+from rl_x.algorithms.algorithm_manager import extract_algorithm_name_from_file, register_algorithm
+from rl_x.algorithms.em_moe_sac.flax_full_jit.em_moe_sac import EMMoESAC
+from rl_x.algorithms.em_moe_sac.flax_full_jit.default_config import get_config
+from rl_x.algorithms.em_moe_sac.flax_full_jit.general_properties import GeneralProperties
+
+
+EM_MOE_SAC_FLAX_FULL_JIT = extract_algorithm_name_from_file(__file__)
+register_algorithm(EM_MOE_SAC_FLAX_FULL_JIT, get_config, EMMoESAC, GeneralProperties)
