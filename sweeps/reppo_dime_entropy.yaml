@@ -1,0 +1,37 @@
+program: experiments/experiment.py
+name: reppo_dime_entropy_avoiding2d_l2_only
+method: grid
+
+metric:
+  name: eval/episode_return
+  goal: maximize
+
+parameters:
+  ent_start:
+    values: [1.0, 2.0]
+  ent_target_mult:
+    values: [1.0, 2.0, 3.0, 4.0]
+
+command:
+  - conda
+  - run
+  - -n
+  - rlx
+  - python
+  - ${program}
+  - --algorithm.name=reppo_dime.flax_full_jit
+  - --environment.name=custom_jax.avoiding_2d
+  - --runner.track_console=True
+  - --runner.save_model=True
+  - --algorithm.evaluation_and_save_frequency=524288
+  - --environment.render=False
+  - --runner.track_wandb=True
+  - --runner.wandb_entity=rubendhanaraju-university-of-porto
+  - --runner.project_name=rlx-reppo-dime
+  - --runner.exp_name=avoiding_massive
+  - --runner.run_name=reppo_dime_avoiding_2d_4096_ent_${ent_start}_target_${ent_target_mult}
+  - --environment.obstacle_layer_1_enabled=False
+  - --environment.obstacle_layer_2_enabled=True
+  - --environment.obstacle_layer_3_enabled=False
+  - --algorithm.ent_start=${ent_start}
+  - --algorithm.ent_target_mult=${ent_target_mult}
