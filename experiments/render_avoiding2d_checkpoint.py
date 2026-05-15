@@ -37,6 +37,13 @@ def parse_args():
     parser.add_argument("--eval-action-mode", choices=("sde", "ode"), default="sde")
     parser.add_argument("--no-obstacles", action="store_true")
     parser.add_argument(
+        "--bounds-collision",
+        dest="bounds_collision",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Enable or disable collisions with the Avoiding2D workspace bounds.",
+    )
+    parser.add_argument(
         "--obstacle-layer-1",
         dest="obstacle_layer_1_enabled",
         default=True,
@@ -76,6 +83,7 @@ def build_config(args):
     config.environment.nr_envs = args.num_trajectories
     config.environment.render = False
     config.environment.no_obstacles = args.no_obstacles
+    config.environment.enable_bounds_collision = args.bounds_collision
     config.environment.obstacle_layer_1_enabled = args.obstacle_layer_1_enabled
     config.environment.obstacle_layer_2_enabled = args.obstacle_layer_2_enabled
     config.environment.obstacle_layer_3_enabled = args.obstacle_layer_3_enabled
