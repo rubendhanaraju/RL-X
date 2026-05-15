@@ -28,7 +28,7 @@ command:
   - --runner.track_wandb=True
   - --runner.wandb_entity=rubendhanaraju-university-of-porto
   - --runner.project_name=rlx-reppo-dime
-  - --runner.exp_name=avoiding_massive
+  - --runner.exp_name=avoiding-massive-sweep-0-4-3
   - --environment.obstacle_layer_1_enabled=False
   - --environment.obstacle_layer_2_enabled=True
   - --environment.obstacle_layer_3_enabled=True
