@@ -22,31 +22,25 @@ FALLBACK_CENTER_X = 0.5
 FALLBACK_OBSTACLE_XY = np.array(
     [
         [0.5, -0.1],
-        [0.425, 0.08],
-        [0.575, 0.08],
+        [0.32, 0.08],
+        [0.44, 0.08],
+        [0.56, 0.08],
+        [0.68, 0.08],
         [0.35, 0.26],
         [0.5, 0.26],
         [0.65, 0.26],
     ],
     dtype=np.float32,
 )
-FALLBACK_OBSTACLE_RADIUS = np.array([0.03, 0.025, 0.025, 0.025, 0.025, 0.025], dtype=np.float32)
-FALLBACK_OBSTACLE_LAYER_ID = np.array([0, 1, 1, 2, 2, 2], dtype=np.int32)
+FALLBACK_OBSTACLE_RADIUS = np.array([0.03, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025], dtype=np.float32)
+FALLBACK_OBSTACLE_LAYER_ID = np.array([0, 1, 1, 1, 1, 2, 2, 2], dtype=np.int32)
 FALLBACK_MODE_LAYER_ID = np.array([0, 0, 1, 1, 1, 2, 2, 2, 2], dtype=np.int32)
 FALLBACK_VIEW_X_MIN = 0.2
 FALLBACK_VIEW_X_MAX = 0.8
 FALLBACK_VIEW_Y_MIN = -0.35
 FALLBACK_VIEW_Y_MAX = 0.42
 FALLBACK_GOAL_YPOS = 0.35
-FALLBACK_FINISH_LINE_HALF_WIDTH = 0.3
-FALLBACK_FINISH_LINE_HALF_HEIGHT = 0.01
-FALLBACK_REWARD_OBSTACLE_FALLOFF_RADIUS = 0.2
-FALLBACK_REWARD_PROGRESS_COEFF = 1.0
-FALLBACK_REWARD_OBSTACLE_COEFF = 0.0
-FALLBACK_REWARD_CENTERLINE_COEFF = 0.0
-FALLBACK_REWARD_COLLISION_PENALTY = 1.0
-FALLBACK_REWARD_GOAL_BONUS = 2.0
-REWARD_COMPONENTS = ("total", "progress", "obstacle", "centerline", "collision", "goal")
+REWARD_COMPONENTS = ("total", "progress", "obstacle", "centerline", "bounds", "collision", "goal")
 
 try:
     import jax
@@ -61,10 +55,12 @@ try:
         INIT_XY,
         MODE_LAYER_ID,
         OBSTACLE_LAYER_ID,
+        REWARD_BOUNDS_COEFF,
         REWARD_CENTERLINE_COEFF,
         REWARD_COLLISION_PENALTY,
         REWARD_GOAL_BONUS,
         REWARD_OBSTACLE_COEFF,
+        REWARD_OBSTACLE_CUTOFF_RADIUS,
         REWARD_OBSTACLE_FALLOFF_RADIUS,
         REWARD_PROGRESS_COEFF,
         VIEW_X_MAX,
@@ -92,14 +88,6 @@ except ModuleNotFoundError as exc:
     VIEW_Y_MIN = FALLBACK_VIEW_Y_MIN
     VIEW_Y_MAX = FALLBACK_VIEW_Y_MAX
     GOAL_YPOS = FALLBACK_GOAL_YPOS
-    FINISH_LINE_HALF_WIDTH = FALLBACK_FINISH_LINE_HALF_WIDTH
-    FINISH_LINE_HALF_HEIGHT = FALLBACK_FINISH_LINE_HALF_HEIGHT
-    REWARD_OBSTACLE_FALLOFF_RADIUS = FALLBACK_REWARD_OBSTACLE_FALLOFF_RADIUS
-    REWARD_PROGRESS_COEFF = FALLBACK_REWARD_PROGRESS_COEFF
-    REWARD_OBSTACLE_COEFF = FALLBACK_REWARD_OBSTACLE_COEFF
-    REWARD_CENTERLINE_COEFF = FALLBACK_REWARD_CENTERLINE_COEFF
-    REWARD_COLLISION_PENALTY = FALLBACK_REWARD_COLLISION_PENALTY
-    REWARD_GOAL_BONUS = FALLBACK_REWARD_GOAL_BONUS
     HAS_AVOIDING_2D_ENV = False
 
 
@@ -114,9 +102,11 @@ class Scene:
 @dataclass(frozen=True)
 class RewardParams:
     obstacle_falloff_radius: float
+    obstacle_cutoff_radius: float
     progress_coeff: float
     obstacle_coeff: float
     centerline_coeff: float
+    bounds_coeff: float
     collision_penalty: float
     goal_bonus: float
     point_radius: float
@@ -202,11 +192,15 @@ def build_scene(no_obstacles: bool, mode_reward_index: int, obstacle_layer_enabl
 
 
 def default_reward_params(scene: Scene) -> RewardParams:
+    if scene.env is None:
+        raise RuntimeError("Avoiding2D environment import is required for reward constants.")
     return RewardParams(
         obstacle_falloff_radius=float(REWARD_OBSTACLE_FALLOFF_RADIUS),
+        obstacle_cutoff_radius=float(REWARD_OBSTACLE_CUTOFF_RADIUS),
         progress_coeff=float(REWARD_PROGRESS_COEFF),
         obstacle_coeff=float(REWARD_OBSTACLE_COEFF),
         centerline_coeff=float(REWARD_CENTERLINE_COEFF),
+        bounds_coeff=float(REWARD_BOUNDS_COEFF),
         collision_penalty=float(REWARD_COLLISION_PENALTY),
         goal_bonus=float(REWARD_GOAL_BONUS),
         point_radius=float(getattr(scene.env, "point_radius", 0.0)) if scene.env is not None else 0.0,
@@ -252,18 +246,28 @@ def rewards_at_points(
         0.0,
     )
     falloff_radius = max(params.obstacle_falloff_radius, 1e-8)
+    cutoff_radius = max(params.obstacle_cutoff_radius, 0.0)
+    radial_obstacle_penalty = np.exp(-0.5 * (obstacle_clearance / falloff_radius) ** 2)
+    radial_obstacle_penalty = np.where(obstacle_clearance <= cutoff_radius, radial_obstacle_penalty, 0.0)
     obstacle_penalty = np.sum(
-        np.exp(-0.5 * (obstacle_clearance / falloff_radius) ** 2),
+        radial_obstacle_penalty,
         axis=1,
     )
     collision = np.any(obstacle_clearance <= 0.0, axis=1).astype(np.float32)
     goal_progress = (points[:, 1] - float(INIT_XY[1])) / (GOAL_YPOS - float(INIT_XY[1]))
     goal_progress = np.clip(goal_progress, 0.0, 1.0)
+    bounds_penalty = (
+        (points[:, 0] <= VIEW_X_MIN)
+        | (points[:, 0] >= VIEW_X_MAX)
+        | (points[:, 1] <= VIEW_Y_MIN)
+        | (points[:, 1] >= VIEW_Y_MAX)
+    ).astype(np.float32)
     goal_bonus = (points[:, 1] >= GOAL_YPOS).astype(np.float32)
     components = {
         "progress": params.progress_coeff * goal_progress,
         "obstacle": -params.obstacle_coeff * obstacle_penalty,
         "centerline": -params.centerline_coeff * np.abs(points[:, 0] - CENTER_X),
+        "bounds": -params.bounds_coeff * bounds_penalty,
         "collision": -params.collision_penalty * collision,
         "goal": params.goal_bonus * goal_bonus,
     }
@@ -393,7 +397,15 @@ def add_reward_param_sliders(fig: plt.Figure, initial_params: RewardParams, on_c
             max(0.6, initial_params.obstacle_falloff_radius * 3.0),
             "%.3f",
         ),
+        (
+            "gauss cutoff",
+            "obstacle_cutoff_radius",
+            0.0,
+            max(0.8, initial_params.obstacle_cutoff_radius * 3.0),
+            "%.3f",
+        ),
         ("centerline", "centerline_coeff", 0.0, _slider_max(initial_params.centerline_coeff, 200.0), "%.3f"),
+        ("bounds", "bounds_coeff", 0.0, _slider_max(initial_params.bounds_coeff, 5.0), "%.3f"),
         ("collision", "collision_penalty", 0.0, _slider_max(initial_params.collision_penalty, 5.0), "%.3f"),
         ("goal", "goal_bonus", 0.0, _slider_max(initial_params.goal_bonus, 10.0), "%.3f"),
         ("point radius", "point_radius", 0.0, max(0.08, initial_params.point_radius * 3.0), "%.4f"),
@@ -417,9 +429,11 @@ def add_reward_param_sliders(fig: plt.Figure, initial_params: RewardParams, on_c
     def current_params() -> RewardParams:
         return RewardParams(
             obstacle_falloff_radius=float(sliders["obstacle_falloff_radius"].val),
+            obstacle_cutoff_radius=float(sliders["obstacle_cutoff_radius"].val),
             progress_coeff=float(sliders["progress_coeff"].val),
             obstacle_coeff=float(sliders["obstacle_coeff"].val),
             centerline_coeff=float(sliders["centerline_coeff"].val),
+            bounds_coeff=float(sliders["bounds_coeff"].val),
             collision_penalty=float(sliders["collision_penalty"].val),
             goal_bonus=float(sliders["goal_bonus"].val),
             point_radius=float(sliders["point_radius"].val),

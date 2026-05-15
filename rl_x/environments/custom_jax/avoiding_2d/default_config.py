@@ -22,6 +22,7 @@ def get_config(environment_name):
     config.point_radius = 0.0
     config.collision_margin = 0.0
     config.block_on_collision = True
+    config.enable_bounds_collision = False
     config.terminate_on_collision = False
     config.terminate_on_goal = False
     config.no_obstacles = False

@@ -16,8 +16,6 @@ from rl_x.environments.custom_jax.avoiding_2d.environment import (
     FINISH_LINE_HALF_WIDTH,
     GOAL_YPOS,
     INIT_XY,
-    OBSTACLE_RADIUS,
-    OBSTACLE_XY,
     VIEW_X_MAX,
     VIEW_X_MIN,
     VIEW_Y_MAX,
@@ -38,6 +36,27 @@ def parse_args():
     parser.add_argument("--n-substeps", type=int, default=None, help="Override Avoiding2D n_substeps.")
     parser.add_argument("--eval-action-mode", choices=("sde", "ode"), default="sde")
     parser.add_argument("--no-obstacles", action="store_true")
+    parser.add_argument(
+        "--obstacle-layer-1",
+        dest="obstacle_layer_1_enabled",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Enable or disable obstacle layer 1 in the rendered scene.",
+    )
+    parser.add_argument(
+        "--obstacle-layer-2",
+        dest="obstacle_layer_2_enabled",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Enable or disable obstacle layer 2 in the rendered scene.",
+    )
+    parser.add_argument(
+        "--obstacle-layer-3",
+        dest="obstacle_layer_3_enabled",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Enable or disable obstacle layer 3 in the rendered scene.",
+    )
     parser.add_argument("--show", action="store_true", help="Show the matplotlib window after saving.")
     return parser.parse_args()
 
@@ -57,6 +76,9 @@ def build_config(args):
     config.environment.nr_envs = args.num_trajectories
     config.environment.render = False
     config.environment.no_obstacles = args.no_obstacles
+    config.environment.obstacle_layer_1_enabled = args.obstacle_layer_1_enabled
+    config.environment.obstacle_layer_2_enabled = args.obstacle_layer_2_enabled
+    config.environment.obstacle_layer_3_enabled = args.obstacle_layer_3_enabled
     if args.max_steps is not None:
         config.environment.max_steps = args.max_steps
     if args.n_substeps is not None:
@@ -125,7 +147,36 @@ def trajectory_end(done, env_id):
     return done.shape[0] + 1
 
 
-def render_rollouts(points, done, output_path, plot_max_trajectories, show):
+def trajectory_returns(reward, done):
+    reward = np.asarray(reward, dtype=np.float32)
+    done = np.asarray(done, dtype=np.bool_)
+    if reward.shape != done.shape:
+        raise ValueError(f"reward and done must have matching shapes, got {reward.shape} and {done.shape}")
+    if reward.ndim != 2:
+        raise ValueError(f"reward and done must be 2D arrays with shape (steps, trajectories), got {reward.shape}")
+
+    done_int = done.astype(np.int32)
+    done_count_before_step = np.cumsum(done_int, axis=0) - done_int
+    first_episode_mask = done_count_before_step == 0
+    return np.sum(np.where(first_episode_mask, reward, 0.0), axis=0)
+
+
+def format_return_stats(returns):
+    returns = np.asarray(returns, dtype=np.float32)
+    if returns.size == 0:
+        return "Return: n/a"
+
+    mean_return = float(np.mean(returns))
+    std_return = float(np.std(returns))
+    max_return = float(np.max(returns))
+    min_return = float(np.min(returns))
+    return (
+        f"Return: {mean_return:.2f} +/- {std_return:.2f}, "
+        f"max {max_return:.2f}, min {min_return:.2f}"
+    )
+
+
+def render_rollouts(points, done, returns, env, output_path, plot_max_trajectories, show):
     if not show:
         import matplotlib
 
@@ -144,11 +195,14 @@ def render_rollouts(points, done, output_path, plot_max_trajectories, show):
     ax.axis("equal")
     ax.set_xlim((VIEW_X_MIN, VIEW_X_MAX))
     ax.set_ylim((VIEW_Y_MIN, VIEW_Y_MAX))
-    ax.set_title(f"Avoiding2D checkpoint rollouts ({plot_count}/{nr_trajectories})")
+    ax.set_title(
+        f"Avoiding2D checkpoint rollouts ({plot_count}/{nr_trajectories})\n"
+        f"{format_return_stats(returns)}"
+    )
     ax.set_xlabel("x")
     ax.set_ylabel("y")
 
-    for center, radius in zip(np.asarray(OBSTACLE_XY), np.asarray(OBSTACLE_RADIUS)):
+    for center, radius in zip(np.asarray(env.obstacle_xy), np.asarray(env.obstacle_radius)):
         ax.add_patch(patches.Circle(center, float(radius), color="tab:red", alpha=0.85))
 
     finish_line = patches.Rectangle(
@@ -199,12 +253,13 @@ def main():
         data = rollout(model, eval_env, args.num_trajectories, eval_env.horizon, args.seed)
         points = np.asarray(data["points"], dtype=np.float32)
         done = np.asarray(data["done"], dtype=np.bool_)
+        returns = trajectory_returns(data["reward"], done)
 
         if args.npz is not None:
             os.makedirs(os.path.dirname(os.path.abspath(args.npz)), exist_ok=True)
             np.savez_compressed(args.npz, **data)
 
-        render_rollouts(points, done, args.output, args.plot_max_trajectories, args.show)
+        render_rollouts(points, done, returns, eval_env, args.output, args.plot_max_trajectories, args.show)
 
         final_modes = np.asarray(data["final_mode_encoding"], dtype=np.float32)
         reached_modes = final_modes > 0.5

@@ -2,14 +2,20 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from rl_x.environments.custom_jax.avoiding_2d import environment as avoiding_2d_env
 from rl_x.environments.custom_jax.avoiding_2d.default_config import get_config
 from rl_x.environments.custom_jax.avoiding_2d.environment import (
     L1_XPOS,
     L1_YPOS,
+    L2_LEFT_OUTER_XPOS,
     L2_TOP_XPOS,
     L2_YPOS,
+    L2_RIGHT_OUTER_XPOS,
+    L2_BOTTOM_XPOS,
     L3_TOP_XPOS,
     L3_YPOS,
+    VIEW_X_MAX,
+    VIEW_X_MIN,
     Avoiding2D,
 )
 
@@ -23,13 +29,29 @@ def test_default_environment_keeps_all_obstacle_layers_active():
     env = Avoiding2D(get_config("custom_jax.avoiding_2d"))
 
     np.testing.assert_array_equal(np.asarray(env.obstacle_layer_enabled), np.asarray([True, True, True]))
-    assert env.obstacle_xy.shape == (6, 2)
-    assert env.obstacle_radius.shape == (6,)
+    assert env.obstacle_xy.shape == (8, 2)
+    assert env.obstacle_radius.shape == (8,)
 
     state = reset_one(env)
     assert float(state.l1_passed) == 0.0
     assert float(state.l2_passed) == 0.0
     assert float(state.l3_passed) == 0.0
+
+
+def test_second_obstacle_layer_has_four_evenly_spaced_obstacles():
+    env = Avoiding2D(get_config("custom_jax.avoiding_2d"))
+    layer_2_points = np.asarray(env.obstacle_xy)[1:5]
+    expected_spacing = (VIEW_X_MAX - VIEW_X_MIN) / 5.0
+    expected_x = VIEW_X_MIN + expected_spacing * np.arange(1, 5, dtype=np.float32)
+
+    np.testing.assert_allclose(
+        layer_2_points[:, 0],
+        np.asarray([L2_LEFT_OUTER_XPOS, L2_TOP_XPOS, L2_BOTTOM_XPOS, L2_RIGHT_OUTER_XPOS], dtype=np.float32),
+    )
+    np.testing.assert_allclose(layer_2_points[:, 0], expected_x)
+    np.testing.assert_allclose(layer_2_points[:, 1], np.full((4,), L2_YPOS, dtype=np.float32))
+    gaps = np.diff(np.concatenate(([VIEW_X_MIN], layer_2_points[:, 0], [VIEW_X_MAX])))
+    np.testing.assert_allclose(gaps, np.full((5,), expected_spacing, dtype=np.float32), rtol=1e-6)
 
 
 def test_disabled_obstacle_layer_is_removed_from_collision_reward_and_modes():
@@ -108,6 +130,95 @@ def test_mode_reward_ignores_disabled_layer_modes():
     enabled_reward = enabled_env._reward(point, jnp.asarray(0.0, dtype=jnp.float32), disabled_mode_encoding)
 
     np.testing.assert_allclose(np.asarray(enabled_reward - disabled_reward), np.asarray(1.0), rtol=1e-6, atol=1e-6)
+
+
+def test_reward_obstacle_penalty_is_zero_outside_cutoff_radius(monkeypatch):
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_PROGRESS_COEFF", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_OBSTACLE_COEFF", 1.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_OBSTACLE_FALLOFF_RADIUS", 0.2)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_OBSTACLE_CUTOFF_RADIUS", 0.02)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_CENTERLINE_COEFF", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_COLLISION_PENALTY", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_GOAL_BONUS", 0.0)
+
+    env = Avoiding2D(get_config("custom_jax.avoiding_2d"))
+    mode_encoding = jnp.zeros((9,), dtype=jnp.float32)
+    center = env.obstacle_xy[0]
+    radius = env.obstacle_radius[0]
+    inside_cutoff = center + jnp.asarray([radius + 0.01, 0.0], dtype=jnp.float32)
+    outside_cutoff = center + jnp.asarray([radius + 0.03, 0.0], dtype=jnp.float32)
+
+    inside_reward = env._reward(inside_cutoff, jnp.asarray(0.0, dtype=jnp.float32), mode_encoding)
+    outside_reward = env._reward(outside_cutoff, jnp.asarray(0.0, dtype=jnp.float32), mode_encoding)
+
+    assert float(inside_reward) < 0.0
+    np.testing.assert_allclose(np.asarray(outside_reward), np.asarray(0.0), rtol=1e-6, atol=1e-6)
+
+
+def test_reward_bounds_penalty_applies_on_workspace_bounds(monkeypatch):
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_PROGRESS_COEFF", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_OBSTACLE_COEFF", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_CENTERLINE_COEFF", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_BOUNDS_COEFF", 1.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_COLLISION_PENALTY", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_GOAL_BONUS", 0.0)
+
+    env = Avoiding2D(get_config("custom_jax.avoiding_2d"))
+    mode_encoding = jnp.zeros((9,), dtype=jnp.float32)
+    hit_bound = jnp.asarray([avoiding_2d_env.VIEW_X_MIN, 0.0], dtype=jnp.float32)
+    inside_bound = jnp.asarray([avoiding_2d_env.VIEW_X_MIN + 0.01, 0.0], dtype=jnp.float32)
+
+    hit_bound_reward = env._reward(hit_bound, jnp.asarray(0.0, dtype=jnp.float32), mode_encoding)
+    inside_bound_reward = env._reward(inside_bound, jnp.asarray(0.0, dtype=jnp.float32), mode_encoding)
+
+    np.testing.assert_allclose(np.asarray(hit_bound_reward), np.asarray(-1.0), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(inside_bound_reward), np.asarray(0.0), rtol=1e-6, atol=1e-6)
+
+
+def test_bounds_collision_physics_can_be_toggled():
+    start_xy = jnp.asarray([VIEW_X_MAX - 0.005, 0.0], dtype=jnp.float32)
+    target_xy = jnp.asarray([VIEW_X_MAX + 0.02, 0.0], dtype=jnp.float32)
+    mode_encoding = jnp.zeros((9,), dtype=jnp.float32)
+
+    disabled_config = get_config("custom_jax.avoiding_2d")
+    disabled_config.no_obstacles = True
+    disabled_config.n_substeps = 1
+    disabled_config.enable_bounds_collision = False
+    disabled_env = Avoiding2D(disabled_config)
+    disabled_result = disabled_env._step_assumed_controller(
+        start_xy,
+        target_xy,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        mode_encoding,
+        jnp.asarray(1.0, dtype=jnp.float32),
+        jnp.asarray(1.0, dtype=jnp.float32),
+        jnp.asarray(1.0, dtype=jnp.float32),
+    )
+
+    enabled_config = get_config("custom_jax.avoiding_2d")
+    enabled_config.no_obstacles = True
+    enabled_config.n_substeps = 1
+    enabled_config.enable_bounds_collision = True
+    enabled_env = Avoiding2D(enabled_config)
+    enabled_result = enabled_env._step_assumed_controller(
+        start_xy,
+        target_xy,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        mode_encoding,
+        jnp.asarray(1.0, dtype=jnp.float32),
+        jnp.asarray(1.0, dtype=jnp.float32),
+        jnp.asarray(1.0, dtype=jnp.float32),
+    )
+
+    disabled_point_xy, disabled_collision, disabled_step_collision = disabled_result[:3]
+    enabled_point_xy, enabled_collision, enabled_step_collision = enabled_result[:3]
+
+    np.testing.assert_allclose(np.asarray(disabled_point_xy), np.asarray(target_xy), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(disabled_collision), np.asarray(0.0), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(disabled_step_collision), np.asarray(0.0), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(enabled_point_xy), np.asarray(start_xy), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(enabled_collision), np.asarray(1.0), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(enabled_step_collision), np.asarray(1.0), rtol=1e-6, atol=1e-6)
 
 
 def test_no_obstacles_disables_all_layers_and_modes():
