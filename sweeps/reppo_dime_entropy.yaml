@@ -8,9 +8,9 @@ metric:
 
 parameters:
   algorithm.ent_start:
-    values: [1.0, 2.0]
+    values: [2.0]
   algorithm.ent_target_mult:
-    values: [1.0, 2.0, 3.0, 4.0]
+    values: [2.0, 3.0, 4.0]
 
 command:
   - conda
@@ -31,5 +31,5 @@ command:
   - --runner.exp_name=avoiding_massive
   - --environment.obstacle_layer_1_enabled=False
   - --environment.obstacle_layer_2_enabled=True
-  - --environment.obstacle_layer_3_enabled=False
+  - --environment.obstacle_layer_3_enabled=True
   - ${args}
