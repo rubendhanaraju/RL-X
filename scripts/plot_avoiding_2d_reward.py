@@ -17,83 +17,34 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-FALLBACK_INIT_XY = np.array([0.525, -0.28], dtype=np.float32)
-FALLBACK_CENTER_X = 0.5
-FALLBACK_OBSTACLE_XY = np.array(
-    [
-        [0.5, -0.1],
-        [0.32, 0.08],
-        [0.44, 0.08],
-        [0.56, 0.08],
-        [0.68, 0.08],
-        [0.35, 0.26],
-        [0.5, 0.26],
-        [0.65, 0.26],
-    ],
-    dtype=np.float32,
+from rl_x.environments.custom_jax.avoiding_2d.default_config import get_config
+from rl_x.environments.custom_jax.avoiding_2d.environment import (
+    CENTER_X,
+    FINISH_LINE_HALF_HEIGHT,
+    FINISH_LINE_HALF_WIDTH,
+    GOAL_YPOS,
+    INIT_XY,
+    REWARD_BOUNDS_COEFF,
+    REWARD_CENTERLINE_COEFF,
+    REWARD_COLLISION_PENALTY,
+    REWARD_GOAL_BONUS,
+    REWARD_OBSTACLE_COEFF,
+    REWARD_OBSTACLE_CUTOFF_RADIUS,
+    REWARD_OBSTACLE_FALLOFF_RADIUS,
+    REWARD_PROGRESS_COEFF,
+    VIEW_X_MAX,
+    VIEW_X_MIN,
+    VIEW_Y_MAX,
+    VIEW_Y_MIN,
+    Avoiding2D,
 )
-FALLBACK_OBSTACLE_RADIUS = np.array([0.03, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025], dtype=np.float32)
-FALLBACK_OBSTACLE_LAYER_ID = np.array([0, 1, 1, 1, 1, 2, 2, 2], dtype=np.int32)
-FALLBACK_MODE_LAYER_ID = np.array([0, 0, 1, 1, 1, 2, 2, 2, 2], dtype=np.int32)
-FALLBACK_VIEW_X_MIN = 0.2
-FALLBACK_VIEW_X_MAX = 0.8
-FALLBACK_VIEW_Y_MIN = -0.35
-FALLBACK_VIEW_Y_MAX = 0.42
-FALLBACK_GOAL_YPOS = 0.35
+
 REWARD_COMPONENTS = ("total", "progress", "obstacle", "centerline", "bounds", "collision", "goal")
-
-try:
-    import jax
-    import jax.numpy as jnp
-
-    from rl_x.environments.custom_jax.avoiding_2d.default_config import get_config
-    from rl_x.environments.custom_jax.avoiding_2d.environment import (
-        CENTER_X,
-        FINISH_LINE_HALF_HEIGHT,
-        FINISH_LINE_HALF_WIDTH,
-        GOAL_YPOS,
-        INIT_XY,
-        MODE_LAYER_ID,
-        OBSTACLE_LAYER_ID,
-        REWARD_BOUNDS_COEFF,
-        REWARD_CENTERLINE_COEFF,
-        REWARD_COLLISION_PENALTY,
-        REWARD_GOAL_BONUS,
-        REWARD_OBSTACLE_COEFF,
-        REWARD_OBSTACLE_CUTOFF_RADIUS,
-        REWARD_OBSTACLE_FALLOFF_RADIUS,
-        REWARD_PROGRESS_COEFF,
-        VIEW_X_MAX,
-        VIEW_X_MIN,
-        VIEW_Y_MAX,
-        VIEW_Y_MIN,
-        Avoiding2D,
-    )
-
-    HAS_AVOIDING_2D_ENV = True
-except ModuleNotFoundError as exc:
-    if exc.name not in {"jax", "ml_collections"}:
-        raise
-
-    jax = None
-    jnp = None
-    get_config = None
-    Avoiding2D = None
-    OBSTACLE_LAYER_ID = FALLBACK_OBSTACLE_LAYER_ID
-    MODE_LAYER_ID = FALLBACK_MODE_LAYER_ID
-    CENTER_X = FALLBACK_CENTER_X
-    INIT_XY = FALLBACK_INIT_XY
-    VIEW_X_MIN = FALLBACK_VIEW_X_MIN
-    VIEW_X_MAX = FALLBACK_VIEW_X_MAX
-    VIEW_Y_MIN = FALLBACK_VIEW_Y_MIN
-    VIEW_Y_MAX = FALLBACK_VIEW_Y_MAX
-    GOAL_YPOS = FALLBACK_GOAL_YPOS
-    HAS_AVOIDING_2D_ENV = False
 
 
 @dataclass(frozen=True)
 class Scene:
-    env: object | None
+    env: object
     obstacle_xy: np.ndarray
     obstacle_radius: np.ndarray
     mode_layer_enabled: np.ndarray
@@ -164,36 +115,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_scene(no_obstacles: bool, mode_reward_index: int, obstacle_layer_enabled: tuple[bool, bool, bool]) -> Scene:
-    layer_enabled = np.asarray(obstacle_layer_enabled, dtype=np.bool_)
-    if no_obstacles:
-        layer_enabled = np.zeros((3,), dtype=np.bool_)
-    mode_layer_enabled = layer_enabled[np.asarray(MODE_LAYER_ID, dtype=np.int32)]
-
-    if HAS_AVOIDING_2D_ENV:
-        env_config = get_config("custom_jax.avoiding_2d")
-        env_config.render = False
-        env_config.no_obstacles = no_obstacles
-        env_config.obstacle_layer_1_enabled = bool(layer_enabled[0])
-        env_config.obstacle_layer_2_enabled = bool(layer_enabled[1])
-        env_config.obstacle_layer_3_enabled = bool(layer_enabled[2])
-        env_config.mode_reward_index = mode_reward_index
-        env = Avoiding2D(env_config)
-        return Scene(env, np.asarray(env.obstacle_xy), np.asarray(env.obstacle_radius), np.asarray(env.mode_layer_enabled))
-
-    if no_obstacles:
-        return Scene(
-            None,
-            np.zeros((0, 2), dtype=np.float32),
-            np.zeros((0,), dtype=np.float32),
-            mode_layer_enabled,
-        )
-    obstacle_mask = layer_enabled[np.asarray(OBSTACLE_LAYER_ID, dtype=np.int32)]
-    return Scene(None, FALLBACK_OBSTACLE_XY[obstacle_mask], FALLBACK_OBSTACLE_RADIUS[obstacle_mask], mode_layer_enabled)
+    env_config = get_config("custom_jax.avoiding_2d")
+    env_config.render = False
+    env_config.no_obstacles = no_obstacles
+    env_config.obstacle_layer_1_enabled = bool(obstacle_layer_enabled[0])
+    env_config.obstacle_layer_2_enabled = bool(obstacle_layer_enabled[1])
+    env_config.obstacle_layer_3_enabled = bool(obstacle_layer_enabled[2])
+    env_config.mode_reward_index = mode_reward_index
+    env = Avoiding2D(env_config)
+    return Scene(env, np.asarray(env.obstacle_xy), np.asarray(env.obstacle_radius), np.asarray(env.mode_layer_enabled))
 
 
 def default_reward_params(scene: Scene) -> RewardParams:
-    if scene.env is None:
-        raise RuntimeError("Avoiding2D environment import is required for reward constants.")
     return RewardParams(
         obstacle_falloff_radius=float(REWARD_OBSTACLE_FALLOFF_RADIUS),
         obstacle_cutoff_radius=float(REWARD_OBSTACLE_CUTOFF_RADIUS),
@@ -203,8 +136,8 @@ def default_reward_params(scene: Scene) -> RewardParams:
         bounds_coeff=float(REWARD_BOUNDS_COEFF),
         collision_penalty=float(REWARD_COLLISION_PENALTY),
         goal_bonus=float(REWARD_GOAL_BONUS),
-        point_radius=float(getattr(scene.env, "point_radius", 0.0)) if scene.env is not None else 0.0,
-        collision_margin=float(getattr(scene.env, "collision_margin", 0.0)) if scene.env is not None else 0.0,
+        point_radius=float(scene.env.point_radius),
+        collision_margin=float(scene.env.collision_margin),
     )
 
 

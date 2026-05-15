@@ -49,6 +49,19 @@ def test_default_reward_params_come_from_avoiding_2d_environment_constants():
     assert params.collision_margin == pytest.approx(float(scene.env.collision_margin))
 
 
+def test_scene_obstacles_come_from_avoiding_2d_environment():
+    visualizer = _load_reward_visualizer()
+
+    scene = visualizer.build_scene(
+        no_obstacles=False,
+        mode_reward_index=-1,
+        obstacle_layer_enabled=(True, True, True),
+    )
+
+    np.testing.assert_array_equal(scene.obstacle_xy, np.asarray(scene.env.obstacle_xy))
+    np.testing.assert_array_equal(scene.obstacle_radius, np.asarray(scene.env.obstacle_radius))
+
+
 def test_reward_slider_initial_values_match_default_reward_params():
     visualizer = _load_reward_visualizer()
     scene = visualizer.build_scene(

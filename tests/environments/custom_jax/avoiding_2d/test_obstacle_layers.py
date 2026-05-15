@@ -12,6 +12,10 @@ from rl_x.environments.custom_jax.avoiding_2d.environment import (
     L2_YPOS,
     L2_RIGHT_OUTER_XPOS,
     L2_BOTTOM_XPOS,
+    L3_BOTTOM_XPOS,
+    L3_LEFT_OUTER_XPOS,
+    L3_MID_XPOS,
+    L3_RIGHT_OUTER_XPOS,
     L3_TOP_XPOS,
     L3_YPOS,
     VIEW_X_MAX,
@@ -29,8 +33,8 @@ def test_default_environment_keeps_all_obstacle_layers_active():
     env = Avoiding2D(get_config("custom_jax.avoiding_2d"))
 
     np.testing.assert_array_equal(np.asarray(env.obstacle_layer_enabled), np.asarray([True, True, True]))
-    assert env.obstacle_xy.shape == (8, 2)
-    assert env.obstacle_radius.shape == (8,)
+    assert env.obstacle_xy.shape == (10, 2)
+    assert env.obstacle_radius.shape == (10,)
 
     state = reset_one(env)
     assert float(state.l1_passed) == 0.0
@@ -54,14 +58,50 @@ def test_second_obstacle_layer_has_four_evenly_spaced_obstacles():
     np.testing.assert_allclose(gaps, np.full((5,), expected_spacing, dtype=np.float32), rtol=1e-6)
 
 
+def test_third_obstacle_layer_sits_in_second_layer_gaps_and_bounds():
+    env = Avoiding2D(get_config("custom_jax.avoiding_2d"))
+    layer_3_points = np.asarray(env.obstacle_xy)[5:10]
+    layer_3_radii = np.asarray(env.obstacle_radius)[5:10]
+    expected_x = np.asarray(
+        [
+            0.5 * (VIEW_X_MIN + L2_LEFT_OUTER_XPOS),
+            0.5 * (L2_LEFT_OUTER_XPOS + L2_TOP_XPOS),
+            0.5 * (L2_TOP_XPOS + L2_BOTTOM_XPOS),
+            0.5 * (L2_BOTTOM_XPOS + L2_RIGHT_OUTER_XPOS),
+            0.5 * (L2_RIGHT_OUTER_XPOS + VIEW_X_MAX),
+        ],
+        dtype=np.float32,
+    )
+
+    np.testing.assert_allclose(
+        layer_3_points[:, 0],
+        np.asarray([L3_LEFT_OUTER_XPOS, L3_TOP_XPOS, L3_MID_XPOS, L3_BOTTOM_XPOS, L3_RIGHT_OUTER_XPOS]),
+    )
+    np.testing.assert_allclose(layer_3_points[:, 0], expected_x)
+    np.testing.assert_allclose(layer_3_points[:, 1], np.full((5,), L3_YPOS, dtype=np.float32))
+
+    free_gaps = np.asarray(
+        [
+            layer_3_points[0, 0] - layer_3_radii[0] - VIEW_X_MIN,
+            layer_3_points[1, 0] - layer_3_radii[1] - (layer_3_points[0, 0] + layer_3_radii[0]),
+            layer_3_points[2, 0] - layer_3_radii[2] - (layer_3_points[1, 0] + layer_3_radii[1]),
+            layer_3_points[3, 0] - layer_3_radii[3] - (layer_3_points[2, 0] + layer_3_radii[2]),
+            layer_3_points[4, 0] - layer_3_radii[4] - (layer_3_points[3, 0] + layer_3_radii[3]),
+            VIEW_X_MAX - (layer_3_points[4, 0] + layer_3_radii[4]),
+        ],
+        dtype=np.float32,
+    )
+    np.testing.assert_allclose(free_gaps, np.full((6,), free_gaps[0], dtype=np.float32), rtol=1e-6, atol=1e-6)
+
+
 def test_disabled_obstacle_layer_is_removed_from_collision_reward_and_modes():
     config = get_config("custom_jax.avoiding_2d")
     config.obstacle_layer_2_enabled = False
     env = Avoiding2D(config)
 
     np.testing.assert_array_equal(np.asarray(env.obstacle_layer_enabled), np.asarray([True, False, True]))
-    assert env.obstacle_xy.shape == (4, 2)
-    assert env.obstacle_radius.shape == (4,)
+    assert env.obstacle_xy.shape == (6, 2)
+    assert env.obstacle_radius.shape == (6,)
 
     state = reset_one(env)
     assert float(state.l1_passed) == 0.0
