@@ -8,9 +8,9 @@ metric:
 
 parameters:
   algorithm.ent_start:
-    values: [2.0, 4.0]
+    values: [1.0, 2.0, 4.0]
   algorithm.ent_target_mult:
-    values: [5.0, 6.0]
+    values: [3.0, 5.0, 7.0]
 
 command:
   - conda
@@ -32,4 +32,12 @@ command:
   - --environment.obstacle_layer_1_enabled=False
   - --environment.obstacle_layer_2_enabled=True
   - --environment.obstacle_layer_3_enabled=True
+  - --environment.reward_function=delta_progress
+  - --environment.block_on_collision=True
+  - --environment.enable_bounds_collision=True
+  - --environment.terminate_on_collision=False
+  - --environment.terminate_on_goal=False
+  - --environment.point_radius=0.0
+  - --environment.collision_margin=0.0
+  - --algorithm.gamma=1.0
   - ${args}
