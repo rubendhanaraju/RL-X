@@ -18,6 +18,7 @@ class State:
     point_xy: jax.Array
     prev_action: jax.Array
     collision: jax.Array
+    reached_goal: jax.Array
     mode_encoding: jax.Array
     l1_passed: jax.Array
     l2_passed: jax.Array

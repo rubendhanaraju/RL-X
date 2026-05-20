@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from rl_x.environments.custom_jax.avoiding_2d.box_space import BoxSpace
+from rl_x.environments.custom_jax.avoiding_2d.reward_functions.handler import get_reward_function
 from rl_x.environments.custom_jax.avoiding_2d.state import State
 
 INIT_XY = jnp.array([0.5, -0.28], dtype=jnp.float32)
@@ -133,6 +134,23 @@ class Avoiding2D:
         self.terminate_on_collision = bool(env_config.terminate_on_collision)
         self.terminate_on_goal = bool(env_config.terminate_on_goal)
         self.mode_reward_index = int(env_config.mode_reward_index)
+        self.reward_function_name = env_config.get("reward_function", "default")
+
+        self.init_xy = INIT_XY
+        self.center_x = CENTER_X
+        self.view_x_min = VIEW_X_MIN
+        self.view_x_max = VIEW_X_MAX
+        self.view_y_min = VIEW_Y_MIN
+        self.view_y_max = VIEW_Y_MAX
+        self.goal_ypos = GOAL_YPOS
+        self.reward_obstacle_falloff_radius = REWARD_OBSTACLE_FALLOFF_RADIUS
+        self.reward_obstacle_cutoff_radius = REWARD_OBSTACLE_CUTOFF_RADIUS
+        self.reward_progress_coeff = REWARD_PROGRESS_COEFF
+        self.reward_obstacle_coeff = REWARD_OBSTACLE_COEFF
+        self.reward_centerline_coeff = REWARD_CENTERLINE_COEFF
+        self.reward_bounds_coeff = REWARD_BOUNDS_COEFF
+        self.reward_collision_penalty = REWARD_COLLISION_PENALTY
+        self.reward_goal_bonus = REWARD_GOAL_BONUS
 
         obstacle_layer_enabled = jnp.asarray(
             [
@@ -165,6 +183,7 @@ class Avoiding2D:
         if self.mode_reward_index < -1 or self.mode_reward_index >= self.mode_layer_enabled.shape[0]:
             raise ValueError(f"mode_reward_index must be -1 or in [0, {self.mode_layer_enabled.shape[0] - 1}], "
                              f"got {self.mode_reward_index}")
+        self.reward_function = get_reward_function(self.reward_function_name, self)
 
         self.single_observation_space = BoxSpace(
             low=jnp.array([VIEW_X_MIN, VIEW_Y_MIN, VIEW_X_MIN, VIEW_Y_MIN], dtype=jnp.float32),
@@ -212,6 +231,7 @@ class Avoiding2D:
         terminated = jnp.zeros((), dtype=jnp.bool_)
         truncated = jnp.zeros((), dtype=jnp.bool_)
         collision = jnp.zeros((), dtype=jnp.float32)
+        reached_goal = jnp.zeros((), dtype=jnp.bool_)
         mode_encoding = jnp.zeros(9, dtype=jnp.float32)
         l1_passed = self.initial_l1_passed
         l2_passed = self.initial_l2_passed
@@ -246,6 +266,7 @@ class Avoiding2D:
             point_xy=point_xy,
             prev_action=point_xy,
             collision=collision,
+            reached_goal=reached_goal,
             mode_encoding=mode_encoding,
             l1_passed=l1_passed,
             l2_passed=l2_passed,
@@ -277,11 +298,12 @@ class Avoiding2D:
             state.l2_passed,
             state.l3_passed,
         )
-        reward = self._reward(point_xy, step_collision, mode_encoding)
+        reward = self._reward(point_xy, step_collision, mode_encoding, state.point_xy, state.reached_goal)
 
         episode_length = state.info_episode_store["episode_length"] + 1
         timeout = episode_length >= self.horizon
         goal = point_xy[1] >= GOAL_YPOS
+        reached_goal = state.reached_goal | goal
         terminated = (self.terminate_on_collision and collision > 0.5) | (self.terminate_on_goal and goal)
         truncated = timeout
         done = terminated | truncated
@@ -318,6 +340,7 @@ class Avoiding2D:
             point_xy=point_xy,
             prev_action=target_action,
             collision=collision,
+            reached_goal=reached_goal,
             mode_encoding=mode_encoding,
             l1_passed=l1_passed,
             l2_passed=l2_passed,
@@ -462,32 +485,14 @@ class Avoiding2D:
         return jnp.maximum(obstacle_collision, bounds_collision)
 
     @partial(jax.jit, static_argnums=(0,))
-    def _reward(self, point_xy, collision, mode_encoding):
-        goal_progress = (point_xy[1] - INIT_XY[1]) / (GOAL_YPOS - INIT_XY[1])
-        goal_progress = jnp.clip(goal_progress, 0.0, 1.0)
-
-        obstacle_dist = jnp.linalg.norm(self.obstacle_xy - point_xy, axis=1)
-        obstacle_clearance = obstacle_dist - self.obstacle_radius - self.point_radius - self.collision_margin
-        obstacle_clearance = jnp.maximum(obstacle_clearance, 0.0)
-        radial_obstacle_penalty = jnp.exp(-0.5 * jnp.square(obstacle_clearance / REWARD_OBSTACLE_FALLOFF_RADIUS))
-        radial_obstacle_penalty = jnp.where(
-            obstacle_clearance <= REWARD_OBSTACLE_CUTOFF_RADIUS,
-            radial_obstacle_penalty,
-            0.0,
+    def _reward(self, point_xy, collision, mode_encoding, previous_point_xy=None, reached_goal_before=None):
+        return self.reward_function.reward(
+            point_xy,
+            collision,
+            mode_encoding,
+            previous_point_xy,
+            reached_goal_before,
         )
-        obstacle_penalty = jnp.sum(radial_obstacle_penalty)
-
-        centerline_penalty = jnp.abs(point_xy[0] - CENTER_X)
-        bounds_penalty = ((point_xy[0] <= VIEW_X_MIN) | (point_xy[0] >= VIEW_X_MAX) | (point_xy[1] <= VIEW_Y_MIN) |
-                          (point_xy[1] >= VIEW_Y_MAX)).astype(jnp.float32)
-        goal_bonus = (point_xy[1] >= GOAL_YPOS).astype(jnp.float32)
-        reward = (REWARD_PROGRESS_COEFF * goal_progress + REWARD_GOAL_BONUS * goal_bonus -
-                  REWARD_OBSTACLE_COEFF * obstacle_penalty - REWARD_CENTERLINE_COEFF * centerline_penalty -
-                  REWARD_BOUNDS_COEFF * bounds_penalty - REWARD_COLLISION_PENALTY * collision)
-        if self.mode_reward_index >= 0:
-            reward = reward + mode_encoding[self.mode_reward_index] * self.mode_layer_enabled_float[
-                self.mode_reward_index]
-        return reward
 
     @partial(jax.jit, static_argnums=(0,))
     def _check_mode(self, point_xy, mode_encoding, l1_passed, l2_passed, l3_passed):

@@ -172,6 +172,100 @@ def test_mode_reward_ignores_disabled_layer_modes():
     np.testing.assert_allclose(np.asarray(enabled_reward - disabled_reward), np.asarray(1.0), rtol=1e-6, atol=1e-6)
 
 
+def test_default_reward_function_uses_absolute_goal_progress(monkeypatch):
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_PROGRESS_COEFF", 1.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_OBSTACLE_COEFF", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_CENTERLINE_COEFF", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_BOUNDS_COEFF", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_COLLISION_PENALTY", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_GOAL_BONUS", 0.0)
+
+    env = Avoiding2D(get_config("custom_jax.avoiding_2d"))
+    halfway_y = 0.5 * (avoiding_2d_env.INIT_XY[1] + avoiding_2d_env.GOAL_YPOS)
+    point = jnp.asarray([avoiding_2d_env.CENTER_X, halfway_y], dtype=jnp.float32)
+    mode_encoding = jnp.zeros((9,), dtype=jnp.float32)
+
+    reward = env._reward(point, jnp.asarray(0.0, dtype=jnp.float32), mode_encoding)
+
+    np.testing.assert_allclose(np.asarray(reward), np.asarray(0.5), rtol=1e-6, atol=1e-6)
+
+
+def test_delta_progress_reward_telescopes_between_points(monkeypatch):
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_PROGRESS_COEFF", 1.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_OBSTACLE_COEFF", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_CENTERLINE_COEFF", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_BOUNDS_COEFF", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_COLLISION_PENALTY", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_GOAL_BONUS", 0.0)
+
+    config = get_config("custom_jax.avoiding_2d")
+    config.reward_function = "delta_progress"
+    env = Avoiding2D(config)
+    start = jnp.asarray(avoiding_2d_env.INIT_XY, dtype=jnp.float32)
+    halfway_y = 0.5 * (avoiding_2d_env.INIT_XY[1] + avoiding_2d_env.GOAL_YPOS)
+    halfway = jnp.asarray([avoiding_2d_env.CENTER_X, halfway_y], dtype=jnp.float32)
+    goal = jnp.asarray([avoiding_2d_env.CENTER_X, avoiding_2d_env.GOAL_YPOS], dtype=jnp.float32)
+    mode_encoding = jnp.zeros((9,), dtype=jnp.float32)
+
+    first_half_reward = env._reward(
+        halfway,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        mode_encoding,
+        start,
+        jnp.asarray(False),
+    )
+    second_half_reward = env._reward(
+        goal,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        mode_encoding,
+        halfway,
+        jnp.asarray(False),
+    )
+
+    np.testing.assert_allclose(np.asarray(first_half_reward), np.asarray(0.5), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(second_half_reward), np.asarray(0.5), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        np.asarray(first_half_reward + second_half_reward),
+        np.asarray(1.0),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_delta_progress_reward_goal_bonus_is_one_shot(monkeypatch):
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_PROGRESS_COEFF", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_OBSTACLE_COEFF", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_CENTERLINE_COEFF", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_BOUNDS_COEFF", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_COLLISION_PENALTY", 0.0)
+    monkeypatch.setattr(avoiding_2d_env, "REWARD_GOAL_BONUS", 2.0)
+
+    config = get_config("custom_jax.avoiding_2d")
+    config.reward_function = "delta_progress"
+    env = Avoiding2D(config)
+    previous = jnp.asarray([avoiding_2d_env.CENTER_X, avoiding_2d_env.GOAL_YPOS - 0.01], dtype=jnp.float32)
+    goal = jnp.asarray([avoiding_2d_env.CENTER_X, avoiding_2d_env.GOAL_YPOS], dtype=jnp.float32)
+    mode_encoding = jnp.zeros((9,), dtype=jnp.float32)
+
+    first_goal_reward = env._reward(
+        goal,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        mode_encoding,
+        previous,
+        jnp.asarray(False),
+    )
+    repeated_goal_reward = env._reward(
+        goal,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        mode_encoding,
+        goal,
+        jnp.asarray(True),
+    )
+
+    np.testing.assert_allclose(np.asarray(first_goal_reward), np.asarray(2.0), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(repeated_goal_reward), np.asarray(0.0), rtol=1e-6, atol=1e-6)
+
+
 def test_reward_obstacle_penalty_is_zero_outside_cutoff_radius(monkeypatch):
     monkeypatch.setattr(avoiding_2d_env, "REWARD_PROGRESS_COEFF", 0.0)
     monkeypatch.setattr(avoiding_2d_env, "REWARD_OBSTACLE_COEFF", 1.0)

@@ -35,6 +35,12 @@ def parse_args():
     parser.add_argument("--max-steps", type=int, default=None, help="Override Avoiding2D max_steps.")
     parser.add_argument("--n-substeps", type=int, default=None, help="Override Avoiding2D n_substeps.")
     parser.add_argument("--eval-action-mode", choices=("sde", "ode"), default="sde")
+    parser.add_argument(
+        "--reward-function",
+        choices=("default", "delta_progress"),
+        default="default",
+        help="Avoiding2D reward function to use for rollout returns.",
+    )
     parser.add_argument("--no-obstacles", action="store_true")
     parser.add_argument(
         "--bounds-collision",
@@ -83,6 +89,7 @@ def build_config(args):
     config.environment.nr_envs = args.num_trajectories
     config.environment.render = False
     config.environment.no_obstacles = args.no_obstacles
+    config.environment.reward_function = args.reward_function
     config.environment.enable_bounds_collision = args.bounds_collision
     config.environment.obstacle_layer_1_enabled = args.obstacle_layer_1_enabled
     config.environment.obstacle_layer_2_enabled = args.obstacle_layer_2_enabled

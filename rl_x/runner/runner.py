@@ -36,6 +36,7 @@ rlx_logger = logging.getLogger("rl_x")
 class Runner:
     def __init__(self, implementation_package_names=["rl_x"]):
         algorithm_name, environment_name, self._mode = self.parse_arguments()
+        self._explicit_environment_flags = self._explicit_config_flags("environment")
 
         # Early importing of environment to start Isaac if needed
         self.import_environment(environment_name, implementation_package_names)
@@ -202,6 +203,36 @@ class Runner:
             rlx_logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
         sys.excepthook = handle_exception
 
+    @staticmethod
+    def _explicit_config_flags(config_name):
+        prefix = f"--{config_name}."
+        return {
+            arg.split("=", 1)[0][2:]
+            for arg in sys.argv
+            if arg.startswith(prefix)
+        }
+
+    @staticmethod
+    def _as_bool(value):
+        if isinstance(value, str):
+            return value.lower() == "true"
+        return bool(value)
+
+    def _prepare_test_config(self):
+        render = self._as_bool(getattr(self._config.environment, "render", False))
+        if not render:
+            return
+        if "environment.nr_envs" in self._explicit_environment_flags:
+            return
+        if getattr(self._config.environment, "nr_envs", 1) == 1:
+            return
+
+        rlx_logger.info(
+            "Using environment.nr_envs=1 for rendered test mode. "
+            "Pass --environment.nr_envs explicitly to override."
+        )
+        self._config.environment.nr_envs = 1
+
 
     def parse_arguments(self):
         algorithm_name = [arg for arg in sys.argv if arg.startswith("--algorithm.name=")]
@@ -362,6 +393,7 @@ class Runner:
 
     def _test(self, _):
         self.init_config()
+        self._prepare_test_config()
         
         if self._config.runner.track_wandb:
             raise ValueError("Wandb is not supported in test mode")
