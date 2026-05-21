@@ -1,5 +1,7 @@
 program: experiments/experiment.py
-name: reppo_dime_entropy_avoiding2d_l2_only
+name: avoiding-2D-multimodality-truDI-delta-progress-entropy-sweep
+entity: rubendhanaraju-university-of-porto
+project: rlx-multimodality
 method: grid
 
 metric:
