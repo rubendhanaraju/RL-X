@@ -27,8 +27,9 @@ command:
   - --environment.render=False
   - --runner.track_wandb=True
   - --runner.wandb_entity=rubendhanaraju-university-of-porto
-  - --runner.project_name=rlx-reppo-dime
-  - --runner.exp_name=avoiding-massive-sweep-0-4-3
+  - --runner.project_name=rlx-multimodality
+  - --runner.exp_name=avoiding-2D-multimodality-truDI-delta-progress
+  - --runner.notes="Before, we had some bad values for the V function."
   - --environment.obstacle_layer_1_enabled=False
   - --environment.obstacle_layer_2_enabled=True
   - --environment.obstacle_layer_3_enabled=True
@@ -40,4 +41,6 @@ command:
   - --environment.point_radius=0.0
   - --environment.collision_margin=0.0
   - --algorithm.gamma=1.0
+  - --algorithm.v_min=-50
+  - --algorithm.v_max=10.0
   - ${args}
