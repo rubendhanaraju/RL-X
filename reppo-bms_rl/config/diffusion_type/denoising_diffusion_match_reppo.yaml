@@ -1,0 +1,13 @@
+# Denoising Diffusion Model
+name: ddm
+integrator: EM
+diff_steps: 16
+diff_coef: 1.0
+
+init_std: 1.0
+learn_diff_coef: True
+# learn_diff_coef: False
+
+defaults:
+  - control_net: cond_control_net_match_reppo
+  - diff_coef_schedule: cosine

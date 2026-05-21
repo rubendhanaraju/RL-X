@@ -1,0 +1,68 @@
+# Configuration for TD3 with reppo training pipeline
+defaults:
+  - env: mjx_dmc
+  - platform: jax
+  - experiment_overrides: default
+  - _self_
+
+name: "td3_reppo"
+seed: 42
+num_seeds: 1
+num_trials: 1
+
+hyperparameters:
+
+  # env and run settings (mostly don't touch)
+  # total_time_steps: 50_000_000
+  total_time_steps: 50_000_000
+  normalize_env: true
+  max_episode_steps: 1000
+  eval_interval: 10
+  num_eval: 20
+
+  # optimization settings (seem very stable)
+  lr: 3e-4
+  anneal_lr: false
+  max_grad_norm: 0.5
+  polyak: 1.0 # maybe ablate ?
+
+  # problem discount settings (need tuning)
+  gamma: 0.99
+  lmbda: 0.95
+  lmbda_min: 0.50 # irrelevant if no exploration noise is added
+
+  # batch settings (need tuning for MJX humanoid)
+  num_steps: 128
+  num_mini_batches: 128
+  num_envs: 1024
+  num_epochs: 4
+  
+  # TD3-specific parameters
+  policy_frequency: 2
+  policy_noise: 0.2
+  noise_clip: 0.5
+  exploration_noise: 0.1
+  action_scale: 1.0
+  action_bias: 0.0
+
+  # Network architecture
+  actor_hidden_dim: 256
+  critic_hidden_dim: 256
+  use_actor_norm: true
+  use_critic_norm: true
+  num_actor_layers: 2
+  num_critic_layers: 2
+  
+  # Training parameters
+  learning_starts: 25000
+  buffer_size: 1000000
+  batch_size: 1024
+
+  ent_target_mult: 4.0
+
+tags: []
+
+wandb:
+  mode: "online"
+  project: "td3-reppo"
+  entity: null

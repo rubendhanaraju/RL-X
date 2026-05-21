@@ -1,0 +1,28 @@
+# @package _global_
+defaults:
+  - default # need to set +run=.../config.yaml for correct resolve
+  - _self_
+
+idx: 054
+exp_name: mjx_reppo_bench
+
+hydra:
+  run:
+    dir: outputs/054_mjx_reppo_bench/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+wandb:
+  mode: offline
+  entity: di-skill
+  project: REPPO_PIS_GEOM_DMC
+  group: 054_mjx_reppo_bench
+
+hyperparameters:
+  ent_target_mult: 1.0
+
+  total_time_steps: 55_050_240
+  num_eval: 21
+
+
+experiment_overrides:
+  hyperparameters:
+    lr: 3e-4

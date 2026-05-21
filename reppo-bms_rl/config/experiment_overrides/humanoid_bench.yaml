@@ -1,0 +1,7 @@
+hyperparameters:
+  num_envs: 128
+  num_subproc: 32
+  num_steps: 128
+  num_mini_batches: 8
+  num_epochs: 8
+  kl_bound: 0.1

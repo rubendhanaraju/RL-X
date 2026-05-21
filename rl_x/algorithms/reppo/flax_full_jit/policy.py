@@ -6,6 +6,7 @@ from rl_x.algorithms.reppo.flax_full_jit.utils import (
     MLP,
     get_action_scale,
     select_observation,
+    tanh_normal_log_prob_from_action,
     tanh_normal_log_prob_from_raw,
 )
 from rl_x.environments.action_space_type import ActionSpaceType
@@ -105,15 +106,22 @@ class Policy(nn.Module):
         sample_shape = (nr_action_samples,) + mean.shape
         noise = jax.random.normal(key, shape=sample_shape)
 
+        def clipped_squashed_action(raw_action):
+            normalized_action = jnp.tanh(raw_action)
+            normalized_action = jnp.clip(normalized_action, -1.0 + 1e-4, 1.0 - 1e-4)
+            return normalized_action * self.action_scale
+
         if reverse_kl:
             raw_action = mean[None] + std[None] * noise
-            current_log_prob = tanh_normal_log_prob_from_raw(raw_action, mean[None], std[None], self.action_scale)
-            target_log_prob = tanh_normal_log_prob_from_raw(raw_action, target_mean[None], target_std[None], self.action_scale)
+            action = clipped_squashed_action(raw_action)
+            current_log_prob = tanh_normal_log_prob_from_action(action, mean[None], std[None], self.action_scale)
+            target_log_prob = tanh_normal_log_prob_from_action(action, target_mean[None], target_std[None], self.action_scale)
             return jnp.mean(current_log_prob - target_log_prob, axis=0)
 
         raw_action = target_mean[None] + target_std[None] * noise
-        target_log_prob = tanh_normal_log_prob_from_raw(raw_action, target_mean[None], target_std[None], self.action_scale)
-        current_log_prob = tanh_normal_log_prob_from_raw(raw_action, mean[None], std[None], self.action_scale)
+        action = clipped_squashed_action(raw_action)
+        target_log_prob = tanh_normal_log_prob_from_action(action, target_mean[None], target_std[None], self.action_scale)
+        current_log_prob = tanh_normal_log_prob_from_action(action, mean[None], std[None], self.action_scale)
         return jnp.mean(target_log_prob - current_log_prob, axis=0)
 
     def actor_metrics(self, params, sample_info):

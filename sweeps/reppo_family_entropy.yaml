@@ -1,0 +1,82 @@
+program: experiments/experiment.py
+name: avoiding-2D-multimodality-truDI-delta-progress-reppo-family-entropy-sweep
+entity: rubendhanaraju-university-of-porto
+project: rlx-multimodality
+method: grid
+
+metric:
+  name: eval/episode_return
+  goal: maximize
+
+parameters:
+  algorithm.name:
+    values:
+      - reppo.flax_full_jit
+      - reppo_dime.flax_full_jit
+      - reppo_pis.flax_full_jit
+  algorithm.ent_start:
+    values: [1.0, 2.0, 4.0]
+  algorithm.ent_target_mult:
+    values: [3.0, 5.0, 7.0]
+  algorithm.lmbda:
+    values: [0.5, 0.75, 0.95, 1.0]
+
+command:
+  - conda
+  - run
+  - -n
+  - rlx
+  - python
+  - -c
+  - |
+    import json
+    import os
+    import sys
+
+    program = sys.argv[1]
+    args_json_file = sys.argv[2]
+    fixed_args = sys.argv[3:]
+
+    with open(args_json_file) as f:
+        sweep_args = json.load(f)
+
+    def fmt(value):
+        if isinstance(value, float):
+            return f"{value:g}"
+        return str(value)
+
+    algorithm = sweep_args["algorithm.name"].split(".")[0]
+    run_name = (
+        f"{algorithm}"
+        f"-ent{fmt(sweep_args['algorithm.ent_start'])}"
+        f"-target{fmt(sweep_args['algorithm.ent_target_mult'])}"
+        f"-lambda{fmt(sweep_args['algorithm.lmbda'])}"
+    )
+    sweep_cli_args = [f"--{key}={value}" for key, value in sweep_args.items()]
+    command = [sys.executable, program, f"--runner.run_name={run_name}", *fixed_args, *sweep_cli_args]
+    os.execv(sys.executable, command)
+  - ${program}
+  - ${args_json_file}
+  - --environment.name=custom_jax.avoiding_2d
+  - --runner.track_console=False
+  - --runner.save_model=True
+  - --algorithm.evaluation_and_save_frequency=524288
+  - --environment.render=False
+  - --runner.track_wandb=True
+  - --runner.wandb_entity=rubendhanaraju-university-of-porto
+  - --runner.project_name=rlx-multimodality
+  - --runner.exp_name=avoiding-2D-multimodality-truDI-delta-progress
+  - --runner.notes="Before, we had some bad values for the V function."
+  - --environment.obstacle_layer_1_enabled=False
+  - --environment.obstacle_layer_2_enabled=True
+  - --environment.obstacle_layer_3_enabled=True
+  - --environment.reward_function=delta_progress
+  - --environment.block_on_collision=True
+  - --environment.enable_bounds_collision=True
+  - --environment.terminate_on_collision=False
+  - --environment.terminate_on_goal=False
+  - --environment.point_radius=0.0
+  - --environment.collision_margin=0.0
+  - --algorithm.gamma=1.0
+  - --algorithm.v_min=-50
+  - --algorithm.v_max=10.0

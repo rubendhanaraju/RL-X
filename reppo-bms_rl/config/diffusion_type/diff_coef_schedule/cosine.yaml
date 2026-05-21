@@ -1,0 +1,11 @@
+_target_: src.dime_model.scheduler.get_cosine_schedule
+total_steps: ${diffusion_type.diff_steps}
+scale: 1.0
+min: 0.001
+s: 0.008
+pow: 2  # pow= 1 for cosine schedule
+#_target_: dime.scheduler.create_cos_square_scheduler
+#total_steps: ${diffusion_type.diff_steps}
+#C_start: ${diffusion_type.diff_coef}
+#C_end: 0.01
+#T: 1

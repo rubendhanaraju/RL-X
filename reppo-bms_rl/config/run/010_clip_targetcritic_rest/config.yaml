@@ -1,0 +1,51 @@
+# @package _global_
+defaults:
+  - default # need to set +run=.../config.yaml for correct resolve
+  - _self_
+
+idx: 010
+exp_name: clip_targetcritic_rest
+
+hydra:
+  run:
+    dir: outputs/010_clip_targetcritic_rest/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+wandb:
+  mode: online
+  entity: di-skill
+  project: REPPO_PIS_GEOM_DMC
+  group: 010_clip_targetcritic_rest
+
+hyperparameters:
+  diffusion:
+    diff_steps: 16
+    loss: am
+    noise_schedule:
+      sigma_max: 2.0
+      sigma_min: 0.01
+    use_target_conditional_expectation: False
+    pis_settings:
+      onpol_entropy: False
+      smoothed_importance_weighting: False
+      scale_loss_with_temperature: False
+  update_entropy_lagrangian: true
+  update_kl_lagrangian: true
+  ent_start: 0.01
+  kl_start: 1.0
+  ent_target_mult: 1.0
+  num_epochs_actor: 4
+  polyak: 1.0
+  use_target_critic_for_actor: False
+  kl_action_rep: 1
+  aux_loss_mult: 1.0
+
+  batch_repetitions: 1
+  trust_region_lagrangian: dual_optimal_geometric_average
+  trust_region_granularity: avg
+  trust_region_time_weighting: True
+  total_time_steps: 52_428_800
+  num_eval: 40
+
+experiment_overrides:
+  hyperparameters:
+    lr: 3e-4

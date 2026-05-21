@@ -1,0 +1,9 @@
+python src/jaxrl/reppo_ve_seperate.py -m seed=0 \
+hyperparameters.diffusion.loss=am \
+hyperparameters.diffusion.diff_steps=8,16,32 \
+hyperparameters.diffusion.noise_schedule.sigma_max=2.5,3.5,5 \
+hyperparameters.kl_bound=0.1,0.01,0.001 \
+hyperparameters.ent_target_mult=3,4,5 \
+env.name=CheetahRun,FishSwim,CartpoleSwingup,WalkerRun \
+tags='["am-ve-1"]' \
++launcher=slurm \

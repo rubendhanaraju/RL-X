@@ -1,0 +1,47 @@
+# @package _global_
+defaults:
+  - default # need to set +run=.../config.yaml for correct resolve
+  - _self_
+
+idx: 005
+exp_name: pis_erfsquash_maxent_dmc_80percentil_target1
+
+hydra:
+  run:
+    dir: outputs/005_pis_erfsquash_maxent_dmc/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+wandb:
+  mode: online
+  entity: di-skill
+  project: REPPO_PIS_GEOM_DMC
+  group: 005_pis_erfsquash_maxent_dmc_80percentil_Target1
+
+hyperparameters:
+  diffusion:
+    diff_steps: 16
+    loss: am
+    noise_schedule.sigma_max: 5.0
+    noise_schedule.sigma_min: 0.1
+    use_target_conditional_expectation: False
+    pis_settings:
+      onpol_entropy: False
+      smoothed_importance_weighting: False
+      scale_loss_with_temperature: False
+  update_entropy_lagrangian: true
+  update_kl_lagrangian: true
+  ent_start: 0.01
+  kl_start: 1.0
+  ent_target_mult: 3.5
+  num_epochs_actor: 4
+  polyak: 1.0
+  kl_action_rep: 1
+  aux_loss_mult: 1.0
+
+  batch_repetitions: 2
+  trust_region_lagrangian: dual_optimal_geometric_average
+  trust_region_granularity: avg
+  trust_region_time_weighting: True
+  total_time_steps: 131_072_000
+  num_eval: 1000
+
+experiment_overrides.hyperparameters.lr: 3e-4

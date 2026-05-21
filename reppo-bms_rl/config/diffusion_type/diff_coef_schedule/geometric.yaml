@@ -1,0 +1,4 @@
+_target_: src.dime_model.scheduler.get_geometric_schedule
+total_steps: ${diffusion_type.diff_steps}
+sigma_min: 0.01
+sigma_max: 0.5

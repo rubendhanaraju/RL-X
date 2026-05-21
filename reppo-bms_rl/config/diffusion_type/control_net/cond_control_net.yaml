@@ -1,0 +1,11 @@
+num_layers: 3
+num_hid: 256
+outer_clip: 1e4
+inner_clip: 1e2
+
+weight_init: 1e-8
+bias_init: 0.
+layer_norm: false
+layer_norm_type: "LayerNorm" # RMSNorm
+# time_coder_out: ${diffusion_type.control_net.num_hid}
+time_coder_out: 64

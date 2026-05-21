@@ -1,0 +1,49 @@
+# @package _global_
+defaults:
+  - default # need to set +run=.../config.yaml for correct resolve
+  - _self_
+
+idx: 001
+exp_name: bms_geom_avg_dmc
+
+
+wandb:
+  mode: online
+  entity: di-skill
+  project: BMS_RL
+
+hyperparameters:
+  diffusion:
+    diff_steps: 64
+    loss: am
+    noise_schedule.sigma_max: 5.0
+    noise_schedule.sigma_min: 0.1
+    use_target_conditional_expectation: False
+    coupling: independent
+    shb_settings:
+      loss_scaling_sigma_power: -1
+    independent_settings:
+      error_scaling_sigma_power: -1
+      error_scaling_sigma_t_0_power: 2
+    log_reciprocalness: True
+    reciprocal_loss_strength: 10.0
+  fwd_kl_tr: true
+  update_entropy_lagrangian: false
+  update_kl_lagrangian: false
+  ent_start: 0.01
+  kl_start: 20.0
+  ent_target_mult: 4.0
+  num_epochs_actor: 4
+  polyak: 1.0
+  kl_action_rep: 1
+  aux_loss_mult: 1.0
+  action_rep: 16
+
+  batch_repetitions: 2
+  trust_region_lagrangian: optimal_geometric_average
+  trust_region_granularity: avg
+  trust_region_time_weighting: True
+  total_time_steps: 52428800
+  num_eval: 400
+
+experiment_overrides.hyperparameters.lr: 3e-4

@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax.core import freeze, unfreeze
 
 from rl_x.algorithms.reppo.flax_full_jit.base import (
     RePPOBase,
@@ -16,6 +17,7 @@ from rl_x.algorithms.reppo.flax_full_jit.policy import Policy
 from rl_x.algorithms.reppo.flax_full_jit.utils import (
     get_action_scale,
     hl_gauss,
+    tanh_normal_log_prob_from_action,
     tanh_normal_log_prob_from_raw,
 )
 
@@ -98,6 +100,13 @@ def initialize_policy_params(policy, batch_size=3, observation_dim=3):
         jnp.zeros((batch_size, observation_dim), dtype=jnp.float32),
     )
     return variables["params"]
+
+
+def set_policy_output_bias(params, bias):
+    mutable_params = unfreeze(params)
+    mutable_params["MLP_0"]["Dense_1"]["kernel"] = jnp.zeros_like(mutable_params["MLP_0"]["Dense_1"]["kernel"])
+    mutable_params["MLP_0"]["Dense_1"]["bias"] = jnp.asarray(bias, dtype=jnp.float32)
+    return freeze(mutable_params)
 
 
 def make_normalizer_model(policy_indices=(0, 1), critic_indices=(1, 2)):
@@ -457,13 +466,58 @@ def test_policy_kl_matches_legacy_monte_carlo_formula(reverse_kl):
     noise = jax.random.normal(key, shape=(nr_action_samples,) + mean.shape)
     if reverse_kl:
         raw_action = mean[None] + std[None] * noise
-        current_log_prob = tanh_normal_log_prob_from_raw(raw_action, mean[None], std[None], jnp.ones((2,), dtype=jnp.float32))
-        target_log_prob = tanh_normal_log_prob_from_raw(raw_action, target_mean[None], target_std[None], jnp.ones((2,), dtype=jnp.float32))
+        action = jnp.clip(jnp.tanh(raw_action), -1.0 + 1e-4, 1.0 - 1e-4)
+        current_log_prob = tanh_normal_log_prob_from_action(action, mean[None], std[None], jnp.ones((2,), dtype=jnp.float32))
+        target_log_prob = tanh_normal_log_prob_from_action(action, target_mean[None], target_std[None], jnp.ones((2,), dtype=jnp.float32))
         expected = jnp.mean(current_log_prob - target_log_prob, axis=0)
     else:
         raw_action = target_mean[None] + target_std[None] * noise
-        target_log_prob = tanh_normal_log_prob_from_raw(raw_action, target_mean[None], target_std[None], jnp.ones((2,), dtype=jnp.float32))
-        current_log_prob = tanh_normal_log_prob_from_raw(raw_action, mean[None], std[None], jnp.ones((2,), dtype=jnp.float32))
+        action = jnp.clip(jnp.tanh(raw_action), -1.0 + 1e-4, 1.0 - 1e-4)
+        target_log_prob = tanh_normal_log_prob_from_action(action, target_mean[None], target_std[None], jnp.ones((2,), dtype=jnp.float32))
+        current_log_prob = tanh_normal_log_prob_from_action(action, mean[None], std[None], jnp.ones((2,), dtype=jnp.float32))
         expected = jnp.mean(target_log_prob - current_log_prob, axis=0)
 
+    assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("reverse_kl", [False, True])
+def test_policy_kl_clips_saturated_actions_like_legacy(reverse_kl):
+    policy = make_policy()
+    base_params = initialize_policy_params(policy, batch_size=2)
+    params = set_policy_output_bias(base_params, [8.0, 8.0, -5.0, -5.0])
+    target_params = set_policy_output_bias(base_params, [7.0, 7.0, -5.0, -5.0])
+    observations = jnp.zeros((2, 3), dtype=jnp.float32)
+    key = jax.random.PRNGKey(13)
+    nr_action_samples = 4
+
+    actual = policy.kl_divergence(params, target_params, observations, key, nr_action_samples, reverse_kl)
+
+    mean, std = policy.distribution(params, observations, 1.0)
+    target_mean, target_std = policy.distribution(target_params, observations, 1.0)
+    noise = jax.random.normal(key, shape=(nr_action_samples,) + mean.shape)
+    if reverse_kl:
+        raw_action = mean[None] + std[None] * noise
+        action = jnp.clip(jnp.tanh(raw_action), -1.0 + 1e-4, 1.0 - 1e-4)
+        expected = jnp.mean(
+            tanh_normal_log_prob_from_action(action, mean[None], std[None], jnp.ones((2,), dtype=jnp.float32))
+            - tanh_normal_log_prob_from_action(action, target_mean[None], target_std[None], jnp.ones((2,), dtype=jnp.float32)),
+            axis=0,
+        )
+    else:
+        raw_action = target_mean[None] + target_std[None] * noise
+        action = jnp.clip(jnp.tanh(raw_action), -1.0 + 1e-4, 1.0 - 1e-4)
+        expected = jnp.mean(
+            tanh_normal_log_prob_from_action(action, target_mean[None], target_std[None], jnp.ones((2,), dtype=jnp.float32))
+            - tanh_normal_log_prob_from_action(action, mean[None], std[None], jnp.ones((2,), dtype=jnp.float32)),
+            axis=0,
+        )
+
+    unclipped_action = jnp.tanh(raw_action)
+    unclipped_expected = jnp.mean(
+        tanh_normal_log_prob_from_action(unclipped_action, target_mean[None], target_std[None], jnp.ones((2,), dtype=jnp.float32))
+        - tanh_normal_log_prob_from_action(unclipped_action, mean[None], std[None], jnp.ones((2,), dtype=jnp.float32)),
+        axis=0,
+    )
+
+    assert jnp.max(jnp.abs(jnp.asarray(expected) - jnp.asarray(unclipped_expected))) > 1.0
     assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
