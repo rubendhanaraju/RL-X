@@ -505,6 +505,29 @@ def test_policy_kl_is_zero_for_identical_params():
     assert_allclose(kl, jnp.zeros((2,), dtype=jnp.float32), atol=1e-5)
 
 
+def test_behavior_importance_weight_returns_zero_log_weights():
+    policy = make_zero_control_policy()
+    observations = jnp.asarray(
+        [
+            [0.1, -0.2, 0.3],
+            [0.0, 0.4, -0.1],
+            [0.2, 0.1, 0.0],
+        ],
+        dtype=jnp.float32,
+    )
+
+    importance_weight = policy.behavior_importance_weight(
+        params=None,
+        observation=observations,
+        sample_info={},
+        exploration_scale=jnp.ones((observations.shape[0], 1), dtype=jnp.float32),
+        lmbda_min=0.5,
+    )
+
+    assert importance_weight.shape == (observations.shape[0],)
+    assert_allclose(importance_weight, jnp.zeros((observations.shape[0],), dtype=jnp.float32))
+
+
 def test_optimum_geometric_kl_lagrangian_matches_reference_search_objective():
     w_t = jnp.asarray([0.7, 1.2, 0.9], dtype=jnp.float32)
     old_ctrl = jnp.asarray([[0.1, -0.2], [0.3, 0.2], [-0.4, 0.5]], dtype=jnp.float32)

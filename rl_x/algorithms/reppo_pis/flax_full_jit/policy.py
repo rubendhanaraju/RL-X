@@ -385,7 +385,7 @@ class PISPolicy(nn.Module):
         return self.sde_sample(params, key, observation, stop_grad=True)[0]
 
     def behavior_importance_weight(self, params, observation, sample_info, exploration_scale, lmbda_min):
-        del params, observation, sample_info, exploration_scale, lmbda_min
+        del params, sample_info, exploration_scale, lmbda_min
         return jnp.zeros((observation.shape[0],), dtype=jnp.float32)
 
     def single_kl_divergence(self, key, params, target_params, observation):
