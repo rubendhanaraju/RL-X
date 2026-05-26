@@ -1,5 +1,5 @@
 program: experiments/experiment.py
-name: avoiding-2D-multimodality-truDI-delta-progress-reppo-family-entropy-sweep
+name: avoiding-2D-multimodality-truDI-delta-progress-reppo-family-entropy-horizon-sweep
 entity: rubendhanaraju-university-of-porto
 project: rlx-multimodality
 method: grid
@@ -12,14 +12,16 @@ parameters:
   algorithm.name:
     values:
       # - reppo.flax_full_jit
-      # - reppo_dime.flax_full_jit
+      - reppo_dime.flax_full_jit
       - reppo_pis.flax_full_jit
   algorithm.ent_start:
-    values: [1.0, 2.0, 4.0]
+    values: [2.0, 4.0]
   algorithm.ent_target_mult:
     values: [3.0, 5.0, 7.0]
   algorithm.lmbda:
-    values: [0.5, 0.75, 0.95, 1.0]
+    values: [0.25, 0.5, 0.75, 0.95]
+  algorithm.nr_steps:
+    values: [32, 64, 128]
 
 command:
   - conda

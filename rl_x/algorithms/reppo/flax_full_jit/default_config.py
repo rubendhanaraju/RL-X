@@ -64,5 +64,6 @@ def get_config(algorithm_name):
 
     config.evaluation_and_save_frequency = -1  # evaluate/save once at the end
     config.evaluation_active = True
+    config.eval_action_mode = "ode"  # ode, sde
 
     return config

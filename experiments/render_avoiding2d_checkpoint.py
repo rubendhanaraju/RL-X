@@ -6,8 +6,14 @@ import jax.numpy as jnp
 import numpy as np
 from ml_collections import config_dict
 
-from rl_x.algorithms.reppo_dime.flax_full_jit.default_config import get_config as get_algorithm_config
-from rl_x.algorithms.reppo_dime.flax_full_jit.reppo_dime import RePPO_DIME
+from avoiding2d_checkpoint_utils import (
+    clip_action,
+    load_checkpoint_algorithm_config,
+    load_algorithm_model_class,
+    load_saved_config,
+    resolve_algorithm_name,
+    select_eval_action,
+)
 from rl_x.environments.custom_jax.avoiding_2d.create_env import create_train_and_eval_env
 from rl_x.environments.custom_jax.avoiding_2d.default_config import get_config as get_environment_config
 from rl_x.environments.custom_jax.avoiding_2d.environment import (
@@ -25,48 +31,70 @@ from rl_x.runner.default_config import get_config as get_runner_config
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Render many Avoiding2D trajectories from an RL-X RePPO-DIME checkpoint.")
+    parser = argparse.ArgumentParser(description="Render many Avoiding2D trajectories from an RL-X checkpoint.")
     parser.add_argument("--checkpoint", required=True, help="Path to an RL-X latest.model checkpoint.")
+    parser.add_argument(
+        "--algorithm-name",
+        default="auto",
+        help="RL-X algorithm name. Use 'auto' to read config_algorithm.json from the checkpoint.",
+    )
+    parser.add_argument(
+        "--algorithm-config-json",
+        default=None,
+        help="Optional exact algorithm config JSON to use as the base config.",
+    )
+    parser.add_argument(
+        "--environment-config-json",
+        default=None,
+        help="Optional exact environment config JSON to use as the base config.",
+    )
     parser.add_argument("--output", default="avoiding2d_rollouts.png", help="PNG path for the rendered trajectories.")
     parser.add_argument("--npz", default=None, help="Optional path for dense rollout arrays.")
-    parser.add_argument("--num-trajectories", type=int, default=4096, help="Number of parallel trajectories to generate.")
-    parser.add_argument("--plot-max-trajectories", type=int, default=1024, help="Max trajectories to draw. Use 0 to draw all.")
+    parser.add_argument("--num-trajectories",
+                        type=int,
+                        default=4096,
+                        help="Number of parallel trajectories to generate.")
+    parser.add_argument("--plot-max-trajectories",
+                        type=int,
+                        default=0,
+                        help="Max trajectories to draw. Use 0 to draw all.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=None, help="Override Avoiding2D max_steps.")
     parser.add_argument("--n-substeps", type=int, default=None, help="Override Avoiding2D n_substeps.")
-    parser.add_argument("--eval-action-mode", choices=("sde", "ode"), default="sde")
+    parser.add_argument("--eval-action-mode", choices=("sde", "ode"), default=None)
     parser.add_argument(
         "--reward-function",
         choices=("default", "delta_progress"),
-        default="default",
+        default=None,
         help="Avoiding2D reward function to use for rollout returns.",
     )
-    parser.add_argument("--no-obstacles", action="store_true")
+    parser.add_argument("--no-obstacles", dest="no_obstacles", action="store_true", default=None)
+    parser.add_argument("--with-obstacles", dest="no_obstacles", action="store_false")
     parser.add_argument(
         "--bounds-collision",
         dest="bounds_collision",
-        default=True,
+        default=None,
         action=argparse.BooleanOptionalAction,
         help="Enable or disable collisions with the Avoiding2D workspace bounds.",
     )
     parser.add_argument(
         "--obstacle-layer-1",
         dest="obstacle_layer_1_enabled",
-        default=True,
+        default=None,
         action=argparse.BooleanOptionalAction,
         help="Enable or disable obstacle layer 1 in the rendered scene.",
     )
     parser.add_argument(
         "--obstacle-layer-2",
         dest="obstacle_layer_2_enabled",
-        default=True,
+        default=None,
         action=argparse.BooleanOptionalAction,
         help="Enable or disable obstacle layer 2 in the rendered scene.",
     )
     parser.add_argument(
         "--obstacle-layer-3",
         dest="obstacle_layer_3_enabled",
-        default=True,
+        default=None,
         action=argparse.BooleanOptionalAction,
         help="Enable or disable obstacle layer 3 in the rendered scene.",
     )
@@ -75,9 +103,16 @@ def parse_args():
 
 
 def build_config(args):
+    algorithm_name = resolve_algorithm_name(args.checkpoint, args.algorithm_name)
     config = config_dict.ConfigDict()
-    config.algorithm = get_algorithm_config("reppo_dime.flax_full_jit")
-    config.environment = get_environment_config("custom_jax.avoiding_2d")
+    if args.algorithm_config_json is not None:
+        config.algorithm = load_saved_config(args.algorithm_config_json)
+    else:
+        config.algorithm = load_checkpoint_algorithm_config(args.checkpoint, algorithm_name)
+    if args.environment_config_json is not None:
+        config.environment = load_saved_config(args.environment_config_json)
+    else:
+        config.environment = get_environment_config("custom_jax.avoiding_2d")
     config.runner = get_runner_config("test")
 
     config.runner.load_model = os.path.abspath(args.checkpoint)
@@ -88,28 +123,36 @@ def build_config(args):
 
     config.environment.nr_envs = args.num_trajectories
     config.environment.render = False
-    config.environment.no_obstacles = args.no_obstacles
-    config.environment.reward_function = args.reward_function
-    config.environment.enable_bounds_collision = args.bounds_collision
-    config.environment.obstacle_layer_1_enabled = args.obstacle_layer_1_enabled
-    config.environment.obstacle_layer_2_enabled = args.obstacle_layer_2_enabled
-    config.environment.obstacle_layer_3_enabled = args.obstacle_layer_3_enabled
+    if args.no_obstacles is not None:
+        config.environment.no_obstacles = args.no_obstacles
+    if args.reward_function is not None:
+        config.environment.reward_function = args.reward_function
+    if args.bounds_collision is not None:
+        config.environment.enable_bounds_collision = args.bounds_collision
+    if args.obstacle_layer_1_enabled is not None:
+        config.environment.obstacle_layer_1_enabled = args.obstacle_layer_1_enabled
+    if args.obstacle_layer_2_enabled is not None:
+        config.environment.obstacle_layer_2_enabled = args.obstacle_layer_2_enabled
+    if args.obstacle_layer_3_enabled is not None:
+        config.environment.obstacle_layer_3_enabled = args.obstacle_layer_3_enabled
     if args.max_steps is not None:
         config.environment.max_steps = args.max_steps
     if args.n_substeps is not None:
         config.environment.n_substeps = args.n_substeps
 
-    config.algorithm.eval_action_mode = args.eval_action_mode
+    if args.eval_action_mode is not None:
+        config.algorithm.eval_action_mode = args.eval_action_mode
     config.algorithm.evaluation_active = False
     config.algorithm.nr_steps = 1
     config.algorithm.nr_minibatches = 1
     config.algorithm.nr_epochs = 1
     config.algorithm.total_timesteps = args.num_trajectories
     config.algorithm.evaluation_and_save_frequency = args.num_trajectories
-    return config
+    return config, algorithm_name
 
 
 def rollout(model, env, nr_envs, horizon, seed):
+
     @jax.jit
     def rollout_jit(reset_key, action_key):
         reset_keys = jax.random.split(reset_key, nr_envs)
@@ -124,8 +167,8 @@ def rollout(model, env, nr_envs, horizon, seed):
                 model.observation_normalizer_state,
                 "policy",
             )
-            action = model.select_eval_action(model.actor_state.params, observation, subkey)
-            action = model.clip_action(action)
+            action = select_eval_action(model, model.actor_state.params, observation, subkey)
+            action = clip_action(model, action)
             env_state = env.step(env_state, action)
             done = env_state.terminated | env_state.truncated
             return (env_state, key), (
@@ -185,10 +228,8 @@ def format_return_stats(returns):
     std_return = float(np.std(returns))
     max_return = float(np.max(returns))
     min_return = float(np.min(returns))
-    return (
-        f"Return: {mean_return:.2f} +/- {std_return:.2f}, "
-        f"max {max_return:.2f}, min {min_return:.2f}"
-    )
+    return (f"Return: {mean_return:.2f} +/- {std_return:.2f}, "
+            f"max {max_return:.2f}, min {min_return:.2f}")
 
 
 def render_rollouts(points, done, returns, env, output_path, plot_max_trajectories, show):
@@ -210,10 +251,8 @@ def render_rollouts(points, done, returns, env, output_path, plot_max_trajectori
     ax.axis("equal")
     ax.set_xlim((VIEW_X_MIN, VIEW_X_MAX))
     ax.set_ylim((VIEW_Y_MIN, VIEW_Y_MAX))
-    ax.set_title(
-        f"Avoiding2D checkpoint rollouts ({plot_count}/{nr_trajectories})\n"
-        f"{format_return_stats(returns)}"
-    )
+    ax.set_title(f"Avoiding2D checkpoint rollouts ({plot_count}/{nr_trajectories})\n"
+                 f"{format_return_stats(returns)}")
     ax.set_xlabel("x")
     ax.set_ylabel("y")
 
@@ -244,24 +283,27 @@ def render_rollouts(points, done, returns, env, output_path, plot_max_trajectori
 
 def main():
     args = parse_args()
-    config = build_config(args)
+    config, algorithm_name = build_config(args)
     train_env, eval_env = create_train_and_eval_env(config)
 
     run_path = os.path.abspath("runs/checkpoint_render/avoiding2d")
-    model = RePPO_DIME.load(
+    model_class = load_algorithm_model_class(algorithm_name)
+    explicitly_set_algorithm_params = [
+        "algorithm.nr_steps",
+        "algorithm.nr_minibatches",
+        "algorithm.nr_epochs",
+        "algorithm.total_timesteps",
+        "algorithm.evaluation_and_save_frequency",
+    ]
+    if "eval_action_mode" in config.algorithm:
+        explicitly_set_algorithm_params.append("algorithm.eval_action_mode")
+    model = model_class.load(
         config,
         train_env,
         eval_env,
         run_path,
         writer=None,
-        explicitly_set_algorithm_params=[
-            "algorithm.eval_action_mode",
-            "algorithm.nr_steps",
-            "algorithm.nr_minibatches",
-            "algorithm.nr_epochs",
-            "algorithm.total_timesteps",
-            "algorithm.evaluation_and_save_frequency",
-        ],
+        explicitly_set_algorithm_params=explicitly_set_algorithm_params,
     )
 
     try:
@@ -278,6 +320,7 @@ def main():
 
         final_modes = np.asarray(data["final_mode_encoding"], dtype=np.float32)
         reached_modes = final_modes > 0.5
+        print(f"Loaded algorithm: {algorithm_name}")
         print(f"Saved render to {os.path.abspath(args.output)}")
         if args.npz is not None:
             print(f"Saved rollout arrays to {os.path.abspath(args.npz)}")

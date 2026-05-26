@@ -136,6 +136,7 @@ def test_default_config_matches_legacy_reference_hyperparameters():
     assert cfg.use_env_action_scale is False
     assert cfg.normalizer_epsilon == pytest.approx(1e-2)
     assert cfg.randomize_initial_episode_steps is True
+    assert cfg.eval_action_mode == "ode"
 
 
 def test_action_scale_is_unit_by_default_like_legacy_tanh_actor():
@@ -398,6 +399,34 @@ def test_policy_sample_action_matches_legacy_tanh_normal_formula():
     assert_allclose(log_prob, expected_log_prob)
     assert_allclose(entropy, -expected_log_prob)
     assert_allclose(sample_info["raw_action"], raw_action)
+
+
+def test_select_eval_action_supports_deterministic_and_stochastic_rollouts():
+    policy = make_policy()
+    params = initialize_policy_params(policy)
+    params = set_policy_output_bias(params, [0.2, -0.3, -0.4, 0.1])
+    observations = jnp.asarray(
+        [
+            [0.0, 0.5, -0.2],
+            [1.0, -0.5, 0.4],
+            [-0.2, 0.1, 0.8],
+        ],
+        dtype=jnp.float32,
+    )
+    key = jax.random.PRNGKey(11)
+
+    model = RePPOBase.__new__(RePPOBase)
+    model.policy = policy
+
+    model.eval_action_mode = "ode"
+    deterministic_action = model.select_eval_action(params, observations, key)
+    assert_allclose(deterministic_action, policy.deterministic_action(params, observations, key))
+
+    model.eval_action_mode = "sde"
+    stochastic_action = model.select_eval_action(params, observations, key)
+    expected_stochastic_action, _, _, _ = policy.sample_action(params, observations, key, 1.0)
+    assert_allclose(stochastic_action, expected_stochastic_action)
+    assert not np.allclose(np.asarray(stochastic_action), np.asarray(deterministic_action))
 
 
 def test_behavior_importance_weight_matches_legacy_density_ratio_formula():

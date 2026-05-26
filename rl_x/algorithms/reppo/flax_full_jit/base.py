@@ -177,6 +177,7 @@ class RePPOBase:
 
         self.evaluation_and_save_frequency = int(config.algorithm.evaluation_and_save_frequency)
         self.evaluation_active = config.algorithm.evaluation_active
+        self.eval_action_mode = getattr(config.algorithm, "eval_action_mode", "ode")
 
         self.batch_size = self.nr_envs * self.nr_steps
         if self.batch_size % self.nr_minibatches != 0:
@@ -198,6 +199,8 @@ class RePPOBase:
             raise ValueError("Evaluation and save frequency must be a multiple of batch size.")
         if self.nr_parallel_seeds > 1:
             raise ValueError("Parallel seeds are not supported yet. This is mainly limited by not being able to log multiple wandb runs at the same time.")
+        if self.eval_action_mode not in ("sde", "ode"):
+            raise ValueError("algorithm.eval_action_mode must be either 'sde' or 'ode'.")
 
         rlx_logger.info(f"Using device: {jax.default_backend()}")
 
@@ -421,6 +424,12 @@ class RePPOBase:
 
         env_state, _ = self.randomize_episode_counters(env_state, key)
         return env_state
+
+    def select_eval_action(self, actor_params, observation, key):
+        if self.eval_action_mode == "sde":
+            action, _, _, _ = self.policy.sample_action(actor_params, observation, key, 1.0)
+            return action
+        return self.policy.deterministic_action(actor_params, observation, key)
 
     def train(self):
         exploration_scale = self.exploration_scale()
@@ -790,7 +799,7 @@ class RePPOBase:
                             observation_normalizer_state,
                             "policy",
                         )
-                        eval_action = self.policy.deterministic_action(actor_state.params, eval_observation, action_key)
+                        eval_action = self.select_eval_action(actor_state.params, eval_observation, action_key)
                         eval_env_state = self.eval_env.step(eval_env_state, eval_action)
                         return (actor_state, observation_normalizer_state, eval_env_state, key), None
 
@@ -954,7 +963,7 @@ class RePPOBase:
                 self.observation_normalizer_state,
                 "policy",
             )
-            action = self.policy.deterministic_action(self.actor_state.params, observation, action_key)
+            action = self.select_eval_action(self.actor_state.params, observation, action_key)
             env_state = self.train_env.step(env_state, action)
             return env_state, key
 

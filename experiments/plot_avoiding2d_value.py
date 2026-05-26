@@ -6,8 +6,13 @@ import jax.numpy as jnp
 import numpy as np
 from ml_collections import config_dict
 
-from rl_x.algorithms.reppo_dime.flax_full_jit.default_config import get_config as get_algorithm_config
-from rl_x.algorithms.reppo_dime.flax_full_jit.reppo_dime import RePPO_DIME
+from avoiding2d_checkpoint_utils import (
+    clip_action,
+    load_checkpoint_algorithm_config,
+    load_algorithm_model_class,
+    load_saved_config,
+    resolve_algorithm_name,
+)
 from rl_x.environments.custom_jax.avoiding_2d.create_env import create_train_and_eval_env
 from rl_x.environments.custom_jax.avoiding_2d.default_config import get_config as get_environment_config
 from rl_x.environments.custom_jax.avoiding_2d.environment import (
@@ -26,9 +31,24 @@ from rl_x.runner.default_config import get_config as get_runner_config
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Plot the RePPO-DIME Monte Carlo value estimate over the Avoiding2D xy workspace."
+        description="Plot a Monte Carlo critic value estimate over the Avoiding2D xy workspace."
     )
     parser.add_argument("--checkpoint", required=True, help="Path to an RL-X latest.model checkpoint.")
+    parser.add_argument(
+        "--algorithm-name",
+        default="auto",
+        help="RL-X algorithm name. Use 'auto' to read config_algorithm.json from the checkpoint.",
+    )
+    parser.add_argument(
+        "--algorithm-config-json",
+        default=None,
+        help="Optional exact algorithm config JSON to use as the base config.",
+    )
+    parser.add_argument(
+        "--environment-config-json",
+        default=None,
+        help="Optional exact environment config JSON to use as the base config.",
+    )
     parser.add_argument("--output", default="avoiding2d_value.png", help="PNG path for the value plot.")
     parser.add_argument("--npz", default=None, help="Optional path for dense value/action arrays.")
     parser.add_argument("--resolution", type=int, default=240, help="Grid cells per axis.")
@@ -47,25 +67,26 @@ def parse_args():
     )
     parser.add_argument("--max-steps", type=int, default=None, help="Override Avoiding2D max_steps during loading.")
     parser.add_argument("--n-substeps", type=int, default=None, help="Override Avoiding2D n_substeps during loading.")
-    parser.add_argument("--no-obstacles", action="store_true")
+    parser.add_argument("--no-obstacles", dest="no_obstacles", action="store_true", default=None)
+    parser.add_argument("--with-obstacles", dest="no_obstacles", action="store_false")
     parser.add_argument(
         "--obstacle-layer-1",
         dest="obstacle_layer_1_enabled",
-        default=True,
+        default=None,
         action=argparse.BooleanOptionalAction,
         help="Enable or disable obstacle layer 1 in the plotted scene.",
     )
     parser.add_argument(
         "--obstacle-layer-2",
         dest="obstacle_layer_2_enabled",
-        default=True,
+        default=None,
         action=argparse.BooleanOptionalAction,
         help="Enable or disable obstacle layer 2 in the plotted scene.",
     )
     parser.add_argument(
         "--obstacle-layer-3",
         dest="obstacle_layer_3_enabled",
-        default=True,
+        default=None,
         action=argparse.BooleanOptionalAction,
         help="Enable or disable obstacle layer 3 in the plotted scene.",
     )
@@ -77,9 +98,16 @@ def parse_args():
 
 
 def build_config(args):
+    algorithm_name = resolve_algorithm_name(args.checkpoint, args.algorithm_name)
     config = config_dict.ConfigDict()
-    config.algorithm = get_algorithm_config("reppo_dime.flax_full_jit")
-    config.environment = get_environment_config("custom_jax.avoiding_2d")
+    if args.algorithm_config_json is not None:
+        config.algorithm = load_saved_config(args.algorithm_config_json)
+    else:
+        config.algorithm = load_checkpoint_algorithm_config(args.checkpoint, algorithm_name)
+    if args.environment_config_json is not None:
+        config.environment = load_saved_config(args.environment_config_json)
+    else:
+        config.environment = get_environment_config("custom_jax.avoiding_2d")
     config.runner = get_runner_config("test")
 
     config.runner.load_model = os.path.abspath(args.checkpoint)
@@ -90,10 +118,14 @@ def build_config(args):
 
     config.environment.nr_envs = max(1, min(args.chunk_size, args.resolution * args.resolution))
     config.environment.render = False
-    config.environment.no_obstacles = args.no_obstacles
-    config.environment.obstacle_layer_1_enabled = args.obstacle_layer_1_enabled
-    config.environment.obstacle_layer_2_enabled = args.obstacle_layer_2_enabled
-    config.environment.obstacle_layer_3_enabled = args.obstacle_layer_3_enabled
+    if args.no_obstacles is not None:
+        config.environment.no_obstacles = args.no_obstacles
+    if args.obstacle_layer_1_enabled is not None:
+        config.environment.obstacle_layer_1_enabled = args.obstacle_layer_1_enabled
+    if args.obstacle_layer_2_enabled is not None:
+        config.environment.obstacle_layer_2_enabled = args.obstacle_layer_2_enabled
+    if args.obstacle_layer_3_enabled is not None:
+        config.environment.obstacle_layer_3_enabled = args.obstacle_layer_3_enabled
     if args.max_steps is not None:
         config.environment.max_steps = args.max_steps
     if args.n_substeps is not None:
@@ -105,7 +137,7 @@ def build_config(args):
     config.algorithm.nr_epochs = 1
     config.algorithm.total_timesteps = config.environment.nr_envs
     config.algorithm.evaluation_and_save_frequency = config.environment.nr_envs
-    return config
+    return config, algorithm_name
 
 
 def make_observations(points, target_mode):
@@ -146,7 +178,7 @@ def value_grid(model, args):
                 sample_key,
                 1.0,
             )
-            action = model.clip_action(action)
+            action = clip_action(model, action)
             value = model.critic.apply(
                 {"params": model.critic_state.params},
                 critic_observation,
@@ -225,7 +257,7 @@ def render_value_plot(data, env, args):
     ax.set_ylim((args.y_min, args.y_max))
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Avoiding2D RePPO-DIME value")
+    ax.set_title("Avoiding2D checkpoint value")
     fig.tight_layout()
     fig.savefig(args.output, dpi=200)
     if args.show:
@@ -242,11 +274,12 @@ def main():
     if args.chunk_size <= 0:
         raise ValueError("--chunk-size must be positive")
 
-    config = build_config(args)
+    config, algorithm_name = build_config(args)
     train_env, eval_env = create_train_and_eval_env(config)
 
     run_path = os.path.abspath("runs/checkpoint_value_plot/avoiding2d")
-    model = RePPO_DIME.load(
+    model_class = load_algorithm_model_class(algorithm_name)
+    model = model_class.load(
         config,
         train_env,
         eval_env,
@@ -268,6 +301,7 @@ def main():
             np.savez_compressed(args.npz, **data)
 
         render_value_plot(data, eval_env, args)
+        print(f"Loaded algorithm: {algorithm_name}")
         print(f"Saved value plot to {os.path.abspath(args.output)}")
         if args.npz is not None:
             print(f"Saved value arrays to {os.path.abspath(args.npz)}")
