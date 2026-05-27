@@ -12,8 +12,8 @@ parameters:
   algorithm.name:
     values:
       # - reppo.flax_full_jit
-      - reppo_dime.flax_full_jit
-      # - reppo_pis.flax_full_jit
+      # - reppo_dime.flax_full_jit
+      - reppo_pis.flax_full_jit
   algorithm.ent_start:
     values: [2.0, 4.0]
   algorithm.ent_target_mult:
