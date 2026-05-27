@@ -1,5 +1,5 @@
 program: experiments/experiment.py
-name: avoiding-2D-multimodality-delta-progress-truDI-horizon-sweep
+name: avoiding-2D-multimodality-delta-progress-reppo_pis-horizon-sweep
 entity: rubendhanaraju-university-of-porto
 project: rlx-multimodality
 method: grid
