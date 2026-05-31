@@ -513,8 +513,8 @@ class TRVBDMoE:
                             method=self.critic.forward,
                         )
                         temperature = self.policy.temperature(actor_state.params)
-                        soft_reward = env_state.reward - self.gamma * next_policy_log_prob * temperature
-
+                        nonterminal = 1.0 - env_state.terminated
+                        soft_reward = env_state.reward - (self.gamma * nonterminal * next_policy_log_prob * temperature)
                         transition = (
                             policy_observation,
                             critic_observation,
