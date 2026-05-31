@@ -1,0 +1,48 @@
+program: experiments/experiment.py
+name: avoiding-2D-multimodality-tr_vbd_moe-delta-progress-entropy-sweep
+entity: rubendhanaraju-university-of-porto
+project: rlx-multimodality-tr_vbd_moe
+method: grid
+
+metric:
+  name: eval/episode_return
+  goal: maximize
+
+parameters:
+  algorithm.ent_start:
+    values: [2.0, 4.0]
+  algorithm.ent_target_mult:
+    values: [3.0, 5.0, 7.0]
+
+command:
+  - conda
+  - run
+  - -n
+  - rlx
+  - python
+  - ${program}
+  - --algorithm.name=tr_vbd_moe.flax_full_jit
+  - --environment.name=custom_jax.avoiding_2d
+  - --runner.track_console=False
+  - --runner.save_model=True
+  - --algorithm.evaluation_and_save_frequency=524288
+  - --environment.render=False
+  - --runner.track_wandb=True
+  - --runner.wandb_entity=rubendhanaraju-university-of-porto
+  - --runner.project_name=rlx-multimodality-tr_vbd_moe
+  - --runner.exp_name=avoiding-2D-multimodality-tr_vbd_moe-delta-progress
+  - --runner.notes="Testing variational destilation"
+  - --environment.obstacle_layer_1_enabled=False
+  - --environment.obstacle_layer_2_enabled=True
+  - --environment.obstacle_layer_3_enabled=True
+  - --environment.reward_function=delta_progress
+  - --environment.block_on_collision=True
+  - --environment.enable_bounds_collision=True
+  - --environment.terminate_on_collision=False
+  - --environment.terminate_on_goal=False
+  - --environment.point_radius=0.0
+  - --environment.collision_margin=0.0
+  - --algorithm.gamma=1.0
+  - --algorithm.v_min=-50
+  - --algorithm.v_max=10.0
+  - ${args}
