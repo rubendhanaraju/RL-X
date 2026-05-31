@@ -158,6 +158,9 @@ class TRVBDMoE:
         self.update_entropy_lagrangian = config.algorithm.update_entropy_lagrangian
         self.aux_loss_mult = config.algorithm.aux_loss_mult
 
+        self.action_clipping = config.algorithm.action_clipping
+        self.action_clip_value = config.algorithm.action_clip_value
+
         self.enable_observation_normalization = config.algorithm.enable_observation_normalization
         self.normalizer_epsilon = config.algorithm.normalizer_epsilon
         self.randomize_initial_episode_steps = config.algorithm.randomize_initial_episode_steps
@@ -277,8 +280,8 @@ class TRVBDMoE:
         return jnp.concatenate([base, offset], axis=0)
 
     def clip_action(self, action):
-        # Kept as a no-op compatibility hook. The policy already uses tanh
-        # squashing, so extra hard clipping is intentionally disabled.
+        if self.action_clipping:
+            return jnp.clip(action, -self.action_clip_value, self.action_clip_value)
         return action
 
     def initialize_observation_normalizer(self, observation):
@@ -483,7 +486,7 @@ class TRVBDMoE:
                             self.lmbda_min,
                         )
 
-                        env_action = action
+                        env_action = self.clip_action(action)
                         env_state = self.train_env.step(env_state, env_action)
                         next_observation = env_state.actual_next_observation
                         observation_normalizer_state = self.update_observation_normalizer(
@@ -854,6 +857,7 @@ class TRVBDMoE:
                             "policy",
                         )
                         eval_action = self.select_eval_action(actor_state.params, eval_observation, action_key)
+                        eval_action = self.clip_action(eval_action)
                         eval_env_state = self.eval_env.step(eval_env_state, eval_action)
                         return (actor_state, observation_normalizer_state, eval_env_state, key), None
 
@@ -1020,6 +1024,7 @@ class TRVBDMoE:
             observation = self.normalize_observation(env_state.next_observation, self.observation_normalizer_state,
                                                      "policy")
             action = self.select_eval_action(self.actor_state.params, observation, action_key)
+            action = self.clip_action(action)
             env_state = self.eval_env.step(env_state, action)
             return env_state, key
 

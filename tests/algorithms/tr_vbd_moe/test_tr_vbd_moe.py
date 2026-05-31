@@ -40,6 +40,8 @@ def test_default_config_has_tr_vbd_moe_actor_and_distributional_critic_defaults(
     assert cfg.nr_experts == 4
     assert cfg.nr_actor_samples_per_expert == 1
     assert cfg.min_log_responsibility == -20.0
+    assert cfg.action_clipping is True
+    assert cfg.action_clip_value == 0.999
     assert cfg.hl_gauss is True
     assert cfg.lmbda == 0.95
     assert cfg.aux_loss_mult == 1.0

@@ -48,7 +48,9 @@ def get_config(algorithm_name):
     config.log_std_min = -5.0
     config.log_std_max = 2.0
     config.use_actor_skip = False
-    config.use_env_action_scale = False
+    config.use_env_action_scale = True
+    config.action_clipping = True
+    config.action_clip_value = 0.999
 
     config.kl_start = 0.01
     config.kl_bound = 0.1
