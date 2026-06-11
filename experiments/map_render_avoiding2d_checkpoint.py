@@ -21,8 +21,10 @@ from avoiding2d_wandb_mapper_utils import (
     prepare_run,
     progress_label,
     progress_total,
+    read_output_run_id,
     run_mapper,
     run_output_dir,
+    run_output_dir_with_id,
     should_skip_output,
     write_json,
 )
@@ -103,8 +105,11 @@ def render_run(args: argparse.Namespace, prepared, progress: ProgressLogger) -> 
     prepared.result["artifacts"]["render_png"] = str(output_png)
 
     if should_skip_output(args, output_png, output_npz if args.save_npz else output_png):
-        progress.log("render skipped because outputs already exist")
-        return {"skipped": True, "reason": "outputs already exist"}
+        run_id = str(prepared.result["run"]["id"])
+        if (prepared.output_dir / "render_result.json").exists() and prepared.preexisting_run_id == run_id:
+            progress.log("render skipped because outputs already exist for this run id")
+            return {"skipped": True, "reason": "outputs already exist for this run id"}
+        progress.log("render: existing outputs are not known to belong to this run id; overwriting")
 
     started = time.perf_counter()
     progress.log("render: building config and environments")
@@ -178,6 +183,26 @@ def existing_render_marker(args: argparse.Namespace, output_dir: Path) -> tuple[
     return None, ""
 
 
+def resolve_render_output_dir(run, sweep, args: argparse.Namespace, progress: ProgressLogger, label: str) -> tuple[Path, str]:
+    output_dir = run_output_dir(run, sweep, args)
+    if sweep is None or not output_dir.exists():
+        return output_dir, read_output_run_id(output_dir)
+
+    existing_run_id = read_output_run_id(output_dir)
+    if existing_run_id == str(run.id):
+        return output_dir, existing_run_id
+
+    marker, _ = existing_render_marker(args, output_dir)
+    if existing_run_id or marker is not None:
+        disambiguated_dir = run_output_dir_with_id(run, sweep, args)
+        disambiguated_run_id = read_output_run_id(disambiguated_dir)
+        reason = f"run name collision with run {existing_run_id}" if existing_run_id else "existing outputs have no run id"
+        progress.log(f"run {label}: {reason}; using {disambiguated_dir}")
+        return disambiguated_dir, disambiguated_run_id
+
+    return output_dir, existing_run_id
+
+
 def skipped_existing_run_result(run, sweep, output_dir, marker, reason, duration_seconds: float) -> dict:
     return {
         "run": {
@@ -206,16 +231,31 @@ def make_map_fn(args: argparse.Namespace):
         started = time.perf_counter()
         try:
             if sweep is not None:
-                output_dir = run_output_dir(run, sweep, args)
+                output_dir, preexisting_run_id = resolve_render_output_dir(run, sweep, args, progress, label)
                 if output_dir.exists():
                     marker, reason = existing_render_marker(args, output_dir)
                     if marker is not None:
-                        duration_seconds = time.perf_counter() - started
-                        progress.log(f"run {label}: skipping existing mapped run ({reason}) -> {output_dir}")
-                        return skipped_existing_run_result(run, sweep, output_dir, marker, reason, duration_seconds)
-                    progress.log(f"run {label}: existing output dir is incomplete; retrying -> {output_dir}")
+                        if marker.name == "render_result.json" and preexisting_run_id == str(run.id):
+                            duration_seconds = time.perf_counter() - started
+                            progress.log(f"run {label}: skipping existing mapped run ({reason}) -> {output_dir}")
+                            return skipped_existing_run_result(run, sweep, output_dir, marker, reason, duration_seconds)
+                        progress.log(
+                            f"run {label}: existing mapped outputs are not for this run id; rerendering -> {output_dir}"
+                        )
+                    else:
+                        progress.log(f"run {label}: existing output dir is incomplete; retrying -> {output_dir}")
+            else:
+                output_dir = run_output_dir(run, sweep, args)
+                preexisting_run_id = read_output_run_id(output_dir)
 
-            prepared = prepare_run(run, sweep, args, progress)
+            prepared = prepare_run(
+                run,
+                sweep,
+                args,
+                progress,
+                output_dir=output_dir,
+                preexisting_run_id=preexisting_run_id,
+            )
             if args.config_only:
                 progress.log(f"run {label}: config-only mode; skipping render")
                 prepared.result["duration_seconds"] = time.perf_counter() - started

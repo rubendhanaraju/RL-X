@@ -688,11 +688,17 @@ class TRVBDMoE:
                         lagrangian = self.policy.lagrangian(actor_params)
                         gate_probs = sample_info["gate_probs"]
                         gate_log_probs = sample_info["gate_log_probs"]
-                        expert_costs = (jax.lax.stop_gradient(temperature) *
-                                        (gate_log_probs[:, :, None] + sample_info["expert_action_log_probs"] -
-                                         old_log_responsibilities) - values)
-                        per_state_bound = jnp.sum(gate_probs * jnp.mean(expert_costs, axis=-1), axis=-1)
-                        vbd_bound = jnp.mean(per_state_bound)
+                        temperature_scale = jnp.maximum(jax.lax.stop_gradient(temperature), 1e-6)
+                        expert_bound_terms = jnp.mean(
+                            sample_info["expert_action_log_probs"]
+                            - old_log_responsibilities
+                            - values / temperature_scale,
+                            axis=-1,
+                        )
+                        gate_targets = jax.lax.stop_gradient(jax.nn.softmax(-expert_bound_terms, axis=-1))
+                        expert_loss = jnp.mean(jnp.sum(gate_targets * expert_bound_terms, axis=-1))
+                        gate_loss = -jnp.mean(jnp.sum(gate_targets * gate_log_probs, axis=-1))
+                        vbd_bound = temperature_scale * (expert_loss + gate_loss)
 
                         gate_kl, expert_kl, joint_kl = self.policy.joint_kl_components(
                             actor_params,
@@ -724,6 +730,8 @@ class TRVBDMoE:
                             "loss/actor_loss": actor_loss_metrics["actor_loss"],
                             "loss/actor_total_loss": loss,
                             "loss/tr_vbd_bound": actor_loss_metrics["vbd_bound"],
+                            "loss/tr_vbd_expert_loss": expert_loss,
+                            "loss/tr_vbd_gate_ce_loss": gate_loss,
                             "loss/trust_region_loss": actor_loss_metrics["trust_region_loss"],
                             "loss/entropy_lagrangian_loss": actor_loss_metrics["entropy_lagrangian_loss"],
                             "loss/kl_lagrangian_loss": actor_loss_metrics["kl_lagrangian_loss"],
@@ -734,6 +742,11 @@ class TRVBDMoE:
                             "policy/expert_kl": jnp.mean(expert_kl),
                             "policy/lagrangian": lagrangian,
                             "policy/old_log_responsibility": jnp.mean(old_log_responsibilities),
+                            "policy/gate_target_entropy": -jnp.mean(
+                                jnp.sum(gate_targets * jnp.log(jnp.maximum(gate_targets, 1e-8)), axis=-1)
+                            ),
+                            "policy/gate_target_max_probability": jnp.mean(jnp.max(gate_targets, axis=-1)),
+                            "policy/gate_target_l1_error": jnp.mean(jnp.sum(jnp.abs(gate_probs - gate_targets), axis=-1)),
                             "policy/abs_batch_action": jnp.mean(jnp.abs(minibatch_actions)),
                             "policy/abs_pred_action": jnp.mean(jnp.abs(pred_actions)),
                             "q/policy_value": q_value,

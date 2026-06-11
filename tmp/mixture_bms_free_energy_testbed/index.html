@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Mixture-BMS Q-Only Free-Energy Testbed</title>
+  <style>
+    body { margin: 24px; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f8fafc; color: #111827; }
+    main { max-width: 1280px; margin: 0 auto; }
+    img { width: 100%; height: auto; background: white; border: 1px solid #d1d5db; }
+    a { color: #1d4ed8; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Mixture-BMS with Q-only local free-energy decomposition</h1>
+    <p>The target enters only through Q(x) and grad Q(x). Local responsibilities are computed from frozen expert terminal-sample KDEs, and the gate is computed from grid free energies.</p>
+    <p><a href="summary.json">summary.json</a></p>
+    <img src="mixture_bms_free_energy.png" alt="Mixture-BMS Q-only free-energy figure">
+  </main>
+</body>
+</html>

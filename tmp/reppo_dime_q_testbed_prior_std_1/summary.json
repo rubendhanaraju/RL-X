@@ -1,0 +1,63 @@
+{
+  "config": {
+    "seed": 0,
+    "updates": 1000,
+    "batch_size": 512,
+    "learning_rate": 0.0003,
+    "max_grad_norm": 1.0,
+    "target_update_interval": 25,
+    "diffusion_steps": 8,
+    "diffusion_init_std": 1.0,
+    "score_model_nr_layers": 4,
+    "score_model_nr_hidden_units": 128,
+    "temperature": 0.2,
+    "kl_start": 0.05,
+    "kl_bound": 0.05,
+    "kl_action_rep": 4,
+    "actor_kl_clip_mode": "clipped",
+    "update_kl_lagrangian": true,
+    "update_entropy_lagrangian": false,
+    "resolution": 120,
+    "nr_policy_samples": 32768
+  },
+  "final_metrics": {
+    "update": 1000,
+    "loss": 0.3731169104576111,
+    "actor_loss": 0.371523916721344,
+    "sac_loss": 0.577293872833252,
+    "kl_loss": 0.010174335911870003,
+    "entropy": -2.916863441467285,
+    "temperature": 0.20000000298023224,
+    "lagrangian": 0.03999929130077362,
+    "mean_q": -0.5538669228553772,
+    "running_cost": 2.916863441467285,
+    "terminal_cost": -2.7997283935546875,
+    "friction": 1.0228369235992432,
+    "sample_abs_action": 0.5468221306800842,
+    "grad_norm": 0.8980313539505005,
+    "sample_mode_mass": [
+      0.2734375,
+      0.015625,
+      0.53125,
+      0.1796875
+    ]
+  },
+  "kl_target_policy": 6.481301000897974,
+  "kl_policy_target": 2.468454965119248,
+  "target_mode_mass": [
+    0.2400006502866745,
+    0.27989381551742554,
+    0.18003793060779572,
+    0.30006760358810425
+  ],
+  "policy_mode_mass": [
+    0.3087158203125,
+    0.011962890625,
+    0.537353515625,
+    0.1419677734375
+  ],
+  "sample_policy_cost_mean": 0.07329512387514114,
+  "sample_policy_cost_std": 1.5790303945541382,
+  "sample_entropy_mean": -2.9123263359069824,
+  "sample_entropy_std": 1.9289376735687256
+}

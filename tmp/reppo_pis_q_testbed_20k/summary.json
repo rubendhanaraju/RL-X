@@ -1,0 +1,67 @@
+{
+  "config": {
+    "seed": 0,
+    "updates": 20000,
+    "batch_size": 512,
+    "learning_rate": 0.0003,
+    "max_grad_norm": 1.0,
+    "target_update_interval": 25,
+    "diffusion_steps": 16,
+    "score_model_nr_layers": 4,
+    "score_model_nr_hidden_units": 128,
+    "temperature": 0.2,
+    "kl_start": 10.0,
+    "kl_bound": 0.05,
+    "update_kl_lagrangian": true,
+    "update_entropy_lagrangian": false,
+    "q_score_max_norm": 5.0,
+    "q_score_max_percentile": 95.0,
+    "loss_scaling_sigma_power": -1.0,
+    "scale_loss_with_temperature": false,
+    "onpol_entropy": true,
+    "resolution": 180,
+    "nr_policy_samples": 8192
+  },
+  "final_metrics": {
+    "update": 20000,
+    "loss": 7.473028182983398,
+    "actor_loss": 7.48482084274292,
+    "adjoint_loss": 7.460864067077637,
+    "kl_loss": 0.09847448766231537,
+    "entropy": -1.0255324840545654,
+    "optimal_entropy": -0.3764544129371643,
+    "reverse_ess": 0.005238959565758705,
+    "temperature": 0.20000000298023224,
+    "lagrangian": 0.24327689409255981,
+    "mean_q": 0.011395499110221863,
+    "q_score_norm": 0.6601913571357727,
+    "q_score_pct_clipped": 0.05078125,
+    "control_norm": 1.7405619621276855,
+    "old_control_norm": 1.643474817276001,
+    "target_control_norm": 32.74085998535156,
+    "sample_abs_action": 0.5860940217971802,
+    "grad_norm": 4.859869480133057,
+    "sample_mode_mass": [
+      0.337890625,
+      0.3203125,
+      0.158203125,
+      0.18359375
+    ]
+  },
+  "kl_target_policy": 5.000183414359833,
+  "kl_policy_target": 0.7378832733122712,
+  "target_mode_mass": [
+    0.24000006914138794,
+    0.27988457679748535,
+    0.18004143238067627,
+    0.30007386207580566
+  ],
+  "policy_mode_mass": [
+    0.253662109375,
+    0.300537109375,
+    0.2235107421875,
+    0.2222900390625
+  ],
+  "sample_log_weight_mean": -1.045935869216919,
+  "sample_log_weight_std": 1.8514182567596436
+}

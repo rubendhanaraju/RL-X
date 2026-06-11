@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>TR-VBD-MoE Multimodal Q Testbed</title>
+  <style>
+    body {
+      margin: 24px;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #111827;
+      background: #f8fafc;
+    }
+    main {
+      max-width: 1280px;
+      margin: 0 auto;
+    }
+    img {
+      width: 100%;
+      height: auto;
+      background: white;
+      border: 1px solid #d1d5db;
+    }
+    a {
+      color: #1d4ed8;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>TR-VBD-MoE Multimodal Q Testbed</h1>
+    <p>Static one-state analytic-Q testbed. The panels compare the fixed Q landscape,
+    Boltzmann target density, initial MoE samples, learned policy density,
+    density residuals, Voronoi mode masses, and training traces.</p>
+    <p><a href="summary.json">summary.json</a></p>
+    <h2>Expert Allocation</h2>
+    <p>Dominant-expert heatmap over action space, expert-colored samples,
+    per-expert joint action densities, and the mass each expert assigns to each
+    Boltzmann mode. Black/white contours mark the Boltzmann modes.</p>
+    <img src="expert_allocation.png" alt="TR-VBD-MoE expert allocation figure">
+    <h2>Policy Fit</h2>
+    <img src="tr_vbd_moe_multimodal_q.png" alt="TR-VBD-MoE multimodal Q testbed figure">
+  </main>
+</body>
+</html>

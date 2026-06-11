@@ -27,6 +27,7 @@ class PreparedRun:
     config_path: Path
     raw_config_path: Path
     result: dict[str, Any]
+    preexisting_run_id: str = ""
 
 
 class ProgressLogger:
@@ -263,6 +264,60 @@ def run_output_dir(run: Any, sweep: Any | None, args: argparse.Namespace) -> Pat
     ).resolve()
 
 
+def run_output_dir_with_id(run: Any, sweep: Any | None, args: argparse.Namespace) -> Path:
+    if sweep is None:
+        return run_output_dir(run, sweep, args)
+
+    run_name = safe_dir_name(run.name or run.id)
+    run_id = safe_dir_name(run.id)
+    max_name_length = max(1, 180 - len(run_id) - 1)
+    return (
+        sweep_output_dir(sweep, args)
+        / "runs"
+        / f"{run_name[:max_name_length]}-{run_id}"
+        / args.output_subdir
+    ).resolve()
+
+
+def extract_run_id(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    run_info = payload.get("run")
+    if isinstance(run_info, dict) and run_info.get("id"):
+        return str(run_info["id"])
+    if payload.get("id"):
+        return str(payload["id"])
+    return ""
+
+
+def read_output_run_id(output_dir: Path) -> str:
+    for filename in ("render_result.json", "value_result.json", "run_manifest.json"):
+        path = output_dir / filename
+        if not path.exists():
+            continue
+        try:
+            run_id = extract_run_id(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            run_id = ""
+        if run_id:
+            return run_id
+    return ""
+
+
+def write_run_manifest(run: Any, sweep: Any | None, output_dir: Path) -> Path:
+    return write_json(
+        output_dir / "run_manifest.json",
+        {
+            "id": run.id,
+            "name": run.name,
+            "path": run.path,
+            "url": run.url,
+            "sweep_id": getattr(sweep, "id", None) if sweep else None,
+            "sweep_name": getattr(sweep, "name", None) if sweep else None,
+        },
+    )
+
+
 def unwrap_config_value(value: Any) -> Any:
     if isinstance(value, dict) and "value" in value and len(value) <= 3:
         return value["value"]
@@ -354,13 +409,23 @@ def download_checkpoint(run: Any, args: argparse.Namespace, output_dir: Path) ->
     return resolve_downloaded_file(downloaded_path, download_root, args.checkpoint_file)
 
 
-def prepare_run(run: Any, sweep: Any | None, args: argparse.Namespace, progress: ProgressLogger) -> PreparedRun:
+def prepare_run(
+    run: Any,
+    sweep: Any | None,
+    args: argparse.Namespace,
+    progress: ProgressLogger,
+    *,
+    output_dir: Path | None = None,
+    preexisting_run_id: str = "",
+) -> PreparedRun:
     sweep_dir = sweep_output_dir(sweep, args)
-    output_dir = run_output_dir(run, sweep, args)
+    output_dir = output_dir or run_output_dir(run, sweep, args)
     output_dir.mkdir(parents=True, exist_ok=True)
     sweep_manifest = write_sweep_manifest(sweep, sweep_dir)
     if sweep_manifest is not None:
         progress.log(f"sweep manifest -> {sweep_manifest}")
+    run_manifest_path = write_run_manifest(run, sweep, output_dir)
+    progress.log(f"run manifest -> {run_manifest_path}")
 
     config_path = write_json(output_dir / "config.json", run.config)
     raw_config_path = write_json(output_dir / "raw_config.json", run.rawconfig)
@@ -400,6 +465,7 @@ def prepare_run(run: Any, sweep: Any | None, args: argparse.Namespace, progress:
         },
         "sweep": sweep.manifest() if sweep else None,
         "output_dir": str(output_dir),
+        "run_manifest": str(run_manifest_path),
         "checkpoint": str(checkpoint_path),
         "config": str(config_path),
         "raw_config": str(raw_config_path),
@@ -423,6 +489,7 @@ def prepare_run(run: Any, sweep: Any | None, args: argparse.Namespace, progress:
         config_path=config_path,
         raw_config_path=raw_config_path,
         result=result,
+        preexisting_run_id=preexisting_run_id,
     )
 
 

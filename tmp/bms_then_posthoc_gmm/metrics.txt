@@ -1,0 +1,11 @@
+em_init: our_init
+bms_train_time_sec: 35.738
+our_gmm_train_time_sec: 14.404
+bms_mode_tvd: 0.136450
+posthoc_gmm_mode_tvd: 0.150300
+our_gmm_mode_tvd: 0.007700
+bms_sliced_w2: 2.372016
+posthoc_gmm_sliced_w2: 2.418468
+our_gmm_sliced_w2: 0.208108
+posthoc_gmm_forward_kl_est: 0.240712
+our_gmm_forward_kl_est: 0.008610

@@ -1,0 +1,633 @@
+#!/usr/bin/env python3
+"""
+GMM-constrained BMS-style sampler in JAX/Flax.
+
+This variant uses a neural mixture-of-experts control:
+  - a gating MLP chooses component responsibilities from (x,t),
+  - a component MLP outputs per-component residual controls,
+  - terminal GMM component means are initialized broadly and mode-agnostically.
+
+Output:
+  ./tmp/target_vs_mixture_samples.png  # target, initial GMM, trained GMM
+  ./tmp/learned_gmm_params.npz
+
+Install:
+  pip install "jax[cpu]" flax optax matplotlib
+
+For GPU, install the appropriate JAX CUDA wheel from the JAX docs.
+"""
+
+import argparse
+from functools import partial
+from pathlib import Path
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+from flax.training import train_state
+import optax
+
+# -----------------------------
+# Fixed wide-range 2D multimodal Boltzmann target
+# p(x) ∝ exp(-U(x)).
+# Here U(x) = -log sum_k w_k exp(-0.5 ||x-m_k||^2_{V_k^{-1}})
+# This is a Boltzmann density with several wells/modes.
+# -----------------------------
+
+TARGET_CENTERS = jnp.array(
+    [
+        [-14.0, -12.0],
+        [-13.5,   7.5],
+        [ -6.5,  14.0],
+        [  0.0,   0.0],
+        [  7.0,  12.5],
+        [ 14.0,  -8.0],
+        [  4.5, -15.0],
+        [ 15.0,   4.5],
+    ],
+    dtype=jnp.float32,
+)
+
+_target_weights = jnp.array(
+    [0.10, 0.13, 0.09, 0.18, 0.12, 0.16, 0.08, 0.14],
+    dtype=jnp.float32,
+)
+TARGET_LOGITS = jnp.log(_target_weights)
+
+TARGET_VARS = jnp.array(
+    [
+        [1.20, 1.80],
+        [1.75, 1.10],
+        [1.35, 1.55],
+        [2.30, 1.90],
+        [1.40, 1.70],
+        [1.15, 1.35],
+        [1.60, 1.10],
+        [1.50, 1.85],
+    ],
+    dtype=jnp.float32,
+)
+
+
+def target_log_rho(x: jnp.ndarray) -> jnp.ndarray:
+    """
+    Unnormalized log-density log rho(x) = -U(x).
+    x: (..., 2)
+    returns: (...)
+    """
+    diff = x[..., None, :] - TARGET_CENTERS
+    quad = jnp.sum(diff**2 / TARGET_VARS, axis=-1)
+    log_det = jnp.sum(jnp.log(TARGET_VARS), axis=-1)
+    log_comp = TARGET_LOGITS - 0.5 * (quad + log_det)
+    return jax.nn.logsumexp(log_comp, axis=-1)
+
+
+def target_score(x: jnp.ndarray) -> jnp.ndarray:
+    """
+    score = grad_x log rho(x).
+    x: (batch, 2)
+    returns: (batch, 2)
+    """
+    diff = x[:, None, :] - TARGET_CENTERS[None, :, :]
+    quad = jnp.sum(diff**2 / TARGET_VARS[None, :, :], axis=-1)
+    log_det = jnp.sum(jnp.log(TARGET_VARS), axis=-1)
+
+    log_comp = TARGET_LOGITS[None, :] - 0.5 * (quad + log_det[None, :])
+    resp = jax.nn.softmax(log_comp, axis=-1)
+
+    comp_scores = -diff / TARGET_VARS[None, :, :]
+    return jnp.sum(resp[:, :, None] * comp_scores, axis=1)
+
+
+# -----------------------------
+# GMM-constrained diffusion family
+#
+# We parameterize a whole curve of GMM marginals:
+#
+#   q_t(x) = sum_k pi_k N(x; mu_k(t), diag(var_k(t)))
+#
+# with
+#
+#   mu_k(t) = t * mu_k(T)
+#   var_k(t) = (1-t) * prior_var + t * var_k(T)
+#
+# At t=0 all components are identical N(0, prior_var I),
+# so q_0 is exactly the prior, regardless of the mixture weights.
+#
+# For each latent component k, a linear Gaussian diffusion preserves
+# Gaussianity. After marginalizing k, the Markov drift is the posterior
+# responsibility-weighted sum of component drifts.
+# -----------------------------
+
+
+def positive_terminal_vars(raw_logvars: jnp.ndarray, var_floor: float) -> jnp.ndarray:
+    return var_floor + jnp.exp(jnp.clip(raw_logvars, -7.0, 4.0))
+
+
+def terminal_params_from_flax_params(params, var_floor: float):
+    """
+    Terminal GMM parameters are kept at the root of the Flax param tree so
+    sampling q_T stays simple even though the control uses submodule MLPs.
+    """
+    logits = params["logits"]
+    means_T = params["means_T"]
+    vars_T = positive_terminal_vars(params["raw_logvars_T"], var_floor)
+    return logits, means_T, vars_T
+
+
+def mlp_features(x: jnp.ndarray, t: jnp.ndarray) -> jnp.ndarray:
+    """Features for neural gates/components: [x1, x2, t, sin(pi t), cos(pi t)]."""
+    t_col = t[:, None]
+    return jnp.concatenate(
+        [x, t_col, jnp.sin(jnp.pi * t_col), jnp.cos(jnp.pi * t_col)], axis=-1
+    )
+
+
+class GateNet(nn.Module):
+    k: int
+    hidden: int = 128
+    depth: int = 3
+
+    @nn.compact
+    def __call__(self, features: jnp.ndarray) -> jnp.ndarray:
+        h = features
+        for _ in range(self.depth):
+            h = nn.Dense(self.hidden)(h)
+            h = nn.silu(h)
+        return nn.Dense(self.k)(h)
+
+
+class ComponentNet(nn.Module):
+    k: int
+    dim: int = 2
+    hidden: int = 128
+    depth: int = 3
+
+    @nn.compact
+    def __call__(self, features: jnp.ndarray) -> jnp.ndarray:
+        h = features
+        for _ in range(self.depth):
+            h = nn.Dense(self.hidden)(h)
+            h = nn.silu(h)
+        out = nn.Dense(self.k * self.dim)(h)
+        return out.reshape((features.shape[0], self.k, self.dim))
+
+
+def gmm_base_component_controls_from_raw(
+    means_T: jnp.ndarray,
+    raw_logvars_T: jnp.ndarray,
+    x: jnp.ndarray,
+    t: jnp.ndarray,
+    sigma: float,
+    var_floor: float,
+    prior_var: float,
+) -> jnp.ndarray:
+    """
+    Analytic per-component controls from the GMM path.
+
+    Returns component controls with shape (batch, K, dim). Each component is the
+    linear Gaussian drift needed to move N(0, prior_var I) to
+    N(mu_k(T), diag(var_k(T))) along the linear mean/variance path.
+    """
+    t = jnp.clip(t, 1.0e-4, 1.0 - 1.0e-4)
+    t3 = t[:, None, None]
+
+    vars_T = positive_terminal_vars(raw_logvars_T, var_floor)
+    vars_0 = prior_var * jnp.ones_like(vars_T)
+
+    mu_t = t3 * means_T[None, :, :]
+    dmu_dt = means_T[None, :, :]
+
+    var_t = (1.0 - t3) * vars_0[None, :, :] + t3 * vars_T[None, :, :]
+    dvar_dt = vars_T[None, :, :] - vars_0[None, :, :]
+
+    A_diag = 0.5 * (dvar_dt - sigma**2) / var_t
+    component_drift = dmu_dt + A_diag * (x[:, None, :] - mu_t)
+    return component_drift / sigma
+
+
+class NeuralMoEGMMPath(nn.Module):
+    """
+    Neural mixture-of-experts control with a terminal GMM sampler.
+
+    Terminal endpoint distribution used for x_T samples:
+        q_T(x) = sum_k softmax(logits)_k N(x; means_T[k], diag(vars_T[k])).
+
+    Control used in the BMS drift regression:
+        u_phi(x,t) = sum_k softmax(gate_net(x,t))_k
+                     [u_base,k(x,t; means_T, vars_T) + scale * component_net,k(x,t)].
+
+    This is more flexible than the exact GMM-preserving analytic drift. The
+    plotted endpoint remains the learned terminal GMM q_T.
+    """
+    k: int
+    dim: int = 2
+    var_floor: float = 1.0e-3
+    prior_var: float = 1.0
+    init_mean_scale: float = 12.0
+    init_terminal_std: float = 2.5
+    hidden: int = 128
+    depth: int = 3
+    component_residual_scale: float = 0.15
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, t: jnp.ndarray, sigma: float) -> jnp.ndarray:
+        # Broad, mode-agnostic terminal GMM initialization.
+        # This does not use target mode locations or plotting/domain limits.
+        logits = self.param("logits", nn.initializers.zeros, (self.k,))
+
+        def broad_mean_init(key, shape, dtype=jnp.float32):
+            return self.init_mean_scale * jax.random.normal(key, shape, dtype)
+
+        means_T = self.param("means_T", broad_mean_init, (self.k, self.dim))
+
+        def terminal_logvar_init(key, shape, dtype=jnp.float32):
+            del key
+            init_var_minus_floor = jnp.maximum(
+                jnp.asarray(self.init_terminal_std**2 - self.var_floor, dtype=dtype),
+                jnp.asarray(1.0e-6, dtype=dtype),
+            )
+            raw = jnp.log(init_var_minus_floor)
+            return jnp.full(shape, raw, dtype=dtype)
+
+        raw_logvars_T = self.param(
+            "raw_logvars_T",
+            terminal_logvar_init,
+            (self.k, self.dim),
+        )
+
+        features = mlp_features(x, t)
+        gate_logits = GateNet(self.k, self.hidden, self.depth, name="gate_net")(features)
+        gate_probs = jax.nn.softmax(gate_logits, axis=-1)
+
+        base_controls = gmm_base_component_controls_from_raw(
+            means_T=means_T,
+            raw_logvars_T=raw_logvars_T,
+            x=x,
+            t=t,
+            sigma=sigma,
+            var_floor=self.var_floor,
+            prior_var=self.prior_var,
+        )
+        residual_controls = ComponentNet(
+            self.k, self.dim, self.hidden, self.depth, name="component_net"
+        )(features)
+
+        component_controls = base_controls + self.component_residual_scale * residual_controls
+        return jnp.sum(gate_probs[:, :, None] * component_controls, axis=1)
+
+
+# -----------------------------
+# Sampling utilities
+# -----------------------------
+
+
+def sample_terminal_gmm(params, key, n: int, var_floor: float) -> jnp.ndarray:
+    logits, means_T, vars_T = terminal_params_from_flax_params(params, var_floor)
+
+    key_comp, key_noise = jax.random.split(key)
+    comp = jax.random.categorical(key_comp, logits, shape=(n,))
+    eps = jax.random.normal(key_noise, (n, means_T.shape[-1]))
+
+    return means_T[comp] + jnp.sqrt(vars_T[comp]) * eps
+
+
+def sample_brownian_bridge(
+    x0: jnp.ndarray,
+    xT: jnp.ndarray,
+    t: jnp.ndarray,
+    key,
+    sigma: float,
+) -> jnp.ndarray:
+    """
+    Brownian bridge marginal:
+      X_t | X_0, X_T ~ N((1-t)X_0 + t X_T, sigma^2 t(1-t) I)
+    with T=1.
+    """
+    tc = t[:, None]
+    mean = (1.0 - tc) * x0 + tc * xT
+    std = sigma * jnp.sqrt(tc * (1.0 - tc))
+    return mean + std * jax.random.normal(key, x0.shape)
+
+
+def bms_independent_coupling_target_control(
+    x0: jnp.ndarray,
+    xT: jnp.ndarray,
+    xt: jnp.ndarray,
+    t: jnp.ndarray,
+    sigma: float,
+    prior_var: float,
+) -> jnp.ndarray:
+    """
+    Independent-coupling BMS target with c(t)=gamma(t)=t, T=1,
+    reference dX = sigma dB.
+
+    Proposition 2.10:
+      sigma^{-1} xi =
+          grad_x0 log p_prior(x0)
+        + grad_xT log p_target(xT)
+        - grad_xt log P_{t|0}(xt | x0)
+
+    where
+      grad_xt log P_{t|0}(xt | x0) = -(xt-x0)/(sigma^2 t).
+    """
+    tc = t[:, None]
+
+    prior_score = -x0 / prior_var
+    terminal_score = target_score(xT)
+    grad_log_pt_given_0 = -(xt - x0) / (sigma**2 * tc)
+
+    return sigma * (prior_score + terminal_score - grad_log_pt_given_0)
+
+
+# -----------------------------
+# Jitted training step
+# -----------------------------
+
+
+@partial(jax.jit, static_argnames=("batch_size",))
+def train_step(
+    state: train_state.TrainState,
+    ref_params,
+    key,
+    batch_size: int,
+    sigma: float,
+    t_eps: float,
+    var_floor: float,
+    prior_var: float,
+    eta: float,
+    entropy_coef: float,
+    var_reg: float,
+):
+    key_x0, key_xT, key_t, key_bridge = jax.random.split(key, 4)
+
+    x0 = jnp.sqrt(prior_var) * jax.random.normal(key_x0, (batch_size, 2))
+
+    # BMS-style current endpoint samples. Detached from gradient by construction:
+    # xT is closed over inside loss_fn, not differentiated through.
+    xT = sample_terminal_gmm(state.params, key_xT, batch_size, var_floor)
+
+    t = jax.random.uniform(
+        key_t,
+        (batch_size,),
+        minval=t_eps,
+        maxval=1.0 - t_eps,
+    )
+
+    xt = sample_brownian_bridge(x0, xT, t, key_bridge, sigma)
+
+    xi = bms_independent_coupling_target_control(
+        x0=x0,
+        xT=xT,
+        xt=xt,
+        t=t,
+        sigma=sigma,
+        prior_var=prior_var,
+    )
+    xi = jax.lax.stop_gradient(xi)
+
+    u_ref = state.apply_fn({"params": ref_params}, xt, t, sigma)
+    u_ref = jax.lax.stop_gradient(u_ref)
+
+    def loss_fn(params):
+        u_pred = state.apply_fn({"params": params}, xt, t, sigma)
+
+        drift_mse = 0.5 * jnp.mean(jnp.sum((u_pred - xi)**2, axis=-1))
+        damping = 0.5 * eta * jnp.mean(jnp.sum((u_pred - u_ref)**2, axis=-1))
+
+        logits, means_T, vars_T = terminal_params_from_flax_params(params, var_floor)
+        pi = jax.nn.softmax(logits)
+
+        # Mild regularizers: no mode information, only numerical stabilization.
+        entropy_loss = entropy_coef * jnp.sum(pi * jnp.log(pi + 1.0e-8))
+        var_loss = var_reg * jnp.mean(jnp.log(vars_T)**2)
+
+        total = drift_mse + damping + entropy_loss + var_loss
+
+        metrics = {
+            "loss": total,
+            "drift_mse": drift_mse,
+            "damping": damping,
+            "entropy": -jnp.sum(pi * jnp.log(pi + 1.0e-8)),
+            "mean_norm": jnp.mean(jnp.linalg.norm(means_T, axis=-1)),
+            "avg_var": jnp.mean(vars_T),
+        }
+        return total, metrics
+
+    (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    state = state.apply_gradients(grads=grads)
+    return state, metrics
+
+
+# -----------------------------
+# Plotting
+# -----------------------------
+
+
+def save_outputs(state, init_params, key, args):
+    out_dir = Path.cwd() / "tmp"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    key_init_samples, key_final_samples = jax.random.split(key)
+
+    init_samples = np.asarray(
+        sample_terminal_gmm(init_params, key_init_samples, args.n_plot_samples, args.var_floor)
+    )
+    final_samples = np.asarray(
+        sample_terminal_gmm(state.params, key_final_samples, args.n_plot_samples, args.var_floor)
+    )
+
+    init_logits, init_means_T, init_vars_T = terminal_params_from_flax_params(init_params, args.var_floor)
+    init_pi = np.asarray(jax.nn.softmax(init_logits))
+    init_means_np = np.asarray(init_means_T)
+    init_vars_np = np.asarray(init_vars_T)
+
+    logits, means_T, vars_T = terminal_params_from_flax_params(state.params, args.var_floor)
+    pi = np.asarray(jax.nn.softmax(logits))
+    means_np = np.asarray(means_T)
+    vars_np = np.asarray(vars_T)
+
+    np.savez(
+        out_dir / "learned_gmm_params.npz",
+        weights=pi,
+        means=means_np,
+        diag_vars=vars_np,
+        init_weights=init_pi,
+        init_means=init_means_np,
+        init_diag_vars=init_vars_np,
+    )
+
+    lim = args.plot_lim
+    grid_n = args.grid_n
+    xs = np.linspace(-lim, lim, grid_n)
+    ys = np.linspace(-lim, lim, grid_n)
+    xx, yy = np.meshgrid(xs, ys)
+    pts = jnp.asarray(np.stack([xx.ravel(), yy.ravel()], axis=-1))
+
+    log_rho = np.asarray(target_log_rho(pts)).reshape(grid_n, grid_n)
+    dens = np.exp(log_rho - np.max(log_rho))
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
+
+    axes[0].imshow(
+        dens,
+        extent=[-lim, lim, -lim, lim],
+        origin="lower",
+        aspect="equal",
+    )
+    axes[0].set_title("Target Boltzmann density $\\rho(x)=e^{-U(x)}$")
+    axes[0].set_xlabel("$x_1$")
+    axes[0].set_ylabel("$x_2$")
+
+    axes[1].scatter(init_samples[:, 0], init_samples[:, 1], s=2, alpha=0.25)
+    axes[1].scatter(init_means_np[:, 0], init_means_np[:, 1], s=80, marker="x")
+    axes[1].set_xlim(-lim, lim)
+    axes[1].set_ylim(-lim, lim)
+    axes[1].set_aspect("equal")
+    axes[1].set_title("Initial terminal GMM $q_T$ before training")
+    axes[1].set_xlabel("$x_1$")
+    axes[1].set_ylabel("$x_2$")
+
+    axes[2].scatter(final_samples[:, 0], final_samples[:, 1], s=2, alpha=0.25)
+    axes[2].scatter(means_np[:, 0], means_np[:, 1], s=80, marker="x")
+    axes[2].set_xlim(-lim, lim)
+    axes[2].set_ylim(-lim, lim)
+    axes[2].set_aspect("equal")
+    axes[2].set_title("Learned terminal GMM $q_T$ after training")
+    axes[2].set_xlabel("$x_1$")
+    axes[2].set_ylabel("$x_2$")
+
+    fig.savefig(out_dir / "target_vs_mixture_samples.png", dpi=200)
+    plt.close(fig)
+
+    print(f"\nSaved image to: {out_dir / 'target_vs_mixture_samples.png'}")
+    print(f"Saved GMM params to: {out_dir / 'learned_gmm_params.npz'}")
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--k", type=int, default=32)
+    parser.add_argument("--steps", type=int, default=20000)
+    parser.add_argument("--batch_size", type=int, default=4096)
+    parser.add_argument("--lr", type=float, default=1.0e-3)
+
+    parser.add_argument("--sigma", type=float, default=1.0)
+    parser.add_argument("--prior_var", type=float, default=1.0)
+    parser.add_argument("--t_eps", type=float, default=2.0e-2)
+
+    parser.add_argument("--eta", type=float, default=0.10)
+    parser.add_argument("--outer_every", type=int, default=250)
+
+    parser.add_argument("--var_floor", type=float, default=1.0e-3)
+    parser.add_argument("--entropy_coef", type=float, default=1.0e-3)
+    parser.add_argument("--var_reg", type=float, default=1.0e-4)
+
+    # Broad but mode-agnostic terminal GMM initialization.
+    # The terminal means are sampled from N(0, init_mean_scale^2 I).
+    # No target mode locations or plotting/domain limits are used.
+    parser.add_argument("--init_mean_scale", type=float, default=12.0)
+    parser.add_argument("--init_terminal_std", type=float, default=2.5)
+    parser.add_argument("--hidden", type=int, default=128)
+    parser.add_argument("--depth", type=int, default=3)
+    parser.add_argument("--component_residual_scale", type=float, default=0.15)
+
+    parser.add_argument("--log_every", type=int, default=250)
+
+    parser.add_argument("--plot_lim", type=float, default=18.5)
+    parser.add_argument("--grid_n", type=int, default=350)
+    parser.add_argument("--n_plot_samples", type=int, default=30000)
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    out_dir = Path.cwd() / "tmp"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    key = jax.random.PRNGKey(args.seed)
+    key_init, key_train, key_plot = jax.random.split(key, 3)
+
+    model = NeuralMoEGMMPath(
+        k=args.k,
+        dim=2,
+        var_floor=args.var_floor,
+        prior_var=args.prior_var,
+        init_mean_scale=args.init_mean_scale,
+        init_terminal_std=args.init_terminal_std,
+        hidden=args.hidden,
+        depth=args.depth,
+        component_residual_scale=args.component_residual_scale,
+    )
+
+    dummy_x = jnp.zeros((4, 2), dtype=jnp.float32)
+    dummy_t = jnp.ones((4,), dtype=jnp.float32) * 0.5
+
+    variables = model.init(key_init, dummy_x, dummy_t, args.sigma)
+
+    tx = optax.chain(
+        optax.clip_by_global_norm(10.0),
+        optax.adamw(args.lr, weight_decay=1.0e-5),
+    )
+
+    state = train_state.TrainState.create(
+        apply_fn=model.apply,
+        params=variables["params"],
+        tx=tx,
+    )
+
+    # Keep the post-initialization, pre-training GMM for plotting.
+    init_params = jax.tree_util.tree_map(lambda z: z.copy(), state.params)
+
+    ref_params = state.params
+
+    print("Starting neural MoE GMM-constrained BMS-style training.")
+    print(f"JAX devices: {jax.devices()}")
+    print(f"Output directory: {out_dir}")
+
+    for step in range(1, args.steps + 1):
+        key_train, subkey = jax.random.split(key_train)
+
+        if (step - 1) % args.outer_every == 0:
+            ref_params = jax.tree_util.tree_map(lambda z: z, state.params)
+
+        state, metrics = train_step(
+            state=state,
+            ref_params=ref_params,
+            key=subkey,
+            batch_size=args.batch_size,
+            sigma=args.sigma,
+            t_eps=args.t_eps,
+            var_floor=args.var_floor,
+            prior_var=args.prior_var,
+            eta=args.eta,
+            entropy_coef=args.entropy_coef,
+            var_reg=args.var_reg,
+        )
+
+        if step == 1 or step % args.log_every == 0:
+            m = jax.device_get(metrics)
+            print(f"step {step:6d} | "
+                  f"loss {float(m['loss']):10.4f} | "
+                  f"mse {float(m['drift_mse']):10.4f} | "
+                  f"damp {float(m['damping']):9.4f} | "
+                  f"H(pi) {float(m['entropy']):7.3f} | "
+                  f"|mu| {float(m['mean_norm']):7.3f} | "
+                  f"avg_var {float(m['avg_var']):7.3f}")
+
+    save_outputs(state, init_params, key_plot, args)
+
+
+if __name__ == "__main__":
+    main()
