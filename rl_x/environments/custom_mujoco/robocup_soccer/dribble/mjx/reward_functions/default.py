@@ -311,7 +311,9 @@ class DefaultReward:
         info[f"reward/feet_yaw"] = feet_yaw_reward
         info[f"reward/total"] = reward
         info[f"env_info/xy_vel_diff_abs"] = jnp.nan_to_num(jnp.mean(jnp.minimum(jnp.abs(ball_velocity_difference), 2*internal_state["max_command_velocity"])), nan=2*internal_state["max_command_velocity"], posinf=2*internal_state["max_command_velocity"], neginf=2*internal_state["max_command_velocity"])
-        info[f"env_info/ball_distance"] = jnp.sqrt(ball_distance_squared)
+        ball_distance = jnp.sqrt(ball_distance_squared)
+        info[f"env_info/ball_distance"] = ball_distance
+        info[f"env_info/ball_too_far"] = (self.env.ball_termination_distance > 0.0) & (ball_distance > self.env.ball_termination_distance)
         info[f"env_info/ball_velocity_diff_abs"] = info[f"env_info/xy_vel_diff_abs"]
         info[f"env_info/yaw_to_command_abs"] = jnp.abs(yaw_to_command_error)
         info[f"env_info/yaw_to_ball_abs"] = jnp.abs(yaw_to_ball_error)
