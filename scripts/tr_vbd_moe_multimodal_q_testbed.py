@@ -28,8 +28,7 @@ from rl_x.algorithms.tr_vbd_moe.flax_full_jit.policy import atanh
 from rl_x.algorithms.tr_vbd_moe.flax_full_jit.policy import normal_diag_log_prob
 from rl_x.algorithms.tr_vbd_moe.flax_full_jit.policy import tanh_log_det_from_raw
 from rl_x.algorithms.tr_vbd_moe.flax_full_jit.tr_vbd_moe import (
-    compute_tr_vbd_moe_actor_loss,
-)
+    compute_tr_vbd_moe_actor_loss,)
 
 LOG_2_PI = np.log(2.0 * np.pi)
 
@@ -57,12 +56,8 @@ class TestbedConfig:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Fit the TR-VBD-MoE actor to a fixed 2D multimodal Boltzmann "
-            "distribution induced by an analytic Q function."
-        )
-    )
+    parser = argparse.ArgumentParser(description=("Fit the TR-VBD-MoE actor to a fixed 2D multimodal Boltzmann "
+                                                  "distribution induced by an analytic Q function."))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--updates", type=int, default=2500)
     parser.add_argument("--batch-size", type=int, default=512)
@@ -86,10 +81,8 @@ def parse_args() -> argparse.Namespace:
         "--update-entropy-lagrangian",
         default=False,
         action=argparse.BooleanOptionalAction,
-        help=(
-            "Adapt temperature. Disabled by default so the visual target remains "
-            "a fixed Boltzmann distribution."
-        ),
+        help=("Adapt temperature. Disabled by default so the visual target remains "
+              "a fixed Boltzmann distribution."),
     )
     parser.add_argument("--min-log-responsibility", type=float, default=-20.0)
     parser.add_argument("--resolution", type=int, default=180)
@@ -138,6 +131,8 @@ def make_policy(config: TestbedConfig) -> TRVBDMoEPolicy:
         kl_start=config.kl_start,
         use_norm=False,
         use_skip=False,
+        gate_probability_floor=0.01,
+        expert_mean_init_scale=0.0,
     )
 
 
@@ -168,7 +163,8 @@ def default_modes() -> tuple[jax.Array, jax.Array, jax.Array]:
 def multimodal_q(actions: jax.Array, centers: jax.Array, stds: jax.Array, log_weights: jax.Array, temperature: float):
     diff = (actions[..., None, :] - centers) / stds
     normal_log_probs = -0.5 * jnp.sum(jnp.square(diff), axis=-1)
-    normal_log_probs = normal_log_probs - jnp.sum(jnp.log(stds), axis=-1) - actions.shape[-1] * 0.5 * jnp.log(2.0 * jnp.pi)
+    normal_log_probs = normal_log_probs - jnp.sum(jnp.log(stds),
+                                                  axis=-1) - actions.shape[-1] * 0.5 * jnp.log(2.0 * jnp.pi)
     log_density = jax.nn.logsumexp(log_weights + normal_log_probs, axis=-1)
     return temperature * log_density
 
@@ -208,9 +204,7 @@ def make_train_step(policy: TRVBDMoEPolicy, config: TestbedConfig, centers, stds
         lagrangian = policy.lagrangian(params)
         temperature_scale = jnp.maximum(jax.lax.stop_gradient(temperature), 1e-6)
         expert_bound_terms = jnp.mean(
-            sample_info["expert_action_log_probs"]
-            - old_log_responsibilities
-            - q_values / temperature_scale,
+            sample_info["expert_action_log_probs"] - old_log_responsibilities - q_values / temperature_scale,
             axis=-1,
         )
         gate_targets = jax.lax.stop_gradient(jax.nn.softmax(-expert_bound_terms, axis=-1))
@@ -223,8 +217,7 @@ def make_train_step(policy: TRVBDMoEPolicy, config: TestbedConfig, centers, stds
             jnp.sum(
                 sample_info["gate_probs"] * jnp.mean(-sample_info["mixture_log_probs"], axis=-1),
                 axis=-1,
-            )
-        )
+            ))
         loss, actor_metrics = compute_tr_vbd_moe_actor_loss(
             vbd_bound,
             joint_kl,
@@ -290,25 +283,23 @@ def train(policy: TRVBDMoEPolicy, config: TestbedConfig):
         state, metrics = train_step(state, target_params, step_key)
         if update == 0 or (update + 1) % max(config.updates // 200, 1) == 0 or update + 1 == config.updates:
             host_metrics = jax.tree.map(lambda x: np.asarray(x), metrics)
-            history.append(
-                {
-                    "update": update + 1,
-                    "loss": float(host_metrics["loss"]),
-                    "vbd_bound": float(host_metrics["vbd_bound"]),
-                    "expert_loss": float(host_metrics["expert_loss"]),
-                    "gate_loss": float(host_metrics["gate_loss"]),
-                    "joint_kl": float(host_metrics["joint_kl"]),
-                    "entropy": float(host_metrics["entropy"]),
-                    "temperature": float(host_metrics["temperature"]),
-                    "lagrangian": float(host_metrics["lagrangian"]),
-                    "mean_q": float(host_metrics["mean_q"]),
-                    "grad_norm": float(host_metrics["grad_norm"]),
-                    "gate_probs": host_metrics["gate_probs"].tolist(),
-                    "gate_targets": host_metrics["gate_targets"].tolist(),
-                    "gate_target_l1_error": float(host_metrics["gate_target_l1_error"]),
-                    "expert_mode_counts": host_metrics["expert_mode_counts"].tolist(),
-                }
-            )
+            history.append({
+                "update": update + 1,
+                "loss": float(host_metrics["loss"]),
+                "vbd_bound": float(host_metrics["vbd_bound"]),
+                "expert_loss": float(host_metrics["expert_loss"]),
+                "gate_loss": float(host_metrics["gate_loss"]),
+                "joint_kl": float(host_metrics["joint_kl"]),
+                "entropy": float(host_metrics["entropy"]),
+                "temperature": float(host_metrics["temperature"]),
+                "lagrangian": float(host_metrics["lagrangian"]),
+                "mean_q": float(host_metrics["mean_q"]),
+                "grad_norm": float(host_metrics["grad_norm"]),
+                "gate_probs": host_metrics["gate_probs"].tolist(),
+                "gate_targets": host_metrics["gate_targets"].tolist(),
+                "gate_target_l1_error": float(host_metrics["gate_target_l1_error"]),
+                "expert_mode_counts": host_metrics["expert_mode_counts"].tolist(),
+            })
     return state, history, initial_params, centers, stds, log_weights
 
 
@@ -331,15 +322,13 @@ def normalized_density_from_log(log_density: np.ndarray, cell_area: float) -> tu
 
 def evaluate_densities(policy, params, config, centers, stds, log_weights):
     xs, ys, xx, yy, grid_actions, cell_area = make_action_grid(config.resolution)
-    q_values = np.asarray(
-        multimodal_q(
-            jnp.asarray(grid_actions),
-            centers,
-            stds,
-            log_weights,
-            config.temperature,
-        )
-    )
+    q_values = np.asarray(multimodal_q(
+        jnp.asarray(grid_actions),
+        centers,
+        stds,
+        log_weights,
+        config.temperature,
+    ))
     target_density, target_mass = normalized_density_from_log(q_values / config.temperature, cell_area)
 
     observations = jnp.ones((grid_actions.shape[0], 1), dtype=jnp.float32)
@@ -349,8 +338,7 @@ def evaluate_densities(policy, params, config, centers, stds, log_weights):
             observations,
             jnp.asarray(grid_actions),
             1.0,
-        )
-    )
+        ))
     policy_density, policy_mass = normalized_density_from_log(policy_log_prob, cell_area)
 
     target_prob = np.maximum(target_mass, 1e-12)
@@ -361,7 +349,7 @@ def evaluate_densities(policy, params, config, centers, stds, log_weights):
     kl_policy_target = float(np.sum(policy_prob * (np.log(policy_prob) - np.log(target_prob))))
 
     center_np = np.asarray(centers)
-    nearest_mode = np.argmin(np.sum((grid_actions[:, None, :] - center_np[None, :, :]) ** 2, axis=-1), axis=-1)
+    nearest_mode = np.argmin(np.sum((grid_actions[:, None, :] - center_np[None, :, :])**2, axis=-1), axis=-1)
     target_mode_mass = np.asarray([np.sum(target_prob[nearest_mode == idx]) for idx in range(center_np.shape[0])])
     policy_mode_mass = np.asarray([np.sum(policy_prob[nearest_mode == idx]) for idx in range(center_np.shape[0])])
 
@@ -591,11 +579,9 @@ def plot_results(
         ax.set_xlabel("a0")
         ax.set_ylabel("a1")
 
-    fig.suptitle(
-        f"TR-VBD-MoE fixed-Q testbed, KL(target||init)={init_density_data['kl_target_policy']:.4f}, "
-        f"KL(target||policy)={density_data['kl_target_policy']:.4f}, "
-        f"KL(policy||target)={density_data['kl_policy_target']:.4f}"
-    )
+    fig.suptitle(f"TR-VBD-MoE fixed-Q testbed, KL(target||init)={init_density_data['kl_target_policy']:.4f}, "
+                 f"KL(target||policy)={density_data['kl_target_policy']:.4f}, "
+                 f"KL(policy||target)={density_data['kl_policy_target']:.4f}")
     fig.savefig(output_path, dpi=180)
     if show:
         plt.show()
@@ -616,7 +602,7 @@ def plot_expert_allocation(
     centers_np = np.asarray(centers)
     samples, expert_ids = sample_policy_actions(policy, state.params, config)
     colors = plt.get_cmap("tab10")(np.arange(max(config.nr_experts, 1)) % 10)
-    expert_cmap = ListedColormap(colors[: config.nr_experts])
+    expert_cmap = ListedColormap(colors[:config.nr_experts])
     expert_norm = BoundaryNorm(np.arange(config.nr_experts + 1) - 0.5, config.nr_experts)
     extent = [-0.999, 0.999, -0.999, 0.999]
     nr_panels = 3 + config.nr_experts
@@ -715,20 +701,18 @@ def plot_expert_allocation(
             zorder=6,
         )
         dominant_mode = int(np.argmax(expert_data["expert_conditional_mode_mass"][expert_id]))
-        ax.set_title(
-            f"Expert e{expert_id} density: gate={expert_data['gate_probs'][expert_id]:.2f}, "
-            f"dominant=m{dominant_mode}"
-        )
+        ax.set_title(f"Expert e{expert_id} density: gate={expert_data['gate_probs'][expert_id]:.2f}, "
+                     f"dominant=m{dominant_mode}")
         fig.colorbar(expert_im, ax=ax, fraction=0.046)
 
-    for panel_id, ax in enumerate(axes[: 3 + config.nr_experts]):
+    for panel_id, ax in enumerate(axes[:3 + config.nr_experts]):
         if panel_id == 2:
             continue
         ax.set_xlim(-1.0, 1.0)
         ax.set_ylim(-1.0, 1.0)
         ax.set_xlabel("a0")
         ax.set_ylabel("a1")
-    for ax in axes[3 + config.nr_experts :]:
+    for ax in axes[3 + config.nr_experts:]:
         ax.axis("off")
 
     fig.suptitle("Expert allocation over Boltzmann modes")

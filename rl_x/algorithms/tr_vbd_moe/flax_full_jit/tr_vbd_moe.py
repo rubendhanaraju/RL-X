@@ -21,7 +21,7 @@ except ModuleNotFoundError:
 from .critic import get_critic
 from .general_properties import GeneralProperties
 from .policy import get_policy
-from .utils import hl_gauss, tree_norm
+from .utils import get_action_scale, hl_gauss, tree_norm
 
 rlx_logger = logging.getLogger("rl_x")
 
@@ -153,6 +153,10 @@ class TRVBDMoE:
         self.kl_bound = config.algorithm.kl_bound
         self.reduce_kl = config.algorithm.reduce_kl
         self.update_kl_lagrangian = config.algorithm.update_kl_lagrangian
+        self.use_actor_line_search = getattr(config.algorithm, "use_actor_line_search", True)
+        self.line_search_max_steps = getattr(config.algorithm, "line_search_max_steps", 8)
+        self.line_search_backtrack_coeff = getattr(config.algorithm, "line_search_backtrack_coeff", 0.5)
+        self.line_search_kl_tolerance = getattr(config.algorithm, "line_search_kl_tolerance", 1.0)
 
         self.ent_target_mult = config.algorithm.ent_target_mult
         self.update_entropy_lagrangian = config.algorithm.update_entropy_lagrangian
@@ -160,6 +164,7 @@ class TRVBDMoE:
 
         self.action_clipping = config.algorithm.action_clipping
         self.action_clip_value = config.algorithm.action_clip_value
+        self.action_scale = get_action_scale(config, train_env)
 
         self.enable_observation_normalization = config.algorithm.enable_observation_normalization
         self.normalizer_epsilon = config.algorithm.normalizer_epsilon
@@ -181,7 +186,12 @@ class TRVBDMoE:
         self.os_shape = self.train_env.single_observation_space.shape
         self.as_shape = self.train_env.single_action_space.shape
         self.horizon = self.train_env.horizon
-        self.action_size_target = jnp.prod(jnp.asarray(self.as_shape)) * self.ent_target_mult
+        # Target entropy for bounded tanh policies.  For support [-scale, scale],
+        # the uniform upper bound is sum(log(2 * scale)).  Cap the configured
+        # target to avoid impossible entropy targets.
+        raw_entropy_target = jnp.prod(jnp.asarray(self.as_shape)) * self.ent_target_mult
+        max_action_entropy = jnp.sum(jnp.log(2.0 * jnp.maximum(self.action_scale, 1e-8)))
+        self.action_size_target = jnp.minimum(raw_entropy_target, 0.95 * max_action_entropy)
         self.policy_observation_indices = getattr(self.train_env, "policy_observation_indices",
                                                   jnp.arange(self.os_shape[0]))
         self.critic_observation_indices = getattr(self.train_env, "critic_observation_indices",
@@ -247,6 +257,14 @@ class TRVBDMoE:
             raise ValueError("TR-VBD-MoE expects at least two experts.")
         if self.config.algorithm.nr_actor_samples_per_expert < 1:
             raise ValueError("algorithm.nr_actor_samples_per_expert must be at least 1.")
+        if getattr(self.config.algorithm, "use_actor_line_search", True):
+            if getattr(self.config.algorithm, "line_search_max_steps", 8) < 1:
+                raise ValueError("algorithm.line_search_max_steps must be at least 1.")
+            backtrack_coeff = getattr(self.config.algorithm, "line_search_backtrack_coeff", 0.5)
+            if not (0.0 < backtrack_coeff < 1.0):
+                raise ValueError("algorithm.line_search_backtrack_coeff must be in (0, 1).")
+            if getattr(self.config.algorithm, "line_search_kl_tolerance", 1.0) <= 0.0:
+                raise ValueError("algorithm.line_search_kl_tolerance must be positive.")
 
     def build_policy_and_critic(self):
         return get_policy(self.config, self.train_env), get_critic(self.config, self.train_env)
@@ -281,7 +299,8 @@ class TRVBDMoE:
 
     def clip_action(self, action):
         if self.action_clipping:
-            return jnp.clip(action, -self.action_clip_value, self.action_clip_value)
+            clip_value = self.action_clip_value * self.action_scale
+            return jnp.clip(action, -clip_value, clip_value)
         return action
 
     def initialize_observation_normalizer(self, observation):
@@ -689,15 +708,24 @@ class TRVBDMoE:
                         gate_probs = sample_info["gate_probs"]
                         gate_log_probs = sample_info["gate_log_probs"]
                         temperature_scale = jnp.maximum(jax.lax.stop_gradient(temperature), 1e-6)
+                        # Version-A free-energy costs U_z(s).  The old posterior
+                        # responsibility is frozen, but gradients still flow through
+                        # the sampled expert actions and Q(s, a) into the expert heads.
                         expert_bound_terms = jnp.mean(
                             sample_info["expert_action_log_probs"]
                             - old_log_responsibilities
                             - values / temperature_scale,
                             axis=-1,
                         )
+
+                        # Exact Version-A upper-bound objective:
+                        #   alpha * E_s sum_z g(z|s) [log g(z|s) + U_z(s)].
+                        # The softmax(-U) target is only diagnostic; using CE to this
+                        # target is a projected-gate variant, not exact Version A.
                         gate_targets = jax.lax.stop_gradient(jax.nn.softmax(-expert_bound_terms, axis=-1))
-                        expert_loss = jnp.mean(jnp.sum(gate_targets * expert_bound_terms, axis=-1))
-                        gate_loss = -jnp.mean(jnp.sum(gate_targets * gate_log_probs, axis=-1))
+                        expert_loss = jnp.mean(jnp.sum(gate_probs * expert_bound_terms, axis=-1))
+                        gate_loss = jnp.mean(jnp.sum(gate_probs * gate_log_probs, axis=-1))
+                        gate_ce_loss = -jnp.mean(jnp.sum(gate_targets * gate_log_probs, axis=-1))
                         vbd_bound = temperature_scale * (expert_loss + gate_loss)
 
                         gate_kl, expert_kl, joint_kl = self.policy.joint_kl_components(
@@ -731,7 +759,8 @@ class TRVBDMoE:
                             "loss/actor_total_loss": loss,
                             "loss/tr_vbd_bound": actor_loss_metrics["vbd_bound"],
                             "loss/tr_vbd_expert_loss": expert_loss,
-                            "loss/tr_vbd_gate_ce_loss": gate_loss,
+                            "loss/tr_vbd_gate_entropy_term": gate_loss,
+                            "loss/tr_vbd_gate_ce_loss": gate_ce_loss,
                             "loss/trust_region_loss": actor_loss_metrics["trust_region_loss"],
                             "loss/entropy_lagrangian_loss": actor_loss_metrics["entropy_lagrangian_loss"],
                             "loss/kl_lagrangian_loss": actor_loss_metrics["kl_lagrangian_loss"],
@@ -791,8 +820,116 @@ class TRVBDMoE:
                             actor_minibatch,
                             actor_key,
                         )
-                        actor_state = actor_state.apply_gradients(grads=actor_grads)
+
+                        actor_metrics["policy/kl_pre_update"] = actor_metrics["policy/kl"]
                         actor_metrics["gradients/actor_grad_norm"] = tree_norm(actor_grads)
+
+                        if self.use_actor_line_search:
+                            # Propose the optimizer step once, then backtrack only the
+                            # parameter displacement until the latent joint MoE KL against
+                            # the frozen behavior policy is inside the trust region.
+                            updates, proposed_opt_state = actor_state.tx.update(
+                                actor_grads,
+                                actor_state.opt_state,
+                                actor_state.params,
+                            )
+
+                            proposed_params = optax.apply_updates(actor_state.params, updates)
+
+                            def scaled_params(scale):
+                                # Line-search the *total* displacement from the frozen
+                                # behavior policy, not just the last minibatch update.
+                                # This makes scale=0 exactly feasible: params = target_old.
+                                return jax.tree_util.tree_map(
+                                    lambda old, proposed: old + scale * (proposed - old),
+                                    target_actor_state.params,
+                                    proposed_params,
+                                )
+
+                            candidate_scales = self.line_search_backtrack_coeff ** jnp.arange(
+                                self.line_search_max_steps,
+                                dtype=jnp.float32,
+                            )
+                            # Explicit zero-step fallback guarantees feasibility because
+                            # scaled_params(0) is exactly the frozen behavior policy and
+                            # KL(old || old) = 0.  This implements hard rejection if all
+                            # positive backtracking steps violate the trust region.
+                            candidate_scales = jnp.concatenate([candidate_scales, jnp.zeros((1,), dtype=jnp.float32)])
+                            acceptance_bound = self.kl_bound * self.line_search_kl_tolerance
+
+                            def candidate_joint_kl(scale):
+                                candidate_params = scaled_params(scale)
+                                _, _, candidate_kl = self.policy.joint_kl_components(
+                                    candidate_params,
+                                    target_actor_state.params,
+                                    actor_minibatch[0],
+                                )
+                                return jnp.mean(candidate_kl)
+
+                            candidate_kls = jax.vmap(candidate_joint_kl)(candidate_scales)
+                            valid_candidates = jnp.isfinite(candidate_kls) & (candidate_kls <= acceptance_bound)
+                            # The zero-step candidate should be valid.  If numerical issues
+                            # make every candidate invalid, force hard rejection.
+                            any_valid = jnp.any(valid_candidates)
+                            first_valid_idx = jnp.argmax(valid_candidates.astype(jnp.int32))
+                            fallback_idx = candidate_scales.shape[0] - 1
+                            accepted_idx = jnp.where(any_valid, first_valid_idx, fallback_idx)
+                            accepted_scale = candidate_scales[accepted_idx]
+                            accepted_params = scaled_params(accepted_scale)
+                            accepted_positive_step = accepted_scale > 0.0
+
+                            accepted_opt_state = jax.tree_util.tree_map(
+                                lambda new, old: jnp.where(accepted_positive_step, new, old),
+                                proposed_opt_state,
+                                actor_state.opt_state,
+                            )
+                            actor_state = actor_state.replace(
+                                step=actor_state.step + accepted_positive_step.astype(actor_state.step.dtype),
+                                params=accepted_params,
+                                opt_state=accepted_opt_state,
+                            )
+
+                            accepted_gate_kl, accepted_expert_kl, accepted_joint_kl = self.policy.joint_kl_components(
+                                actor_state.params,
+                                target_actor_state.params,
+                                actor_minibatch[0],
+                            )
+                            accepted_gate_kl = jnp.mean(accepted_gate_kl)
+                            accepted_expert_kl = jnp.mean(accepted_expert_kl)
+                            accepted_joint_kl = jnp.mean(accepted_joint_kl)
+                            full_update_kl = candidate_kls[0]
+
+                            actor_metrics["policy/kl"] = accepted_joint_kl
+                            actor_metrics["policy/kl_accepted"] = accepted_joint_kl
+                            actor_metrics["policy/gate_kl"] = accepted_gate_kl
+                            actor_metrics["policy/expert_kl"] = accepted_expert_kl
+                            actor_metrics["policy/kl_full_update"] = full_update_kl
+                            actor_metrics["policy/kl_violation_full_update"] = jnp.maximum(full_update_kl - self.kl_bound, 0.0)
+                            actor_metrics["policy/kl_violation_accepted"] = jnp.maximum(accepted_joint_kl - self.kl_bound, 0.0)
+                            actor_metrics["policy/kl_acceptance_bound"] = acceptance_bound
+                            actor_metrics["policy/line_search_scale"] = accepted_scale
+                            actor_metrics["policy/line_search_accepted"] = accepted_positive_step.astype(jnp.float32)
+                            actor_metrics["policy/line_search_rejected_full_step"] = (accepted_scale < 1.0).astype(jnp.float32)
+                            actor_metrics["policy/line_search_backtracks"] = accepted_idx.astype(jnp.float32)
+                        else:
+                            actor_state = actor_state.apply_gradients(grads=actor_grads)
+                            accepted_gate_kl, accepted_expert_kl, accepted_joint_kl = self.policy.joint_kl_components(
+                                actor_state.params,
+                                target_actor_state.params,
+                                actor_minibatch[0],
+                            )
+                            actor_metrics["policy/kl"] = jnp.mean(accepted_joint_kl)
+                            actor_metrics["policy/kl_accepted"] = jnp.mean(accepted_joint_kl)
+                            actor_metrics["policy/gate_kl"] = jnp.mean(accepted_gate_kl)
+                            actor_metrics["policy/expert_kl"] = jnp.mean(accepted_expert_kl)
+                            actor_metrics["policy/kl_full_update"] = jnp.mean(accepted_joint_kl)
+                            actor_metrics["policy/kl_violation_full_update"] = jnp.maximum(jnp.mean(accepted_joint_kl) - self.kl_bound, 0.0)
+                            actor_metrics["policy/kl_violation_accepted"] = actor_metrics["policy/kl_violation_full_update"]
+                            actor_metrics["policy/kl_acceptance_bound"] = jnp.asarray(self.kl_bound * self.line_search_kl_tolerance, dtype=jnp.float32)
+                            actor_metrics["policy/line_search_scale"] = jnp.ones((), dtype=jnp.float32)
+                            actor_metrics["policy/line_search_accepted"] = jnp.ones((), dtype=jnp.float32)
+                            actor_metrics["policy/line_search_rejected_full_step"] = jnp.zeros((), dtype=jnp.float32)
+                            actor_metrics["policy/line_search_backtracks"] = jnp.zeros((), dtype=jnp.float32)
 
                         metrics = {**critic_metrics, **actor_metrics}
                         return (actor_state, target_actor_state, critic_state, key), metrics

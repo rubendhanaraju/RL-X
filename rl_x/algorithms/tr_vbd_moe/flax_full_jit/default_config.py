@@ -39,9 +39,11 @@ def get_config(algorithm_name):
     config.use_simplical_embedding = False
     config.use_critic_skip = False
 
-    config.nr_experts = 4
-    config.nr_actor_samples_per_expert = 1
+    config.nr_experts = 5
+    config.nr_actor_samples_per_expert = 2
     config.min_log_responsibility = -20.0
+    config.gate_probability_floor = 1e-4
+    config.expert_mean_init_scale = 0.05
     config.use_actor_norm = True
     config.nr_actor_layers = 3
     config.actor_min_std = 0.0
@@ -49,16 +51,26 @@ def get_config(algorithm_name):
     config.log_std_max = 2.0
     config.use_actor_skip = False
     config.use_env_action_scale = True
-    config.action_clipping = True
+    config.action_clipping = False
     config.action_clip_value = 0.999
 
     config.kl_start = 0.01
-    config.kl_bound = 0.1
+    config.kl_bound = 0.05
     config.reduce_kl = True
     config.update_kl_lagrangian = True
 
+    # Enforce the latent joint MoE KL with a backtracking line search after
+    # each actor minibatch update.  The optimizer proposes an Adam step; the
+    # accepted policy parameters are behavior_params + scale *
+    # (proposed_params - behavior_params), where scale is the first value in
+    # {1, c, c^2, ...} satisfying the KL bound.
+    config.use_actor_line_search = True
+    config.line_search_max_steps = 8
+    config.line_search_backtrack_coeff = 0.5
+    config.line_search_kl_tolerance = 1.0
+
     config.ent_start = 0.01
-    config.ent_target_mult = 3.0
+    config.ent_target_mult = 0.5
     config.update_entropy_lagrangian = True
     config.aux_loss_mult = 1.0
 

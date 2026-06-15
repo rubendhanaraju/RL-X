@@ -33,6 +33,8 @@ def get_policy(config, env):
             min_std=config.algorithm.actor_min_std,
             ent_start=config.algorithm.ent_start,
             kl_start=config.algorithm.kl_start,
+            gate_probability_floor=getattr(config.algorithm, "gate_probability_floor", 0.0),
+            expert_mean_init_scale=getattr(config.algorithm, "expert_mean_init_scale", 0.0),
             use_norm=config.algorithm.use_actor_norm,
             use_skip=config.algorithm.use_actor_skip,
         )
@@ -93,6 +95,31 @@ class ExpertNetwork(nn.Module):
         return mean, log_std
 
 
+class GateNetwork(nn.Module):
+    nr_experts: int
+    hidden_dim: int
+    layers: int
+    use_norm: bool
+    use_skip: bool
+
+    @nn.compact
+    def __call__(self, observation):
+        # Initialize final gate logits at exactly zero so the initial gate is uniform.
+        features = MLP(
+            out_features=self.hidden_dim,
+            hidden_dim=self.hidden_dim,
+            layers=max(self.layers - 1, 1),
+            activation="swish",
+            use_norm=self.use_norm,
+            use_skip=self.use_skip,
+        )(observation)
+        return nn.Dense(
+            self.nr_experts,
+            kernel_init=nn.initializers.zeros,
+            bias_init=nn.initializers.zeros,
+        )(features)
+
+
 class TRVBDMoEPolicy(nn.Module):
     action_dim: int
     action_scale: jnp.ndarray
@@ -105,6 +132,8 @@ class TRVBDMoEPolicy(nn.Module):
     min_std: float
     ent_start: float
     kl_start: float
+    gate_probability_floor: float
+    expert_mean_init_scale: float
     use_norm: bool
     use_skip: bool
 
@@ -114,14 +143,19 @@ class TRVBDMoEPolicy(nn.Module):
         self.param("log_lagrangian", lambda key, shape: jnp.ones(shape, dtype=jnp.float32) * jnp.log(self.kl_start), (1,))
 
         observation = select_observation(observation, self.policy_observation_indices)
-        gate_logits = MLP(
-            out_features=self.nr_experts,
+        gate_logits = GateNetwork(
+            nr_experts=self.nr_experts,
             hidden_dim=self.hidden_dim,
             layers=self.layers,
-            activation="swish",
             use_norm=self.use_norm,
             use_skip=self.use_skip,
         )(observation)
+
+        expert_mean_offsets = self.param(
+            "expert_mean_offsets",
+            self._init_expert_mean_offsets,
+            (self.nr_experts, self.action_dim),
+        )
 
         means = []
         log_stds = []
@@ -136,10 +170,26 @@ class TRVBDMoEPolicy(nn.Module):
                 use_skip=self.use_skip,
                 name=f"expert_{expert_id}",
             )(observation)
+            mean = mean + expert_mean_offsets[expert_id]
             means.append(mean)
             log_stds.append(log_std)
 
         return gate_logits, jnp.stack(means, axis=-2), jnp.stack(log_stds, axis=-2)
+
+    def _init_expert_mean_offsets(self, key, shape):
+        if self.expert_mean_init_scale <= 0.0:
+            return jnp.zeros(shape, dtype=jnp.float32)
+        offsets = jax.random.normal(key, shape, dtype=jnp.float32)
+        offsets = offsets / (jnp.linalg.norm(offsets, axis=-1, keepdims=True) + EPS)
+        return offsets * self.expert_mean_init_scale
+
+    def gate_log_probs_and_probs(self, gate_logits):
+        gate_probs = jax.nn.softmax(gate_logits, axis=-1)
+        floor = jnp.asarray(self.gate_probability_floor, dtype=gate_probs.dtype)
+        floor = jnp.clip(floor, 0.0, (1.0 / self.nr_experts) - EPS)
+        gate_probs = (1.0 - self.nr_experts * floor) * gate_probs + floor
+        gate_log_probs = jnp.log(jnp.maximum(gate_probs, EPS))
+        return gate_log_probs, gate_probs
 
     def distribution(self, params, observation, std_scale=1.0):
         gate_logits, means, log_stds = self.apply({"params": params}, observation)
@@ -163,7 +213,7 @@ class TRVBDMoEPolicy(nn.Module):
     def mixture_log_prob_from_raw_dist(self, raw_action, gate_logits, means, log_stds):
         component_log_probs = self.component_raw_log_probs(raw_action, means, log_stds)
         extra_ndim = component_log_probs.ndim - 2
-        log_gate_probs = jax.nn.log_softmax(gate_logits, axis=-1)
+        log_gate_probs, _ = self.gate_log_probs_and_probs(gate_logits)
         log_gate_probs = log_gate_probs.reshape((gate_logits.shape[0],) + (1,) * extra_ndim + (self.nr_experts,))
         raw_log_prob = jax.nn.logsumexp(log_gate_probs + component_log_probs, axis=-1)
         return raw_log_prob - tanh_log_det_from_raw(raw_action, self.action_scale)
@@ -179,7 +229,8 @@ class TRVBDMoEPolicy(nn.Module):
     def sample_action(self, params, observation, key, exploration_scale=1.0):
         gate_logits, means, log_stds = self.distribution(params, observation, exploration_scale)
         expert_key, action_key = jax.random.split(key)
-        expert_ids = jax.random.categorical(expert_key, gate_logits, axis=-1)
+        log_gate_probs, _ = self.gate_log_probs_and_probs(gate_logits)
+        expert_ids = jax.random.categorical(expert_key, log_gate_probs, axis=-1)
         gather_ids = expert_ids[:, None, None]
         selected_means = jnp.take_along_axis(means, gather_ids, axis=-2).squeeze(axis=-2)
         selected_log_stds = jnp.take_along_axis(log_stds, gather_ids, axis=-2).squeeze(axis=-2)
@@ -190,6 +241,7 @@ class TRVBDMoEPolicy(nn.Module):
             "raw_action": raw_action,
             "expert_ids": expert_ids,
             "gate_logits": gate_logits,
+            "gate_log_probs": log_gate_probs,
             "means": means,
             "log_stds": log_stds,
         }
@@ -218,8 +270,8 @@ class TRVBDMoEPolicy(nn.Module):
         expert_action_log_probs = raw_log_probs - tanh_log_det_from_raw(raw_actions, self.action_scale)
         return {
             "gate_logits": gate_logits,
-            "gate_log_probs": jax.nn.log_softmax(gate_logits, axis=-1),
-            "gate_probs": jax.nn.softmax(gate_logits, axis=-1),
+            "gate_log_probs": self.gate_log_probs_and_probs(gate_logits)[0],
+            "gate_probs": self.gate_log_probs_and_probs(gate_logits)[1],
             "means": means,
             "log_stds": log_stds,
             "raw_actions": raw_actions,
@@ -232,7 +284,7 @@ class TRVBDMoEPolicy(nn.Module):
     def log_responsibilities_for_expert_samples(self, params, observation, raw_actions, min_log_responsibility):
         gate_logits, means, log_stds = self.distribution(params, observation, 1.0)
         component_log_probs = self.component_raw_log_probs(raw_actions, means, log_stds)
-        log_gate_probs = jax.nn.log_softmax(gate_logits, axis=-1)
+        log_gate_probs, _ = self.gate_log_probs_and_probs(gate_logits)
         log_gate_probs = log_gate_probs[:, None, None, :]
         log_joint = log_gate_probs + component_log_probs
         log_responsibilities = log_joint - jax.nn.logsumexp(log_joint, axis=-1, keepdims=True)
@@ -254,9 +306,8 @@ class TRVBDMoEPolicy(nn.Module):
         gate_logits, means, log_stds = self.distribution(params, observation, 1.0)
         old_gate_logits, old_means, old_log_stds = self.distribution(target_params, observation, 1.0)
 
-        log_gate_probs = jax.nn.log_softmax(gate_logits, axis=-1)
-        old_log_gate_probs = jax.nn.log_softmax(old_gate_logits, axis=-1)
-        old_gate_probs = jax.nn.softmax(old_gate_logits, axis=-1)
+        log_gate_probs, _ = self.gate_log_probs_and_probs(gate_logits)
+        old_log_gate_probs, old_gate_probs = self.gate_log_probs_and_probs(old_gate_logits)
 
         gate_kl = jnp.sum(old_gate_probs * (old_log_gate_probs - log_gate_probs), axis=-1)
         expert_kl = self.gaussian_kl(old_means, old_log_stds, means, log_stds)
@@ -270,8 +321,7 @@ class TRVBDMoEPolicy(nn.Module):
     def actor_metrics(self, params, sample_info):
         del params
         gate_logits = sample_info["gate_logits"]
-        gate_log_probs = jax.nn.log_softmax(gate_logits, axis=-1)
-        gate_probs = jax.nn.softmax(gate_logits, axis=-1)
+        gate_log_probs, gate_probs = self.gate_log_probs_and_probs(gate_logits)
         return {
             "moe/gate_entropy": -jnp.mean(jnp.sum(gate_probs * gate_log_probs, axis=-1)),
             "moe/gate_max_probability": jnp.mean(jnp.max(gate_probs, axis=-1)),
