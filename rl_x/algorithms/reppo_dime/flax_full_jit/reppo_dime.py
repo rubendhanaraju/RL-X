@@ -978,6 +978,10 @@ class RePPO_DIME:
                 raise ModuleNotFoundError("wandb is required when runner.track_wandb is enabled")
             wandb.save(f"{self.save_path}/{self.latest_model_file_name}", base_path=self.save_path)
 
+            if global_step is not None:
+                step_model_file_name = f"step_{global_step:012d}.model"
+                wandb.save(f"{self.save_path}/{step_model_file_name}", base_path=self.save_path)
+
     @classmethod
     def load(cls, config, train_env, eval_env, run_path, writer, explicitly_set_algorithm_params):
         splitted_path = config.runner.load_model.split("/")
