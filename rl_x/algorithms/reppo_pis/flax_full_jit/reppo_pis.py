@@ -23,11 +23,11 @@ from rl_x.algorithms.reppo_pis.flax_full_jit.policy import get_policy
 from rl_x.algorithms.reppo_pis.flax_full_jit.utils import hl_gauss, tree_norm
 from rl_x.algorithms.reppo_pis.flax_full_jit.general_properties import GeneralProperties
 
-
 rlx_logger = logging.getLogger("rl_x")
 
 
 def compute_reppo_pis_lambda_targets(rewards, values, terminations, truncations, importance_weights, gamma, lmbda):
+
     def compute_nstep_lambda(carry, transition):
         lambda_return, truncated, importance_weight = carry
         reward, value, done, current_truncated, current_importance_weight = transition
@@ -171,6 +171,7 @@ def compute_reppo_pis_adjoint_actor_loss(
 
 
 class RePPO_PIS:
+
     def __init__(self, config, train_env, eval_env, run_path, writer):
         self.config = config
         self.train_env = train_env
@@ -260,13 +261,17 @@ class RePPO_PIS:
         self.as_shape = self.train_env.single_action_space.shape
         self.horizon = self.train_env.horizon
         self.action_size_target = jnp.prod(jnp.asarray(self.as_shape)) * self.ent_target_mult
-        self.policy_observation_indices = getattr(self.train_env, "policy_observation_indices", jnp.arange(self.os_shape[0]))
-        self.critic_observation_indices = getattr(self.train_env, "critic_observation_indices", jnp.arange(self.os_shape[0]))
+        self.policy_observation_indices = getattr(self.train_env, "policy_observation_indices",
+                                                  jnp.arange(self.os_shape[0]))
+        self.critic_observation_indices = getattr(self.train_env, "critic_observation_indices",
+                                                  jnp.arange(self.os_shape[0]))
 
         if self.evaluation_and_save_frequency % self.batch_size != 0:
             raise ValueError("Evaluation and save frequency must be a multiple of batch size.")
         if self.nr_parallel_seeds > 1:
-            raise ValueError("Parallel seeds are not supported yet. This is mainly limited by not being able to log multiple wandb runs at the same time.")
+            raise ValueError(
+                "Parallel seeds are not supported yet. This is mainly limited by not being able to log multiple wandb runs at the same time."
+            )
         self.validate_reference_options()
 
         rlx_logger.info(f"Using device: {jax.default_backend()}")
@@ -292,7 +297,10 @@ class RePPO_PIS:
         )
 
         dummy_action = jnp.zeros((self.nr_envs,) + self.as_shape, dtype=jnp.float32)
-        critic_variables = self.critic.init(critic_key, env_state.next_observation, dummy_action, method=self.critic.forward)
+        critic_variables = self.critic.init(critic_key,
+                                            env_state.next_observation,
+                                            dummy_action,
+                                            method=self.critic.forward)
         critic_tx = self.create_critic_optimizer(self.create_learning_rate())
         self.critic_state = TrainState.create(
             apply_fn=self.critic.apply,
@@ -314,13 +322,15 @@ class RePPO_PIS:
 
     def validate_reference_options(self):
         if self.eval_action_mode != "sde":
-            raise ValueError("The reference JAX RePPO-PIS path evaluates with SDE samples; set algorithm.eval_action_mode='sde'.")
+            raise ValueError(
+                "The reference JAX RePPO-PIS path evaluates with SDE samples; set algorithm.eval_action_mode='sde'.")
         if self.config.algorithm.score_model_layer_norm_type != "LayerNorm":
             raise ValueError("Only score_model_layer_norm_type='LayerNorm' is supported by the Flax Linen port.")
         if self.config.algorithm.score_model_use_path_gradient:
             raise ValueError("score_model_use_path_gradient is not implemented in the reference JAX RePPO-PIS path.")
         if self.diffusion_loss != "am":
-            raise ValueError("The Flax Linen RePPO-PIS port currently supports the reference adjoint-matching loss only.")
+            raise ValueError(
+                "The Flax Linen RePPO-PIS port currently supports the reference adjoint-matching loss only.")
         if self.smoothed_importance_weighting:
             raise ValueError("smoothed_importance_weighting is not implemented in the Flax Linen port.")
         if self.trust_region_lagrangian not in ("dual_descent", "dual_optimal_geometric_average"):
@@ -364,11 +374,9 @@ class RePPO_PIS:
         if nr_offset_envs <= 0:
             return jnp.ones((self.nr_envs, 1), dtype=jnp.float32) * self.exploration_noise_min
 
-        offset = (
-            jnp.arange(nr_offset_envs, dtype=jnp.float32)[:, None]
-            * (self.exploration_noise_max - self.exploration_noise_min)
-            / max(nr_offset_envs, 1)
-        ) + self.exploration_noise_min
+        offset = (jnp.arange(nr_offset_envs, dtype=jnp.float32)[:, None] *
+                  (self.exploration_noise_max - self.exploration_noise_min) /
+                  max(nr_offset_envs, 1)) + self.exploration_noise_min
         base = jnp.ones((self.exploration_base_envs, 1), dtype=jnp.float32) * self.exploration_noise_min
         return jnp.concatenate([base, offset], axis=0)
 
@@ -434,7 +442,8 @@ class RePPO_PIS:
             else:
                 raise ValueError(f"Unknown observation_type: {observation_type}")
 
-            normalized_selected_observation = (observation[..., indices] - mean) / jnp.sqrt(var + self.normalizer_epsilon)
+            normalized_selected_observation = (observation[..., indices] - mean) / jnp.sqrt(var +
+                                                                                            self.normalizer_epsilon)
             return observation.at[..., indices].set(normalized_selected_observation)
         return observation
 
@@ -561,8 +570,10 @@ class RePPO_PIS:
                         key, action_key, next_action_key = jax.random.split(key, 3)
 
                         observation = env_state.next_observation
-                        policy_observation = self.normalize_observation(observation, observation_normalizer_state, "policy")
-                        critic_observation = self.normalize_observation(observation, observation_normalizer_state, "critic")
+                        policy_observation = self.normalize_observation(observation, observation_normalizer_state,
+                                                                        "policy")
+                        critic_observation = self.normalize_observation(observation, observation_normalizer_state,
+                                                                        "critic")
                         (
                             action,
                             raw_action,
@@ -641,12 +652,14 @@ class RePPO_PIS:
                         )
 
                         if self.render:
+
                             def render(env_state):
                                 return self.train_env.render(env_state)
 
                             env_state = jax.experimental.io_callback(render, env_state, env_state)
 
-                        return (actor_state, target_critic_state, observation_normalizer_state, env_state, key), transition
+                        return (actor_state, target_critic_state, observation_normalizer_state, env_state,
+                                key), transition
 
                     rollout_carry, batch = jax.lax.scan(
                         single_rollout,
@@ -801,13 +814,11 @@ class RePPO_PIS:
                     )
                     critic_metrics = {metric_key: jnp.mean(critic_metrics[metric_key]) for metric_key in critic_metrics}
 
-                    target_critic_state = target_critic_state.replace(
-                        params=optax.incremental_update(
-                            critic_state.params,
-                            target_critic_state.params,
-                            step_size=self.polyak,
-                        )
-                    )
+                    target_critic_state = target_critic_state.replace(params=optax.incremental_update(
+                        critic_state.params,
+                        target_critic_state.params,
+                        step_size=self.polyak,
+                    ))
 
                     def q_score_clipping(grads):
                         sample_norms = jnp.linalg.norm(grads, axis=-1, keepdims=True)
@@ -819,6 +830,7 @@ class RePPO_PIS:
                     q_critic_params = target_critic_state.params if self.use_target_critic_for_actor else critic_state.params
 
                     if self.q_score_max_norm_for_squashed:
+
                         def squashed_critic(obs, action):
                             return jnp.squeeze(
                                 self.critic.apply(
@@ -826,8 +838,7 @@ class RePPO_PIS:
                                     obs,
                                     action,
                                     method=self.critic.critic,
-                                )
-                            )
+                                ))
 
                         def squash_action(raw_action):
                             return self.policy.erf_forward(raw_action)
@@ -841,6 +852,7 @@ class RePPO_PIS:
                         _, raw_vjp = jax.vjp(jax.vmap(squash_action), batch_raw_actions)
                         (q_score,) = raw_vjp(squashed_q_score)
                     else:
+
                         def raw_critic(obs, raw_action):
                             action = self.policy.erf_forward(raw_action)
                             return jnp.squeeze(
@@ -849,8 +861,7 @@ class RePPO_PIS:
                                     obs,
                                     action,
                                     method=self.critic.critic,
-                                )
-                            )
+                                ))
 
                         q_value, q_score = jax.vmap(jax.value_and_grad(raw_critic, argnums=1))(
                             batch_critic_states,
@@ -913,12 +924,12 @@ class RePPO_PIS:
 
                         temperature = self.policy.temperature(actor_params)
                         temp_scaler = jax.lax.stop_gradient(temperature)
-                        nabla_p_T_ref = -raw_actions / self.policy.sigma_T_0() ** 2
+                        nabla_p_T_ref = -raw_actions / self.policy.sigma_T_0()**2
                         adjoint_state = (nabla_p_T_ref - tanh_correction_grads) - (q_scores / temp_scaler)
                         ctrl_target = -sigma_t * adjoint_state
 
                         unscaled_adjoint_loss = 0.5 * jnp.sum(jnp.square(controls - ctrl_target), axis=-1)
-                        sigma_t_scaling = sigma_t.squeeze(-1) ** int(self.loss_scaling_sigma_power)
+                        sigma_t_scaling = sigma_t.squeeze(-1)**int(self.loss_scaling_sigma_power)
                         if self.scale_loss_with_temperature:
                             temp_scaling = jnp.square(temp_scaler)
                         else:
@@ -971,34 +982,62 @@ class RePPO_PIS:
                         )
 
                         metrics = {
-                            "loss/actor_loss": actor_loss_metrics["actor_loss"],
-                            "loss/actor_total_loss": loss,
-                            "loss/actor_adjoint_loss": actor_loss_metrics["adjoint_loss"],
-                            "loss/entropy_lagrangian_loss": actor_loss_metrics["entropy_lagrangian_loss"],
-                            "loss/kl_lagrangian_loss": actor_loss_metrics["kl_lagrangian_loss"],
-                            "entropy/temperature": temperature,
-                            "entropy/policy_entropy": entropy,
-                            "entropy/optimal_entropy": jnp.mean(optimal_entropy),
-                            "entropy/reverse_ess": compute_reverse_ess(log_importance_weights),
-                            "policy/kl": kl_loss,
-                            "policy/lagrangian": lagrangian,
-                            "policy/mean_loss_weight": jnp.mean(loss_weights),
-                            "policy/abs_batch_action": jnp.mean(jnp.abs(minibatch_actions)),
-                            "policy/abs_batch_raw_action": jnp.mean(jnp.abs(minibatch_raw_actions)),
-                            "policy/tanh_correction_grad_norm": jnp.mean(jnp.sum(jnp.square(minibatch_tanh_correction_grads), axis=-1)),
-                            "q/policy_value": jnp.mean(minibatch_q_values),
-                            "q/actor_target_value": jnp.mean(minibatch_target_values),
-                            "q/score_norm": jnp.mean(jnp.sum(jnp.square(minibatch_q_scores), axis=-1)),
-                            "q/score_pct_clipped": q_pct_clipped,
-                            "data/actor_reward": jnp.mean(minibatch_rewards),
-                            "parameters/actor_norm": tree_norm(actor_params),
-                            "diffusion/log_weight": jnp.mean(minibatch_log_weights),
-                            "diffusion/log_path_weight_deterministic": jnp.mean(minibatch_log_path_weight_deterministics),
-                            "diffusion/log_path_weight_stochastic": jnp.mean(minibatch_log_path_weight_stochastics),
-                            "diffusion/log_p_T_ref": jnp.mean(minibatch_log_p_T_refs),
-                            "diffusion/cov_weight": jnp.mean(minibatch_cov_weights),
-                            "diffusion/control_norm": jnp.mean(0.5 * jnp.sum(jnp.square(controls), axis=-1)),
-                            "diffusion/old_control_norm": jnp.mean(0.5 * jnp.sum(jnp.square(old_controls), axis=-1)),
+                            "loss/actor_loss":
+                                actor_loss_metrics["actor_loss"],
+                            "loss/actor_total_loss":
+                                loss,
+                            "loss/actor_adjoint_loss":
+                                actor_loss_metrics["adjoint_loss"],
+                            "loss/entropy_lagrangian_loss":
+                                actor_loss_metrics["entropy_lagrangian_loss"],
+                            "loss/kl_lagrangian_loss":
+                                actor_loss_metrics["kl_lagrangian_loss"],
+                            "entropy/temperature":
+                                temperature,
+                            "entropy/policy_entropy":
+                                entropy,
+                            "entropy/optimal_entropy":
+                                jnp.mean(optimal_entropy),
+                            "entropy/reverse_ess":
+                                compute_reverse_ess(log_importance_weights),
+                            "policy/kl":
+                                kl_loss,
+                            "policy/lagrangian":
+                                lagrangian,
+                            "policy/mean_loss_weight":
+                                jnp.mean(loss_weights),
+                            "policy/abs_batch_action":
+                                jnp.mean(jnp.abs(minibatch_actions)),
+                            "policy/abs_batch_raw_action":
+                                jnp.mean(jnp.abs(minibatch_raw_actions)),
+                            "policy/tanh_correction_grad_norm":
+                                jnp.mean(jnp.sum(jnp.square(minibatch_tanh_correction_grads), axis=-1)),
+                            "q/policy_value":
+                                jnp.mean(minibatch_q_values),
+                            "q/actor_target_value":
+                                jnp.mean(minibatch_target_values),
+                            "q/score_norm":
+                                jnp.mean(jnp.sum(jnp.square(minibatch_q_scores), axis=-1)),
+                            "q/score_pct_clipped":
+                                q_pct_clipped,
+                            "data/actor_reward":
+                                jnp.mean(minibatch_rewards),
+                            "parameters/actor_norm":
+                                tree_norm(actor_params),
+                            "diffusion/log_weight":
+                                jnp.mean(minibatch_log_weights),
+                            "diffusion/log_path_weight_deterministic":
+                                jnp.mean(minibatch_log_path_weight_deterministics),
+                            "diffusion/log_path_weight_stochastic":
+                                jnp.mean(minibatch_log_path_weight_stochastics),
+                            "diffusion/log_p_T_ref":
+                                jnp.mean(minibatch_log_p_T_refs),
+                            "diffusion/cov_weight":
+                                jnp.mean(minibatch_cov_weights),
+                            "diffusion/control_norm":
+                                jnp.mean(0.5 * jnp.sum(jnp.square(controls), axis=-1)),
+                            "diffusion/old_control_norm":
+                                jnp.mean(0.5 * jnp.sum(jnp.square(old_controls), axis=-1)),
                         }
                         return loss, metrics
 
@@ -1042,7 +1081,8 @@ class RePPO_PIS:
                     actor_metrics = {metric_key: jnp.mean(actor_metrics[metric_key]) for metric_key in actor_metrics}
 
                     optimization_metrics = {**critic_metrics, **actor_metrics}
-                    optimization_metrics["lr/learning_rate"] = actor_state.opt_state[-1].hyperparams["learning_rate"] if self.anneal_learning_rate else self.learning_rate
+                    optimization_metrics["lr/learning_rate"] = actor_state.opt_state[-1].hyperparams[
+                        "learning_rate"] if self.anneal_learning_rate else self.learning_rate
 
                     infos = jax.tree_util.tree_map(lambda x: jnp.mean(x), infos)
                     combined_metrics = jax.tree_util.tree_map(lambda x: jnp.mean(x), {**infos, **optimization_metrics})
@@ -1050,22 +1090,23 @@ class RePPO_PIS:
                     def callback(callback_carry):
                         metrics, local_learning_iteration_step, combined_learning_iteration_step, parallel_seed_id = callback_carry
                         current_time = time.time()
-                        metrics["time/sps"] = int((self.nr_steps * self.nr_envs) / (current_time - self.last_time[parallel_seed_id]))
+                        metrics["time/sps"] = int(
+                            (self.nr_steps * self.nr_envs) / (current_time - self.last_time[parallel_seed_id]))
                         self.last_time[parallel_seed_id] = current_time
                         global_step = combined_learning_iteration_step.item() * self.nr_steps * self.nr_envs
                         metrics["steps/nr_env_steps"] = global_step
-                        metrics["steps/nr_updates"] = combined_learning_iteration_step.item() * self.nr_epochs * self.nr_minibatches
+                        metrics["steps/nr_updates"] = combined_learning_iteration_step.item(
+                        ) * self.nr_epochs * self.nr_minibatches
                         is_last_train_update_before_eval = self.evaluation_active and (
-                            local_learning_iteration_step + 1 == self.nr_updates_per_multi_learning_iteration
-                        )
+                            local_learning_iteration_step + 1 == self.nr_updates_per_multi_learning_iteration)
                         self.start_logging(global_step)
                         for metric_key, value in metrics.items():
                             self.log(metric_key, np.asarray(value), global_step)
                         self.end_logging(wandb_commit=not is_last_train_update_before_eval)
 
                     combined_learning_iteration_step = (
-                        multi_learning_iteration_step * self.nr_updates_per_multi_learning_iteration
-                    ) + learning_iteration_step + 1
+                        multi_learning_iteration_step *
+                        self.nr_updates_per_multi_learning_iteration) + learning_iteration_step + 1
                     jax.debug.callback(
                         callback,
                         (combined_metrics, learning_iteration_step, combined_learning_iteration_step, parallel_seed_id),
@@ -1084,12 +1125,14 @@ class RePPO_PIS:
                 key, subkey = jax.random.split(key)
                 learning_carry, _ = jax.lax.scan(
                     learning_iteration,
-                    (actor_state, target_actor_state, critic_state, target_critic_state, observation_normalizer_state, env_state, subkey),
+                    (actor_state, target_actor_state, critic_state, target_critic_state, observation_normalizer_state,
+                     env_state, subkey),
                     jnp.arange(self.nr_updates_per_multi_learning_iteration),
                 )
                 actor_state, target_actor_state, critic_state, target_critic_state, observation_normalizer_state, env_state, key = learning_carry
 
                 if self.evaluation_active:
+
                     def single_eval_rollout(carry, _):
                         actor_state, observation_normalizer_state, eval_env_state, key = carry
                         key, action_key = jax.random.split(key)
@@ -1125,14 +1168,21 @@ class RePPO_PIS:
                             self.log(metric_key, np.asarray(value), global_step)
                         self.end_logging()
 
-                    combined_iteration_step = (multi_learning_iteration_step + 1) * self.nr_updates_per_multi_learning_iteration
+                    combined_iteration_step = (multi_learning_iteration_step +
+                                               1) * self.nr_updates_per_multi_learning_iteration
                     jax.debug.callback(eval_callback, (eval_metrics, combined_iteration_step))
 
                 if self.save_model:
-                    def save_with_check(actor_state, target_actor_state, critic_state, target_critic_state, observation_normalizer_state):
-                        self.save(actor_state, target_actor_state, critic_state, target_critic_state, observation_normalizer_state)
 
-                    jax.debug.callback(save_with_check, actor_state, target_actor_state, critic_state, target_critic_state, observation_normalizer_state)
+                    save_global_step = (multi_learning_iteration_step + 1) * self.evaluation_and_save_frequency
+
+                    def save_with_check(actor_state, target_actor_state, critic_state, target_critic_state,
+                                        observation_normalizer_state, global_step):
+                        self.save(actor_state, target_actor_state, critic_state, target_critic_state,
+                                  observation_normalizer_state, int(global_step))
+
+                    jax.debug.callback(save_with_check, actor_state, target_actor_state, critic_state,
+                                       target_critic_state, observation_normalizer_state, save_global_step)
 
                 return (
                     actor_state,
@@ -1146,7 +1196,8 @@ class RePPO_PIS:
 
             jax.lax.scan(
                 multi_learning_and_eval_save_iteration,
-                (actor_state, target_actor_state, critic_state, target_critic_state, observation_normalizer_state, env_state, key),
+                (actor_state, target_actor_state, critic_state, target_critic_state, observation_normalizer_state,
+                 env_state, key),
                 jnp.arange(self.nr_multi_learning_and_eval_save_iterations),
             )
 
@@ -1190,7 +1241,13 @@ class RePPO_PIS:
         if self.track_console:
             rlx_logger.info("└" + "─" * 31 + "┴" + "─" * 16 + "┘")
 
-    def save(self, actor_state, target_actor_state, critic_state, target_critic_state, observation_normalizer_state):
+    def save(self,
+             actor_state,
+             target_actor_state,
+             critic_state,
+             target_critic_state,
+             observation_normalizer_state,
+             global_step=None):
         checkpoint = {
             "actor": actor_state,
             "target_actor": target_actor_state,
@@ -1203,8 +1260,16 @@ class RePPO_PIS:
         with open(f"{self.save_path}/tmp/config_algorithm.json", "w") as f:
             json.dump(self.config.algorithm.to_dict(), f)
         shutil.make_archive(f"{self.save_path}/{self.latest_model_file_name}", "zip", f"{self.save_path}/tmp")
-        os.rename(f"{self.save_path}/{self.latest_model_file_name}.zip", f"{self.save_path}/{self.latest_model_file_name}")
+        os.rename(f"{self.save_path}/{self.latest_model_file_name}.zip",
+                  f"{self.save_path}/{self.latest_model_file_name}")
         shutil.rmtree(f"{self.save_path}/tmp")
+
+        if global_step is not None:
+            step_model_file_name = f"step_{global_step:012d}.model"
+            shutil.copyfile(
+                f"{self.save_path}/{self.latest_model_file_name}",
+                f"{self.save_path}/{step_model_file_name}",
+            )
 
         if self.track_wandb:
             if wandb is None:
@@ -1252,7 +1317,8 @@ class RePPO_PIS:
             model.target_actor_state = checkpoint["target_actor"]
             model.critic_state = checkpoint["critic"]
             model.target_critic_state = checkpoint.get("target_critic", model.target_critic_state)
-            model.observation_normalizer_state = model.migrate_observation_normalizer(checkpoint["observation_normalizer"])
+            model.observation_normalizer_state = model.migrate_observation_normalizer(
+                checkpoint["observation_normalizer"])
         finally:
             shutil.rmtree(checkpoint_dir)
         return model
@@ -1263,7 +1329,8 @@ class RePPO_PIS:
         @jax.jit
         def rollout(env_state, key):
             key, action_key = jax.random.split(key)
-            observation = self.normalize_observation(env_state.next_observation, self.observation_normalizer_state, "policy")
+            observation = self.normalize_observation(env_state.next_observation, self.observation_normalizer_state,
+                                                     "policy")
             action = self.select_eval_action(self.actor_state.params, observation, action_key)
             action = self.clip_action(action)
             env_state = self.eval_env.step(env_state, action)

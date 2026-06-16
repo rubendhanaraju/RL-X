@@ -182,8 +182,14 @@ def simulate_sde(apply_fn, params, x0, key, sigma: float, n_steps: int, state_cl
     return xT
 
 
-def refresh_endpoint_buffer(state, key, args) -> jnp.ndarray:
-    """Generate endpoint samples from the current BMS model."""
+def refresh_endpoint_buffer_from_params(apply_fn, params, key, args) -> jnp.ndarray:
+    """Generate endpoint samples from a specified frozen BMS model.
+
+    In the BMS fixed-point iteration, the bridge endpoints must come from the
+    same frozen previous iterate that is used as the damping reference.  Passing
+    params explicitly avoids accidentally refreshing the replay buffer from the
+    candidate model after inner-loop updates have already started.
+    """
     out = []
     n_done = 0
     key_loop = key
@@ -192,8 +198,8 @@ def refresh_endpoint_buffer(state, key, args) -> jnp.ndarray:
         key_loop, key_x0, key_sde = jax.random.split(key_loop, 3)
         x0 = args.prior_std * jax.random.normal(key_x0, (n, TARGET_DIM), dtype=jnp.float32)
         xT = simulate_sde(
-            state.apply_fn,
-            state.params,
+            apply_fn,
+            params,
             x0,
             key_sde,
             args.sigma,
@@ -213,6 +219,11 @@ def refresh_endpoint_buffer(state, key, args) -> jnp.ndarray:
             reps = int(np.ceil(args.buffer_size / arr.shape[0]))
             arr = np.tile(arr, (reps, 1))[:args.buffer_size]
     return jnp.asarray(arr[:args.buffer_size])
+
+
+def refresh_endpoint_buffer(state, key, args) -> jnp.ndarray:
+    """Generate endpoint samples from the current BMS model."""
+    return refresh_endpoint_buffer_from_params(state.apply_fn, state.params, key, args)
 
 
 def sample_brownian_bridge(x0, xT, t, key, sigma: float):
@@ -235,9 +246,9 @@ def bms_target_control(x0, xT, xt, t, sigma: float, prior_std: float):
 def bms_target_control_prior_var(x0, xT, xt, t, sigma: float, prior_var: float):
     """Same BMS target, using prior variance directly.
 
-This is used by the corrected standalone GMM-BMS implementation, whose
-reference prior is N(0, prior_var I) and is intentionally independent of the
-pure-BMS baseline's broad prior_std.
+This is used by the corrected GMM-BMS implementation, whose reference
+prior is N(0, prior_var I).  By default prior_var is set to --prior_std**2
+for a like-for-like comparison, but it can be overridden explicitly.
     """
     tc = t[:, None]
     prior_score = -x0 / prior_var
@@ -309,7 +320,14 @@ def train_step_bms(
 
 
 def positive_terminal_vars(raw_logvars: jnp.ndarray, var_floor: float) -> jnp.ndarray:
-    return var_floor + jnp.exp(jnp.clip(raw_logvars, -7.0, 4.0))
+    """Map log-variance parameters to positive variances.
+
+    This practical benchmark version uses an exp(logvar) parameterization with
+    a wide safety clip.  It keeps the faster log-variance training dynamics of
+    the original script while avoiding the very tight [-7, 4] clipping that can
+    silently freeze gradients if optimization wanders too far.
+    """
+    return var_floor + jnp.exp(jnp.clip(raw_logvars, -20.0, 8.0))
 
 
 def terminal_params_from_flax_params(params, var_floor: float):
@@ -424,11 +442,8 @@ class DirectGMMPath(nn.Module):
 
         def raw_logvar_init(key, shape, dtype=jnp.float32):
             del key
-            init_var_minus_floor = jnp.maximum(
-                jnp.asarray(self.init_terminal_std**2 - self.var_floor, dtype=dtype),
-                jnp.asarray(1.0e-6, dtype=dtype),
-            )
-            return jnp.full(shape, jnp.log(init_var_minus_floor), dtype=dtype)
+            init_var_minus_floor = max(float(self.init_terminal_std**2 - self.var_floor), 1.0e-6)
+            return jnp.full(shape, np.log(init_var_minus_floor), dtype=dtype)
 
         raw_logvars_T = self.param("raw_logvars_T", raw_logvar_init, (self.k, self.dim))
 
@@ -540,15 +555,15 @@ def gmm_params_to_np(params, var_floor: float):
     }
 
 
-def make_initial_our_gmm(args, key):
-    """Return the exact post-initialization GMM used by our GMM-BMS method.
+def make_initial_our_gmm(args, key, k_override=None):
+    """Return the post-initialization GMM used by the GMM-BMS initializer.
 
-    This lets the post-hoc EM baseline start from the same terminal GMM
-    initialization as our method, rather than kmeans++/random initialization.
-    The split mirrors train_our_gmm(), so passing the same key gives the same
-    initial parameters.
+    If k_override is given, the same initialization scheme is used with that
+    number of components.  This keeps post-hoc EM robust even when
+    --our_gmm_components differs from --gmm_components.
     """
-    k = args.our_gmm_components if args.our_gmm_components > 0 else args.gmm_components
+    k = int(k_override) if k_override is not None else (
+        args.our_gmm_components if args.our_gmm_components > 0 else args.gmm_components)
     key_init, _ = jax.random.split(key)
     model = DirectGMMPath(
         k=k,
@@ -590,6 +605,11 @@ def train_our_gmm(args, key):
     )
     state = train_state.TrainState.create(apply_fn=model.apply, params=variables["params"], tx=tx)
     ref_params = state.params
+
+    if args.our_use_importance_weights:
+        print("[OUR-GMM] Using endpoint importance weights: this is a diagnostic variant, not plain BMS.")
+    if args.our_entropy_coef != 0.0 or args.our_var_reg != 0.0:
+        print("[OUR-GMM] Nonzero entropy/variance regularization: objective is regularized BMS, not exact BMS.")
 
     start = time.time()
     last_metrics = None
@@ -765,9 +785,20 @@ def gmm_component_usage_stats(gmm, weight_threshold: float = 1.0e-3):
 
 
 def mode_histogram(samples):
-    centers = np.asarray(TARGET_CENTERS)
-    d2 = np.sum((samples[:, None, :] - centers[None, :, :])**2, axis=-1)
-    assign = np.argmin(d2, axis=1)
+    """Empirical target-component histogram using posterior MAP assignment.
+
+    Nearest-mean assignment is only valid for equal spherical components.  The
+    toy target has unequal diagonal variances and nonuniform weights, so use
+    argmax_k pi_k N(x; mu_k, D_k) instead.
+    """
+    samples = np.asarray(samples, dtype=np.float64)
+    centers = np.asarray(TARGET_CENTERS, dtype=np.float64)
+    vars_ = np.asarray(TARGET_VARS, dtype=np.float64)
+    weights = np.asarray(TARGET_WEIGHTS, dtype=np.float64)
+    diff = samples[:, None, :] - centers[None, :, :]
+    log_comp = (np.log(weights[None, :] + 1.0e-300) -
+                0.5 * np.sum(np.log(2.0 * np.pi * vars_)[None, :, :] + diff**2 / vars_[None, :, :], axis=-1))
+    assign = np.argmax(log_comp, axis=1)
     hist = np.bincount(assign, minlength=centers.shape[0]).astype(np.float64)
     return hist / max(hist.sum(), 1.0)
 
@@ -925,10 +956,13 @@ def parse_args():
                    type=float,
                    default=1.0,
                    help="Sigma for corrected Brownian-bridge/SI GMM-BMS; independent of pure BMS sigma.")
-    p.add_argument("--our_prior_var",
-                   type=float,
-                   default=1.0,
-                   help="Prior variance for corrected Brownian-bridge/SI GMM-BMS, i.e. X0 ~ N(0, prior_var I).")
+    p.add_argument(
+        "--our_prior_var",
+        type=float,
+        default=1.0,
+        help=("Prior variance for corrected Brownian-bridge/SI GMM-BMS. "
+              "Default 1.0 is the easier standalone N(0,I) bridge used in the derivation experiments. "
+              "For a like-for-like broad-prior comparison with pure BMS, pass --our_prior_var prior_std**2."))
     p.add_argument("--our_t_eps", type=float, default=2e-2)
     p.add_argument("--our_xi_clip",
                    type=float,
@@ -943,8 +977,16 @@ def parse_args():
     p.add_argument("--our_init_mean_scale", type=float, default=12.0)
     p.add_argument("--our_init_terminal_std", type=float, default=2.5)
     p.add_argument("--our_var_floor", type=float, default=1e-3)
-    p.add_argument("--our_entropy_coef", type=float, default=1e-3)
-    p.add_argument("--our_var_reg", type=float, default=1e-4)
+    p.add_argument("--our_entropy_coef",
+                   type=float,
+                   default=1e-3,
+                   help=("Small practical entropy regularizer on GMM weights. "
+                         "Set to 0 for the exact unregularized finite-dimensional BMS objective."))
+    p.add_argument("--our_var_reg",
+                   type=float,
+                   default=1e-4,
+                   help=("Small practical log-variance regularizer. "
+                         "Set to 0 for the exact unregularized finite-dimensional BMS objective."))
     p.add_argument("--our_use_importance_weights", dest="our_use_importance_weights", action="store_true")
     p.add_argument("--our_no_importance_weights", dest="our_use_importance_weights", action="store_false")
     p.set_defaults(our_use_importance_weights=False)
@@ -956,7 +998,12 @@ def parse_args():
     p.add_argument("--plot_lim", type=float, default=18.5)
     p.add_argument("--grid_n", type=int, default=350)
     p.add_argument("--sliced_projections", type=int, default=128)
-    return p.parse_args()
+    args = p.parse_args()
+    if args.our_prior_var <= 0:
+        raise ValueError("--our_prior_var must be positive")
+    if args.outer_every <= 0:
+        raise ValueError("--outer_every must be positive")
+    return args
 
 
 def run_single_seed(args):
@@ -991,20 +1038,25 @@ def run_single_seed(args):
     state = train_state.TrainState.create(apply_fn=model.apply, params=variables["params"], tx=tx)
     ref_params = state.params
 
-    print("Refreshing initial endpoint buffer...")
-    endpoint_buffer = refresh_endpoint_buffer(state, key_buf, args)
+    endpoint_buffer = None
 
     start = time.time()
     last_metrics = None
     for step in range(1, args.steps + 1):
         key_train, subkey = jax.random.split(key_train)
 
+        refresh_buffer = False
         if (step - 1) % args.outer_every == 0:
             ref_params = jax.tree_util.tree_map(lambda z: z, state.params)
+            refresh_buffer = True
+        elif args.refresh_every > 0 and (step - 1) % args.refresh_every == 0:
+            refresh_buffer = True
 
-        if step == 1 or (step - 1) % args.refresh_every == 0:
+        if refresh_buffer or endpoint_buffer is None:
             key_train, key_refresh = jax.random.split(key_train)
-            endpoint_buffer = refresh_endpoint_buffer(state, key_refresh, args)
+            if step == 1:
+                print("Refreshing initial endpoint buffer...")
+            endpoint_buffer = refresh_endpoint_buffer_from_params(state.apply_fn, ref_params, key_refresh, args)
 
         state, metrics = train_step_bms(
             state,
@@ -1046,7 +1098,7 @@ def run_single_seed(args):
     key_sample, key_our = jax.random.split(key_sample)
     posthoc_init_gmm = None
     if args.em_init == "our_init":
-        posthoc_init_gmm = make_initial_our_gmm(args, key_our)
+        posthoc_init_gmm = make_initial_our_gmm(args, key_our, k_override=args.gmm_components)
 
     print("Fitting diagonal GMM by EM...")
     gmm = fit_diag_gmm_em(

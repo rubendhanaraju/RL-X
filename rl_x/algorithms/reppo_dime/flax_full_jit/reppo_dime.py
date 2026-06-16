@@ -23,11 +23,11 @@ from rl_x.algorithms.reppo_dime.flax_full_jit.policy import get_policy
 from rl_x.algorithms.reppo_dime.flax_full_jit.utils import hl_gauss, tree_norm
 from rl_x.algorithms.reppo_dime.flax_full_jit.general_properties import GeneralProperties
 
-
 rlx_logger = logging.getLogger("rl_x")
 
 
 def compute_reppo_dime_lambda_targets(rewards, values, terminations, truncations, importance_weights, gamma, lmbda):
+
     def compute_nstep_lambda(carry, transition):
         lambda_return, truncated, importance_weight = carry
         reward, value, done, current_truncated, current_importance_weight = transition
@@ -124,6 +124,7 @@ def compute_reppo_dime_actor_loss(
 
 
 class RePPO_DIME:
+
     def __init__(self, config, train_env, eval_env, run_path, writer):
         self.config = config
         self.train_env = train_env
@@ -197,13 +198,17 @@ class RePPO_DIME:
         self.as_shape = self.train_env.single_action_space.shape
         self.horizon = self.train_env.horizon
         self.action_size_target = jnp.prod(jnp.asarray(self.as_shape)) * self.ent_target_mult
-        self.policy_observation_indices = getattr(self.train_env, "policy_observation_indices", jnp.arange(self.os_shape[0]))
-        self.critic_observation_indices = getattr(self.train_env, "critic_observation_indices", jnp.arange(self.os_shape[0]))
+        self.policy_observation_indices = getattr(self.train_env, "policy_observation_indices",
+                                                  jnp.arange(self.os_shape[0]))
+        self.critic_observation_indices = getattr(self.train_env, "critic_observation_indices",
+                                                  jnp.arange(self.os_shape[0]))
 
         if self.evaluation_and_save_frequency % self.batch_size != 0:
             raise ValueError("Evaluation and save frequency must be a multiple of batch size.")
         if self.nr_parallel_seeds > 1:
-            raise ValueError("Parallel seeds are not supported yet. This is mainly limited by not being able to log multiple wandb runs at the same time.")
+            raise ValueError(
+                "Parallel seeds are not supported yet. This is mainly limited by not being able to log multiple wandb runs at the same time."
+            )
         self.validate_reference_options()
 
         rlx_logger.info(f"Using device: {jax.default_backend()}")
@@ -229,7 +234,10 @@ class RePPO_DIME:
         )
 
         dummy_action = jnp.zeros((self.nr_envs,) + self.as_shape, dtype=jnp.float32)
-        critic_variables = self.critic.init(critic_key, env_state.next_observation, dummy_action, method=self.critic.forward)
+        critic_variables = self.critic.init(critic_key,
+                                            env_state.next_observation,
+                                            dummy_action,
+                                            method=self.critic.forward)
         critic_tx = self.create_optimizer(self.create_learning_rate())
         self.critic_state = TrainState.create(
             apply_fn=self.critic.apply,
@@ -286,11 +294,9 @@ class RePPO_DIME:
         if nr_offset_envs <= 0:
             return jnp.ones((self.nr_envs, 1), dtype=jnp.float32) * self.exploration_noise_min
 
-        offset = (
-            jnp.arange(nr_offset_envs, dtype=jnp.float32)[:, None]
-            * (self.exploration_noise_max - self.exploration_noise_min)
-            / max(nr_offset_envs, 1)
-        ) + self.exploration_noise_min
+        offset = (jnp.arange(nr_offset_envs, dtype=jnp.float32)[:, None] *
+                  (self.exploration_noise_max - self.exploration_noise_min) /
+                  max(nr_offset_envs, 1)) + self.exploration_noise_min
         base = jnp.ones((self.exploration_base_envs, 1), dtype=jnp.float32) * self.exploration_noise_min
         return jnp.concatenate([base, offset], axis=0)
 
@@ -356,7 +362,8 @@ class RePPO_DIME:
             else:
                 raise ValueError(f"Unknown observation_type: {observation_type}")
 
-            normalized_selected_observation = (observation[..., indices] - mean) / jnp.sqrt(var + self.normalizer_epsilon)
+            normalized_selected_observation = (observation[..., indices] - mean) / jnp.sqrt(var +
+                                                                                            self.normalizer_epsilon)
             return observation.at[..., indices].set(normalized_selected_observation)
         return observation
 
@@ -482,8 +489,10 @@ class RePPO_DIME:
                         key, action_key, next_action_key = jax.random.split(key, 3)
 
                         observation = env_state.next_observation
-                        policy_observation = self.normalize_observation(observation, observation_normalizer_state, "policy")
-                        critic_observation = self.normalize_observation(observation, observation_normalizer_state, "critic")
+                        policy_observation = self.normalize_observation(observation, observation_normalizer_state,
+                                                                        "policy")
+                        critic_observation = self.normalize_observation(observation, observation_normalizer_state,
+                                                                        "critic")
                         action, _, _, sample_info = self.policy.sample_action(
                             actor_state.params,
                             policy_observation,
@@ -545,6 +554,7 @@ class RePPO_DIME:
                         )
 
                         if self.render:
+
                             def render(env_state):
                                 return self.train_env.render(env_state)
 
@@ -769,8 +779,11 @@ class RePPO_DIME:
                         batch_indices,
                     )
                     actor_state, target_actor_state, critic_state, _ = update_carry
-                    optimization_metrics = {metric_key: jnp.mean(optimization_metrics[metric_key]) for metric_key in optimization_metrics}
-                    optimization_metrics["lr/learning_rate"] = actor_state.opt_state[-1].hyperparams["learning_rate"] if self.anneal_learning_rate else self.learning_rate
+                    optimization_metrics = {
+                        metric_key: jnp.mean(optimization_metrics[metric_key]) for metric_key in optimization_metrics
+                    }
+                    optimization_metrics["lr/learning_rate"] = actor_state.opt_state[-1].hyperparams[
+                        "learning_rate"] if self.anneal_learning_rate else self.learning_rate
 
                     infos = jax.tree_util.tree_map(lambda x: jnp.mean(x), infos)
                     combined_metrics = jax.tree_util.tree_map(lambda x: jnp.mean(x), {**infos, **optimization_metrics})
@@ -778,22 +791,23 @@ class RePPO_DIME:
                     def callback(callback_carry):
                         metrics, local_learning_iteration_step, combined_learning_iteration_step, parallel_seed_id = callback_carry
                         current_time = time.time()
-                        metrics["time/sps"] = int((self.nr_steps * self.nr_envs) / (current_time - self.last_time[parallel_seed_id]))
+                        metrics["time/sps"] = int(
+                            (self.nr_steps * self.nr_envs) / (current_time - self.last_time[parallel_seed_id]))
                         self.last_time[parallel_seed_id] = current_time
                         global_step = combined_learning_iteration_step.item() * self.nr_steps * self.nr_envs
                         metrics["steps/nr_env_steps"] = global_step
-                        metrics["steps/nr_updates"] = combined_learning_iteration_step.item() * self.nr_epochs * self.nr_minibatches
+                        metrics["steps/nr_updates"] = combined_learning_iteration_step.item(
+                        ) * self.nr_epochs * self.nr_minibatches
                         is_last_train_update_before_eval = self.evaluation_active and (
-                            local_learning_iteration_step + 1 == self.nr_updates_per_multi_learning_iteration
-                        )
+                            local_learning_iteration_step + 1 == self.nr_updates_per_multi_learning_iteration)
                         self.start_logging(global_step)
                         for metric_key, value in metrics.items():
                             self.log(metric_key, np.asarray(value), global_step)
                         self.end_logging(wandb_commit=not is_last_train_update_before_eval)
 
                     combined_learning_iteration_step = (
-                        multi_learning_iteration_step * self.nr_updates_per_multi_learning_iteration
-                    ) + learning_iteration_step + 1
+                        multi_learning_iteration_step *
+                        self.nr_updates_per_multi_learning_iteration) + learning_iteration_step + 1
                     jax.debug.callback(
                         callback,
                         (combined_metrics, learning_iteration_step, combined_learning_iteration_step, parallel_seed_id),
@@ -817,6 +831,7 @@ class RePPO_DIME:
                 actor_state, target_actor_state, critic_state, observation_normalizer_state, env_state, key = learning_carry
 
                 if self.evaluation_active:
+
                     def single_eval_rollout(carry, _):
                         actor_state, observation_normalizer_state, eval_env_state, key = carry
                         key, action_key = jax.random.split(key)
@@ -852,14 +867,33 @@ class RePPO_DIME:
                             self.log(metric_key, np.asarray(value), global_step)
                         self.end_logging()
 
-                    combined_iteration_step = (multi_learning_iteration_step + 1) * self.nr_updates_per_multi_learning_iteration
+                    combined_iteration_step = (multi_learning_iteration_step +
+                                               1) * self.nr_updates_per_multi_learning_iteration
                     jax.debug.callback(eval_callback, (eval_metrics, combined_iteration_step))
 
-                if self.save_model:
-                    def save_with_check(actor_state, target_actor_state, critic_state, observation_normalizer_state):
-                        self.save(actor_state, target_actor_state, critic_state, observation_normalizer_state)
+                # if self.save_model:
 
-                    jax.debug.callback(save_with_check, actor_state, target_actor_state, critic_state, observation_normalizer_state)
+                #     def save_with_check(actor_state, target_actor_state, critic_state, observation_normalizer_state):
+                #         self.save(actor_state, target_actor_state, critic_state, observation_normalizer_state)
+
+                #     jax.debug.callback(save_with_check, actor_state, target_actor_state, critic_state,
+                #                        observation_normalizer_state)
+                if self.save_model:
+                    save_global_step = (multi_learning_iteration_step + 1) * self.evaluation_and_save_frequency
+
+                    def save_with_check(actor_state, target_actor_state, critic_state, observation_normalizer_state,
+                                        global_step):
+                        self.save(actor_state, target_actor_state, critic_state, observation_normalizer_state,
+                                  int(global_step))
+
+                    jax.debug.callback(
+                        save_with_check,
+                        actor_state,
+                        target_actor_state,
+                        critic_state,
+                        observation_normalizer_state,
+                        save_global_step,
+                    )
 
                 return (
                     actor_state,
@@ -916,7 +950,7 @@ class RePPO_DIME:
         if self.track_console:
             rlx_logger.info("└" + "─" * 31 + "┴" + "─" * 16 + "┘")
 
-    def save(self, actor_state, target_actor_state, critic_state, observation_normalizer_state):
+    def save(self, actor_state, target_actor_state, critic_state, observation_normalizer_state, global_step=None):
         checkpoint = {
             "actor": actor_state,
             "target_actor": target_actor_state,
@@ -928,8 +962,16 @@ class RePPO_DIME:
         with open(f"{self.save_path}/tmp/config_algorithm.json", "w") as f:
             json.dump(self.config.algorithm.to_dict(), f)
         shutil.make_archive(f"{self.save_path}/{self.latest_model_file_name}", "zip", f"{self.save_path}/tmp")
-        os.rename(f"{self.save_path}/{self.latest_model_file_name}.zip", f"{self.save_path}/{self.latest_model_file_name}")
+        os.rename(f"{self.save_path}/{self.latest_model_file_name}.zip",
+                  f"{self.save_path}/{self.latest_model_file_name}")
         shutil.rmtree(f"{self.save_path}/tmp")
+
+        if global_step is not None:
+            step_model_file_name = f"step_{global_step:012d}.model"
+            shutil.copyfile(
+                f"{self.save_path}/{self.latest_model_file_name}",
+                f"{self.save_path}/{step_model_file_name}",
+            )
 
         if self.track_wandb:
             if wandb is None:
@@ -974,7 +1016,8 @@ class RePPO_DIME:
             model.actor_state = checkpoint["actor"]
             model.target_actor_state = checkpoint["target_actor"]
             model.critic_state = checkpoint["critic"]
-            model.observation_normalizer_state = model.migrate_observation_normalizer(checkpoint["observation_normalizer"])
+            model.observation_normalizer_state = model.migrate_observation_normalizer(
+                checkpoint["observation_normalizer"])
         finally:
             shutil.rmtree(checkpoint_dir)
         return model
@@ -985,7 +1028,8 @@ class RePPO_DIME:
         @jax.jit
         def rollout(env_state, key):
             key, action_key = jax.random.split(key)
-            observation = self.normalize_observation(env_state.next_observation, self.observation_normalizer_state, "policy")
+            observation = self.normalize_observation(env_state.next_observation, self.observation_normalizer_state,
+                                                     "policy")
             action = self.select_eval_action(self.actor_state.params, observation, action_key)
             action = self.clip_action(action)
             env_state = self.eval_env.step(env_state, action)

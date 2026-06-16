@@ -1,7 +1,8 @@
 program: experiments/experiment.py
-name: avoiding-2D-multimodality-delta-progress-reppo_pis-horizon-sweep
-entity: rubendhanaraju-university-of-porto
-project: rlx-multimodality
+name: &sweep_name avoiding-2D-multimodality-delta-progress-truDI-horizon-sweep
+entity: &sweep_entity rubendhanaraju-university-of-porto
+project: &sweep_project rlx-multimodality-truDI
+notes: &sweep_notes "Change noise schedule of TruDI, entropy target as well and sweep for only some hyperparams."
 method: grid
 
 metric:
@@ -12,16 +13,16 @@ parameters:
   algorithm.name:
     values:
       # - reppo.flax_full_jit
-      # - reppo_dime.flax_full_jit
-      - reppo_pis.flax_full_jit
+      - reppo_dime.flax_full_jit
+      # - reppo_pis.flax_full_jit
   algorithm.ent_start:
-    values: [0.1]
+    values: [1.0, 3.0]
   algorithm.ent_target_mult:
     values: [1.0]
   algorithm.lmbda:
     values: [0.25, 0.5, 0.95]
   algorithm.nr_steps:
-    values: [32, 64]
+    values: [128]
 
 command:
   - conda
@@ -37,7 +38,11 @@ command:
 
     program = sys.argv[1]
     args_json_file = sys.argv[2]
-    fixed_args = sys.argv[3:]
+    sweep_name = sys.argv[3]
+    sweep_entity = sys.argv[4]
+    sweep_project = sys.argv[5]
+    sweep_notes = sys.argv[6]
+    fixed_args = sys.argv[7:]
 
     with open(args_json_file) as f:
         sweep_args = json.load(f)
@@ -56,20 +61,26 @@ command:
         f"-nr_steps{fmt(sweep_args['algorithm.nr_steps'])}"
     )
     sweep_cli_args = [f"--{key}={value}" for key, value in sweep_args.items()]
-    command = [sys.executable, program, f"--runner.run_name={run_name}", *fixed_args, *sweep_cli_args]
+    sweep_runner_args = [
+        f"--runner.wandb_entity={sweep_entity}",
+        f"--runner.project_name={sweep_project}",
+        f"--runner.exp_name={sweep_name}",
+        f"--runner.notes={sweep_notes}",
+    ]
+    command = [sys.executable, program, f"--runner.run_name={run_name}", *sweep_runner_args, *fixed_args, *sweep_cli_args]
     os.execv(sys.executable, command)
   - ${program}
   - ${args_json_file}
+  - *sweep_name
+  - *sweep_entity
+  - *sweep_project
+  - *sweep_notes
   - --environment.name=custom_jax.avoiding_2d
   - --runner.track_console=False
   - --runner.save_model=True
   - --algorithm.evaluation_and_save_frequency=524288
   - --environment.render=False
   - --runner.track_wandb=True
-  - --runner.wandb_entity=rubendhanaraju-university-of-porto
-  - --runner.project_name=rlx-multimodality
-  - --runner.exp_name=avoiding-2D-multimodality-delta-progress-reppo_pis-horizon-sweep
-  - --runner.notes="Before, we had some bad values for the V function."
   - --environment.obstacle_layer_1_enabled=False
   - --environment.obstacle_layer_2_enabled=True
   - --environment.obstacle_layer_3_enabled=True
@@ -83,3 +94,4 @@ command:
   - --algorithm.gamma=1.0
   - --algorithm.v_min=-50
   - --algorithm.v_max=10.0
+  - --algorithm.diffusion_init_std=1.0

@@ -4,7 +4,7 @@ Paper-style benchmark for explicit GMM learning with GMM-constrained BMS.
 
 Compares:
   - our_gmm: corrected Brownian-bridge/SI direct-GMM BMS
-  - our_gmm_iw: same, with endpoint self-normalized importance weights
+  - our_gmm_iw: importance-weighted endpoint projection baseline (not the plain BMS fixed-point update)
   - pure_bms: regular BMS sampler endpoint samples
   - bms_posthoc_kmeans: train BMS, fit diagonal GMM to BMS samples with kmeans++ EM
   - bms_posthoc_ourinit: train BMS, fit diagonal GMM to BMS samples initialized from our GMM init
@@ -41,7 +41,7 @@ Example high-dimensional run:
   python gmm_bms_paper_experiments.py \
     --dims 16,32,64,100 \
     --seeds 0,1,2 \
-    --methods bms_posthoc_kmeans,bms_posthoc_ourinit,our_gmm,our_gmm_iw,oracle_em \
+    --methods bms_posthoc_kmeans,bms_posthoc_ourinit,our_gmm,oracle_em \
     --target_modes 20 --mode_scale 20 --target_var 1.0 \
     --gmm_components 32 \
     --steps 50000 --our_steps 50000 \
@@ -82,6 +82,11 @@ def parse_method_list(s: str):
 
 def ensure_dir(p):
     Path(p).mkdir(parents=True, exist_ok=True)
+
+
+def freeze_pytree(tree):
+    """Snapshot a PyTree for an outer BMS iterate and block accidental gradients."""
+    return jax.tree_util.tree_map(lambda z: jax.lax.stop_gradient(z), tree)
 
 
 def write_csv(path, rows):
@@ -211,11 +216,21 @@ def target_score_jax(x, weights, means, vars_):
 
 
 def mode_histogram(samples, target):
-    centers = np.asarray(target['means'], dtype=np.float64)
+    """Assign samples to target GMM components by posterior component density.
+
+    For equal spherical target components this is equivalent to nearest-mean
+    assignment.  For unequal weights or variances, nearest-mean assignment can
+    report the wrong mode proportions, so use argmax_k pi_k N(x | mu_k, D_k).
+    """
     samples = np.asarray(samples, dtype=np.float64)
-    d2 = np.sum((samples[:, None, :] - centers[None, :, :])**2, axis=-1)
-    assign = np.argmin(d2, axis=1)
-    hist = np.bincount(assign, minlength=centers.shape[0]).astype(np.float64)
+    weights = np.asarray(target['weights'], dtype=np.float64)
+    means = np.asarray(target['means'], dtype=np.float64)
+    vars_ = np.asarray(target['vars'], dtype=np.float64)
+    diff = samples[:, None, :] - means[None, :, :]
+    log_comp = (np.log(weights[None, :] + 1e-300) -
+                0.5 * np.sum(np.log(2.0 * np.pi * vars_)[None, :, :] + diff**2 / vars_[None, :, :], axis=-1))
+    assign = np.argmax(log_comp, axis=1)
+    hist = np.bincount(assign, minlength=means.shape[0]).astype(np.float64)
     return hist / max(hist.sum(), 1.0)
 
 
@@ -477,7 +492,13 @@ def simulate_sde(apply_fn, params, x0, key, sigma: float, n_steps: int, state_cl
     return xT
 
 
-def refresh_endpoint_buffer(state, key, args, dim: int, buffer_size: int):
+def refresh_endpoint_buffer_from_params(apply_fn, params, key, args, dim: int, buffer_size: int):
+    """Draw endpoints from a specified, frozen BMS control.
+
+    This is used by the neural BMS baseline.  During one outer iteration, the
+    endpoint buffer and damping reference must both correspond to the same
+    frozen parameter PyTree ref_params.
+    """
     out = []
     n_done = 0
     key_loop = key
@@ -485,8 +506,7 @@ def refresh_endpoint_buffer(state, key, args, dim: int, buffer_size: int):
         n = min(args.sample_batch, buffer_size - n_done)
         key_loop, key_x0, key_sde = jax.random.split(key_loop, 3)
         x0 = args.prior_std * jax.random.normal(key_x0, (n, dim), dtype=jnp.float32)
-        xT = simulate_sde(state.apply_fn, state.params, x0, key_sde, args.sigma, args.sde_steps, args.state_clip,
-                          args.control_clip)
+        xT = simulate_sde(apply_fn, params, x0, key_sde, args.sigma, args.sde_steps, args.state_clip, args.control_clip)
         out.append(np.asarray(jax.device_get(xT)))
         n_done += n
     arr = np.concatenate(out, axis=0).astype(np.float32)
@@ -499,6 +519,11 @@ def refresh_endpoint_buffer(state, key, args, dim: int, buffer_size: int):
             reps = int(np.ceil(buffer_size / arr.shape[0]))
             arr = np.tile(arr, (reps, 1))[:buffer_size]
     return jnp.asarray(arr[:buffer_size])
+
+
+def refresh_endpoint_buffer(state, key, args, dim: int, buffer_size: int):
+    """Draw endpoints from the state's current control; used for final evaluation."""
+    return refresh_endpoint_buffer_from_params(state.apply_fn, state.params, key, args, dim, buffer_size)
 
 
 def sample_brownian_bridge(x0, xT, t, key, sigma: float):
@@ -572,17 +597,24 @@ def train_pure_bms(args, key, target, dim):
     variables = model.init(key_init, dummy_x, dummy_t)
     tx = optax.chain(optax.clip_by_global_norm(args.grad_clip), optax.adamw(args.lr, weight_decay=args.weight_decay))
     state = train_state.TrainState.create(apply_fn=model.apply, params=variables['params'], tx=tx)
-    ref_params = state.params
-    endpoint_buffer = refresh_endpoint_buffer(state, key_buf, args, dim, args.buffer_size)
+    ref_params = freeze_pytree(state.params)
+    endpoint_buffer = None
     start = time.time()
     last_metrics = None
     for step in range(1, args.steps + 1):
         key_train, subkey = jax.random.split(key_train)
-        if (step - 1) % args.outer_every == 0:
-            ref_params = jax.tree_util.tree_map(lambda z: z, state.params)
-        if step == 1 or (step - 1) % args.refresh_every == 0:
+        new_outer_iter = (step == 1) or ((step - 1) % args.outer_every == 0)
+        if new_outer_iter:
+            ref_params = freeze_pytree(state.params)
+
+        # The bridge endpoint buffer must be generated from the same frozen
+        # iterate ref_params used in u_ref.  Refresh on every outer-iteration
+        # boundary, plus any extra user-requested refresh cadence.
+        refresh_buffer = new_outer_iter or (args.refresh_every > 0 and ((step - 1) % args.refresh_every == 0))
+        if refresh_buffer:
             key_train, key_refresh = jax.random.split(key_train)
-            endpoint_buffer = refresh_endpoint_buffer(state, key_refresh, args, dim, args.buffer_size)
+            endpoint_buffer = refresh_endpoint_buffer_from_params(state.apply_fn, ref_params, key_refresh, args, dim,
+                                                                  args.buffer_size)
         state, metrics = train_step_bms(state, ref_params, endpoint_buffer, subkey, args.batch_size, args.sigma,
                                         args.prior_std, args.eta, args.t_eps, args.xi_clip, weights, means, vars_)
         last_metrics = metrics
@@ -600,7 +632,14 @@ def train_pure_bms(args, key, target, dim):
 
 
 def positive_terminal_vars(raw_logvars: jnp.ndarray, var_floor: float) -> jnp.ndarray:
-    return var_floor + jnp.exp(jnp.clip(raw_logvars, -7.0, 4.0))
+    """Map unconstrained parameters to strictly positive diagonal variances.
+
+    The original exp(clip(.)) map is numerically safe, but it creates zero
+    gradients once a variance parameter leaves the clipping interval.  Softplus
+    preserves useful gradients while still enforcing positivity.  The argument
+    name is kept for backward compatibility with the rest of the script.
+    """
+    return var_floor + jax.nn.softplus(raw_logvars) + 1e-8
 
 
 def terminal_params_from_flax_params(params, var_floor: float):
@@ -695,7 +734,9 @@ class DirectGMMPath(nn.Module):
             del key
             init_var_minus_floor = jnp.maximum(jnp.asarray(self.init_terminal_std**2 - self.var_floor, dtype=dtype),
                                                jnp.asarray(1e-6, dtype=dtype))
-            return jnp.full(shape, jnp.log(init_var_minus_floor), dtype=dtype)
+            safe_y = jnp.minimum(init_var_minus_floor, jnp.asarray(20.0, dtype=dtype))
+            raw = jnp.where(init_var_minus_floor > 20.0, init_var_minus_floor, jnp.log(jnp.expm1(safe_y)))
+            return jnp.full(shape, raw, dtype=dtype)
 
         raw_logvars_T = self.param('raw_logvars_T', raw_logvar_init, (self.k, self.dim))
         return gmm_path_control_from_raw(logits, means_T, raw_logvars_T, x, t, sigma, self.var_floor, self.prior_var)
@@ -722,8 +763,11 @@ def train_step_our_gmm(state, ref_params, key, batch_size: int, sigma: float, pr
     u_ref = jax.lax.stop_gradient(u_ref)
 
     if use_importance_weights:
-        # Importance weights must use the proposal that actually generated xT,
-        # namely the frozen reference endpoint law q_{bar phi,1}.
+        # Diagnostic / ablation only: this is not the standard BMS fixed-point
+        # update.  It approximates an endpoint-reweighted ideal objective by
+        # self-normalized importance sampling.  The proposal must be the law
+        # that actually generated xT, namely the frozen reference endpoint law
+        # q_{bar phi,1}.
         log_q = terminal_gmm_log_prob_jax(ref_params, xT, var_floor)
         log_w = target_log_prob_jax(xT, weights, means, vars_) - log_q
         log_w = jax.lax.stop_gradient(log_w)
@@ -745,6 +789,9 @@ def train_step_our_gmm(state, ref_params, key, batch_size: int, sigma: float, pr
         damping = jnp.sum(sample_weights * per_damp)
         logits, means_T, vars_T = terminal_params_from_flax_params(params, var_floor)
         pi = jax.nn.softmax(logits)
+        # Optional numerical regularizers. With the fixed defaults
+        # entropy_coef=var_reg=0, this is exactly the damped
+        # GMM-constrained BMS regression objective.
         entropy_loss = entropy_coef * jnp.sum(pi * jnp.log(pi + 1e-8))
         var_loss = var_reg * jnp.mean(jnp.log(vars_T)**2)
         loss = drift_mse + damping + entropy_loss + var_loss
@@ -808,13 +855,13 @@ def train_our_gmm(args, key, target, dim, use_importance_weights=False):
     tx = optax.chain(optax.clip_by_global_norm(args.our_grad_clip),
                      optax.adamw(args.our_lr, weight_decay=args.weight_decay))
     state = train_state.TrainState.create(apply_fn=model.apply, params=variables['params'], tx=tx)
-    ref_params = state.params
+    ref_params = freeze_pytree(state.params)
     start = time.time()
     last_metrics = None
     for step in range(1, args.our_steps + 1):
         key_train, subkey = jax.random.split(key_train)
         if (step - 1) % args.outer_every == 0:
-            ref_params = jax.tree_util.tree_map(lambda z: z, state.params)
+            ref_params = freeze_pytree(state.params)
         state, metrics = train_step_our_gmm(state, ref_params, subkey, args.our_batch_size, args.our_sigma,
                                             args.our_prior_var, args.our_eta, args.our_t_eps, args.our_xi_clip,
                                             args.our_var_floor, args.our_entropy_coef, args.our_var_reg,
@@ -910,6 +957,10 @@ def run_one(args, dim: int, seed: int, methods):
         if m == 'our_gmm' or m == 'our_gmm_iw':
             use_iw = (m == 'our_gmm_iw')
             print(f'=== Training {m} dim={dim} seed={seed} ===')
+            if use_iw:
+                print(
+                    '[note] our_gmm_iw is not the plain practical BMS fixed-point update; it is an endpoint self-normalized importance-weighted ablation.'
+                )
             offset = 777 if use_iw else 0
             state, train_time, _ = train_our_gmm(args,
                                                  jax.random.fold_in(key_our, offset),
@@ -1056,6 +1107,8 @@ def base_row(args, method, dim, seed, importance_weights, em_init):
         'eval_samples': args.eval_samples,
         'sigma': args.sigma,
         'our_sigma': args.our_sigma,
+        'prior_std': args.prior_std,
+        'our_prior_var': args.our_prior_var,
         'eta': args.eta,
         'our_eta': args.our_eta,
     }
@@ -1076,7 +1129,7 @@ def parse_args():
         type=str,
         default='pure_bms,bms_posthoc_kmeans,bms_posthoc_ourinit,our_gmm,oracle_em',
         help=
-        'Comma-separated methods: pure_bms,bms_posthoc_kmeans,bms_posthoc_ourinit,our_gmm,our_gmm_iw,oracle_em,weighted_em_broad'
+        'Comma-separated methods: pure_bms,bms_posthoc_kmeans,bms_posthoc_ourinit,our_gmm,oracle_em,weighted_em_broad. our_gmm_iw is accepted only as a non-strict endpoint-IW diagnostic.'
     )
     p.add_argument('--save_plots', action='store_true')
     p.add_argument('--verbose', action='store_true')
@@ -1117,7 +1170,13 @@ def parse_args():
     p.add_argument('--our_batch_size', type=int, default=4096)
     p.add_argument('--our_lr', type=float, default=1e-3)
     p.add_argument('--our_sigma', type=float, default=1.0)
-    p.add_argument('--our_prior_var', type=float, default=1.0)
+    p.add_argument(
+        '--our_prior_var',
+        type=float,
+        default=None,
+        help=
+        'Prior variance v0 for direct-GMM BMS. If omitted, uses --prior_std**2 for apples-to-apples comparison with pure_bms.'
+    )
     p.add_argument('--our_t_eps', type=float, default=2e-2)
     p.add_argument('--our_xi_clip', type=float, default=1e12)
     p.add_argument('--our_grad_clip', type=float, default=10.0)
@@ -1125,8 +1184,14 @@ def parse_args():
     p.add_argument('--our_init_mean_scale', type=float, default=12.0)
     p.add_argument('--our_init_terminal_std', type=float, default=2.5)
     p.add_argument('--our_var_floor', type=float, default=1e-3)
-    p.add_argument('--our_entropy_coef', type=float, default=1e-3)
-    p.add_argument('--our_var_reg', type=float, default=1e-4)
+    p.add_argument('--our_entropy_coef',
+                   type=float,
+                   default=0.0,
+                   help='Optional mixture-entropy regularizer. 0.0 gives the exact GMM-BMS objective.')
+    p.add_argument('--our_var_reg',
+                   type=float,
+                   default=0.0,
+                   help='Optional log-variance regularizer. 0.0 gives the exact GMM-BMS objective.')
     p.add_argument('--our_max_log_weight_span', type=float, default=20.0)
 
     # EM / eval
@@ -1143,14 +1208,41 @@ def parse_args():
     p.add_argument('--plot_samples', type=int, default=30000)
     p.add_argument('--plot_lim', type=float, default=25.0)
     p.add_argument('--grid_n', type=int, default=300)
-    return p.parse_args()
+    args = p.parse_args()
+    if args.our_prior_var is None:
+        args.our_prior_var = float(args.prior_std**2)
+    if args.our_entropy_coef != 0.0 or args.our_var_reg != 0.0:
+        print(
+            '[warning] Nonzero --our_entropy_coef or --our_var_reg makes our_gmm a regularized heuristic, not the exact damped BMS objective.'
+        )
+    return args
+
+
+def validate_methods(methods):
+    valid = {
+        'pure_bms',
+        'bms_posthoc_kmeans',
+        'bms_posthoc_ourinit',
+        'our_gmm',
+        'our_gmm_iw',  # non-strict diagnostic; not the exact BMS fixed-point
+        'oracle_em',
+        'weighted_em_broad',
+    }
+    bad = sorted(set(methods) - valid)
+    if bad:
+        raise ValueError(f'Unknown method(s): {bad}. Valid methods are: {sorted(valid)}')
 
 
 def main():
     args = parse_args()
+    if args.outer_every <= 0:
+        raise ValueError('--outer_every must be positive')
+    if args.refresh_every < 0:
+        raise ValueError('--refresh_every must be nonnegative')
     dims = parse_int_list(args.dims)
     seeds = parse_int_list(args.seeds)
     methods = parse_method_list(args.methods)
+    validate_methods(methods)
     ensure_dir(args.out_dir)
     with open(Path(args.out_dir) / 'config.json', 'w') as f:
         json.dump(vars(args), f, indent=2)
