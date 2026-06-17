@@ -8,7 +8,8 @@ from rl_x.environments.custom_jax.avoiding_2d.box_space import BoxSpace
 from rl_x.environments.custom_jax.avoiding_2d.reward_functions.handler import get_reward_function
 from rl_x.environments.custom_jax.avoiding_2d.state import State
 
-INIT_XY = jnp.array([0.5, -0.28], dtype=jnp.float32)
+#INIT_XY = jnp.array([0.5, -0.28], dtype=jnp.float32)
+INIT_XY = jnp.array([0.5, 0.0], dtype=jnp.float32)
 CENTER_X = 0.5
 VIEW_X_MIN = 0.2
 VIEW_X_MAX = 0.8
