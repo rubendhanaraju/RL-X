@@ -103,9 +103,8 @@ def get_config(environment_name):
             "feet_clearance_height": 0.10,
             "reference_hip_pitch_amplitude": 0.25,
             "yaw_velocity_max": 1.5,
-            # True means the feet-distance term is the formula as printed in the
-            # supplement. Set False only if you choose to treat it as a penalty.
-            "literal_feet_distance_formula": True,
+            # Treat foot-spacing deviation as a penalty around nominal stance.
+            "literal_feet_distance_formula": False,
         },
         "termination": {
             "height_percentage_threshold": 0.8,
