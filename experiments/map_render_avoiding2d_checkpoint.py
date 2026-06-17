@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -48,6 +49,14 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--seed", type=int, default=0)
     render.add_argument("--output-filename", default="trajectories.png")
     render.add_argument("--npz-filename", default="trajectories.npz")
+
+    cleanup = parser.add_argument_group("Checkpoint cleanup")
+    cleanup.add_argument(
+        "--delete-downloaded-checkpoint",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Delete the downloaded checkpoint model after the render/config step finishes.",
+    )
     return parser
 
 
@@ -220,6 +229,74 @@ def skipped_existing_run_result(run, sweep, output_dir, marker, reason, duration
     }
 
 
+def cleanup_downloaded_checkpoint(checkpoint_path: Path, output_dir: Path) -> dict:
+    download_root = output_dir / "checkpoint"
+    result: dict = {
+        "path": str(checkpoint_path),
+        "root": str(download_root),
+        "removed": False,
+        "empty_dirs_removed": [],
+    }
+
+    resolved_root = download_root.resolve()
+    resolved_path = checkpoint_path.resolve()
+    try:
+        resolved_path.relative_to(resolved_root)
+    except ValueError:
+        result["reason"] = "refusing to remove a path outside the checkpoint download root"
+        return result
+
+    if not resolved_path.exists():
+        result["reason"] = "already absent"
+        return result
+
+    try:
+        if resolved_path.is_dir() and not resolved_path.is_symlink():
+            shutil.rmtree(resolved_path)
+        else:
+            resolved_path.unlink()
+    except OSError as error:
+        result["reason"] = str(error)
+        return result
+    result["removed"] = True
+
+    parent = resolved_path.parent
+    while parent != resolved_root:
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        result["empty_dirs_removed"].append(str(parent))
+        parent = parent.parent
+
+    try:
+        resolved_root.rmdir()
+    except OSError:
+        pass
+    else:
+        result["empty_dirs_removed"].append(str(resolved_root))
+
+    return result
+
+
+def cleanup_prepared_checkpoint(args: argparse.Namespace, prepared, progress: ProgressLogger) -> None:
+    if args.delete_downloaded_checkpoint:
+        cleanup = cleanup_downloaded_checkpoint(prepared.checkpoint_path, prepared.output_dir)
+        prepared.result["checkpoint_cleanup"] = cleanup
+        if cleanup.get("removed"):
+            progress.log(f"checkpoint cleanup: removed downloaded model -> {prepared.checkpoint_path}")
+        else:
+            progress.log(f"checkpoint cleanup: did not remove downloaded model ({cleanup.get('reason')})")
+        return
+
+    prepared.result["checkpoint_cleanup"] = {
+        "path": str(prepared.checkpoint_path),
+        "root": str(prepared.output_dir / "checkpoint"),
+        "removed": False,
+        "reason": "checkpoint deletion disabled",
+    }
+
+
 def make_map_fn(args: argparse.Namespace):
     state = {"count": 0}
 
@@ -256,17 +333,19 @@ def make_map_fn(args: argparse.Namespace):
                 output_dir=output_dir,
                 preexisting_run_id=preexisting_run_id,
             )
-            if args.config_only:
-                progress.log(f"run {label}: config-only mode; skipping render")
+            try:
+                if args.config_only:
+                    progress.log(f"run {label}: config-only mode; skipping render")
+                    return prepared.result
+
+                prepared.result["render"] = render_run(args, prepared, progress)
+                return prepared.result
+            finally:
+                cleanup_prepared_checkpoint(args, prepared, progress)
                 prepared.result["duration_seconds"] = time.perf_counter() - started
                 write_json(prepared.output_dir / "render_result.json", prepared.result)
-                return prepared.result
-
-            prepared.result["render"] = render_run(args, prepared, progress)
-            prepared.result["duration_seconds"] = time.perf_counter() - started
-            write_json(prepared.output_dir / "render_result.json", prepared.result)
-            progress.log(f"run {label}: completed in {format_duration(prepared.result['duration_seconds'])}")
-            return prepared.result
+                if "render" in prepared.result or args.config_only:
+                    progress.log(f"run {label}: completed in {format_duration(prepared.result['duration_seconds'])}")
         except Exception as error:
             progress.log(f"run {label}: failed after {format_duration(time.perf_counter() - started)}: {error}")
             raise
