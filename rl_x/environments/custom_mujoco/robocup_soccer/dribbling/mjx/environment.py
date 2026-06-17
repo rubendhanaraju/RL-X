@@ -177,6 +177,37 @@ class DribbleMasterEnv:
 
         del self.c_model, self.c_data
 
+    def _empty_info(self):
+        reward_terms = (
+            "base_orientation",
+            "feet_orientation",
+            "feet_distance",
+            "feet_clearance",
+            "termination",
+            "reference_joint_position",
+            "symmetric_action",
+            "joint_torque",
+            "joint_speed",
+            "action_smoothness",
+            "active_sensing",
+            "chasing",
+            "projected_ball_velocity",
+            "yaw_alignment",
+            "yaw_alignment_no_ball",
+        )
+        info = {
+            "rollout/episode_return": jnp.array(0.0),
+            "rollout/episode_length": jnp.array(0, dtype=jnp.int32),
+            "env_info/ball_distance_to_com": jnp.array(0.0),
+            "env_info/ball_velocity_tracking_error": jnp.array(0.0),
+            "env_info/ball_speed": jnp.array(0.0),
+            "env_info/ball_visible": jnp.array(0.0),
+        }
+        for name in reward_terms:
+            info[f"reward_raw/{name}"] = jnp.array(0.0)
+            info[f"reward/{name}"] = jnp.array(0.0)
+        return info
+
     # ---------------------------------------------------------------------
     # XML / model setup helpers
     # ---------------------------------------------------------------------
@@ -459,14 +490,11 @@ class DribbleMasterEnv:
         }
         self.command_function.init(internal_state)
         self.reward_function.init(internal_state, self.initial_mjx_model)
-        info = {
-            "rollout/episode_return": reward,
-            "rollout/episode_length": 0,
-        }
+        info = self._empty_info()
         info_episode_store = {
-            "episode_return": reward,
-            "episode_step": 0,
-            "episode_total_ball_velocity_tracking_error": 0.0,
+            "episode_return": jnp.array(0.0),
+            "episode_step": jnp.array(0, dtype=jnp.int32),
+            "episode_total_ball_velocity_tracking_error": jnp.array(0.0),
         }
         state = State(
             self.initial_mjx_model,
@@ -512,9 +540,9 @@ class DribbleMasterEnv:
         self.command_function.update(internal_state, command_key, force=True)
         next_observation = self.get_observation(data, mjx_model, internal_state, obs_key, jnp.zeros(self.nr_actuator_joints))
         info_episode_store = {
-            "episode_return": 0.0,
-            "episode_step": 0,
-            "episode_total_ball_velocity_tracking_error": 0.0,
+            "episode_return": jnp.array(0.0),
+            "episode_step": jnp.array(0, dtype=jnp.int32),
+            "episode_total_ball_velocity_tracking_error": jnp.array(0.0),
         }
         return state.replace(
             mjx_model=mjx_model,
@@ -681,6 +709,7 @@ class DribbleMasterEnv:
     # ---------------------------------------------------------------------
 
     def render(self, state):
+        env_id = 0
         mjx_model = state.mjx_model
         mj_model = self.viewer.model
         for field in mjx.Model.fields():
@@ -688,15 +717,17 @@ class DribbleMasterEnv:
                 field_name = field.name
                 if field.name in ["mesh_conver", "dof_hasfrictionloss", "tendon_hasfrictionloss", "_sizes"]:
                     continue
-                if field_name in "geom_rbound_hfield":
+                if field_name == "geom_rbound_hfield":
                     field_name = "geom_rbound"
                 mjx_value = getattr(mjx_model, field_name)
                 mj_value = getattr(mj_model, field_name)
                 if mjx_value.shape != mj_value.shape:
-                    mjx_value = mjx_value.reshape(mj_value.shape)
+                    if len(mjx_value.shape) > 0 and mjx_value.shape[0] == self.nr_envs and mjx_value.shape[1:] == mj_value.shape:
+                        mjx_value = mjx_value[env_id]
+                    else:
+                        mjx_value = mjx_value.reshape(mj_value.shape)
                 setattr(mj_model, field_name, mjx_value)
 
-        env_id = 0
         data = mjx.get_data(mj_model, state.data)[env_id]
         data.light_xdir = self.light_xdir
         data.light_xpos = self.light_xpos

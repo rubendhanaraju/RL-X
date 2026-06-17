@@ -105,7 +105,7 @@ class PPO:
         )
 
         if self.save_model:
-            os.makedirs(self.save_path)
+            os.makedirs(self.save_path, exist_ok=True)
             self.latest_model_file_name = "latest.model"
             self.latest_model_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
 
@@ -382,12 +382,15 @@ class PPO:
             "critic": critic_state
         }
         save_args = orbax_utils.save_args_from_target(checkpoint)
-        self.latest_model_checkpointer.save(f"{self.save_path}/tmp", checkpoint, save_args=save_args)
-        with open(f"{self.save_path}/tmp/config_algorithm.json", "w") as f:
+        tmp_save_path = f"{self.save_path}/tmp"
+        if os.path.exists(tmp_save_path):
+            shutil.rmtree(tmp_save_path)
+        self.latest_model_checkpointer.save(tmp_save_path, checkpoint, save_args=save_args)
+        with open(f"{tmp_save_path}/config_algorithm.json", "w") as f:
             json.dump(self.config.algorithm.to_dict(), f)
-        shutil.make_archive(f"{self.save_path}/{self.latest_model_file_name}", "zip", f"{self.save_path}/tmp")
-        os.rename(f"{self.save_path}/{self.latest_model_file_name}.zip", f"{self.save_path}/{self.latest_model_file_name}")
-        shutil.rmtree(f"{self.save_path}/tmp")
+        shutil.make_archive(f"{self.save_path}/{self.latest_model_file_name}", "zip", tmp_save_path)
+        os.replace(f"{self.save_path}/{self.latest_model_file_name}.zip", f"{self.save_path}/{self.latest_model_file_name}")
+        shutil.rmtree(tmp_save_path)
 
         if self.track_wandb:
             wandb.save(f"{self.save_path}/{self.latest_model_file_name}", base_path=self.save_path)
