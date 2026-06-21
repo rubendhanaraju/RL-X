@@ -515,7 +515,7 @@ class MessiDribblingEnv:
         qpos, qvel = self.initial_state_function.setup(mjx_model, state.internal_state, initial_state_key)
         qpos, qvel = self.sample_ball_reset(qpos, qvel, state.internal_state, ball_reset_key)
         data = data.replace(qpos=qpos, qvel=qvel, ctrl=jnp.zeros(self.nr_actuator_joints))
-        # data = mjx.forward(self.initial_mjx_model, data)
+        data = mjx.forward(mjx_model, data)
 
         new_state = state
 
