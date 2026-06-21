@@ -68,7 +68,7 @@ def get_config(environment_name):
             "gait_period_randomization_width": 0.1,
         },
         "env_curriculum_nr_levels": 100,
-        "env_curriculum_level_success_episode_return": 20.0,
+        "env_curriculum_level_success_episode_return": 10.0,
         "domain_randomization": {
             "sampling_type": "step_probability_and_reset",
             "action_delay": {
