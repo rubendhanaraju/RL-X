@@ -25,6 +25,8 @@ def get_config(environment_name):
         "stages": {
             "stage_1": {
                 "ball_spawn_radius": 10.0,
+                "ball_spawn_radius_min": 1.0,
+                "curriculum_ball_spawn_radius": True,
                 "spawn_in_vision": True,
                 "spawn_half_angle_degrees": 45.0,
                 "env_curriculum_initial_coeff": 0.0,
@@ -38,6 +40,8 @@ def get_config(environment_name):
             },
             "stage_2": {
                 "ball_spawn_radius": 2.0,
+                "ball_spawn_radius_min": 2.0,
+                "curriculum_ball_spawn_radius": False,
                 "spawn_in_vision": True,
                 "spawn_half_angle_degrees": 45.0,
                 "env_curriculum_initial_coeff": 1.0,

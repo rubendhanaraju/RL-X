@@ -80,6 +80,8 @@ class MessiDribblingEnv(gym.Env):
         self.ball_qveladr = self.initial_mj_model.jnt_dofadr[self.ball_joint_id]
         self.ball_radius = float(self.initial_mj_model.geom_size[self.ball_geom_id, 0])
         self.ball_spawn_radius = float(self.stage_config["ball_spawn_radius"])
+        self.ball_spawn_radius_min = float(self.stage_config.get("ball_spawn_radius_min", self.ball_spawn_radius))
+        self.curriculum_ball_spawn_radius = bool(self.stage_config.get("curriculum_ball_spawn_radius", False))
         self.camera_site_name = env_config["sensing"]["camera_site_name"]
         self.ball_site_name = env_config["sensing"]["ball_site_name"]
         self.camera_site_id = mujoco.mj_name2id(self.initial_mj_model, mujoco.mjtObj.mjOBJ_SITE, self.camera_site_name)
@@ -305,12 +307,17 @@ class MessiDribblingEnv(gym.Env):
 
 
     def sample_ball_reset(self, qpos, qvel):
+        if self.curriculum_ball_spawn_radius:
+            ball_spawn_radius = self.ball_spawn_radius_min + self.internal_state["env_curriculum_coeff"] * (self.ball_spawn_radius - self.ball_spawn_radius_min)
+        else:
+            ball_spawn_radius = self.ball_spawn_radius
+
         if self.spawn_ball_in_vision:
             relative_angle = self.np_rng.uniform(low=-self.ball_spawn_half_angle, high=self.ball_spawn_half_angle)
             angle = self.root_yaw_from_qpos(qpos) + relative_angle
         else:
             angle = self.np_rng.uniform(low=-np.pi, high=np.pi)
-        ball_xy = qpos[:2] + self.ball_spawn_radius * np.array([np.cos(angle), np.sin(angle)])
+        ball_xy = qpos[:2] + ball_spawn_radius * np.array([np.cos(angle), np.sin(angle)])
         ball_z = self.terrain_function.ground_height_at(ball_xy[0], ball_xy[1]) + self.ball_radius
         ball_qpos = np.array([ball_xy[0], ball_xy[1], ball_z, 1.0, 0.0, 0.0, 0.0])
 
@@ -444,16 +451,6 @@ class MessiDribblingEnv(gym.Env):
 
 
     def reset(self, seed=None):
-        self.terrain_function.sample()
-
-        qpos, qvel = self.initial_state_function.setup()
-        qpos, qvel = self.sample_ball_reset(qpos, qvel)
-        self.internal_state["data"] = mujoco.MjData(self.internal_state["mj_model"])
-        self.internal_state["data"].qpos = qpos
-        self.internal_state["data"].qvel = qvel
-        self.internal_state["data"].ctrl = np.zeros(self.nr_actuator_joints)
-        mujoco.mj_forward(self.internal_state["mj_model"], self.internal_state["data"])
-
         if self.update_env_curriculum:
             episode_success = self.internal_state["info_episode_store"]["episode_return"] >= self.env_curriculum_level_success_episode_return
             self.internal_state["env_curriculum_levels_in_a_row"] = np.where(episode_success,
@@ -470,6 +467,16 @@ class MessiDribblingEnv(gym.Env):
         else:
             self.internal_state["env_curriculum_levels_in_a_row"] = 0.0
         self.internal_state["env_curriculum_coeff"] = np.where(self.internal_state["in_eval_mode"], 1.0, self.internal_state["env_curriculum_coeff"])
+
+        self.terrain_function.sample()
+
+        qpos, qvel = self.initial_state_function.setup()
+        qpos, qvel = self.sample_ball_reset(qpos, qvel)
+        self.internal_state["data"] = mujoco.MjData(self.internal_state["mj_model"])
+        self.internal_state["data"].qpos = qpos
+        self.internal_state["data"].qvel = qvel
+        self.internal_state["data"].ctrl = np.zeros(self.nr_actuator_joints)
+        mujoco.mj_forward(self.internal_state["mj_model"], self.internal_state["data"])
         
         self.internal_state["imu_orientation_rotation"] = Rotation.from_matrix(self.internal_state["data"].site_xmat[self.imu_site_id].reshape(3, 3))
         self.internal_state["imu_orientation_rotation_inverse"] = self.internal_state["imu_orientation_rotation"].inv()
@@ -482,6 +489,7 @@ class MessiDribblingEnv(gym.Env):
         self.handle_domain_randomization(is_episode_start=True)
         self.command_function.get_next_command()
         self.update_ball_sensing(reset_timer=True)
+        self.internal_state["info"]["env_curriculum/coefficient"] = self.internal_state["env_curriculum_coeff"]
 
         next_observation = self.get_observation(np.zeros(self.nr_actuator_joints))
         self.internal_state["info_episode_store"] = {

@@ -97,6 +97,8 @@ class MessiDribblingEnv:
         self.ball_qveladr = self.initial_mj_model.jnt_dofadr[self.ball_joint_id]
         self.ball_radius = float(self.initial_mj_model.geom_size[self.ball_geom_id, 0])
         self.ball_spawn_radius = float(self.stage_config["ball_spawn_radius"])
+        self.ball_spawn_radius_min = float(self.stage_config.get("ball_spawn_radius_min", self.ball_spawn_radius))
+        self.curriculum_ball_spawn_radius = bool(self.stage_config.get("curriculum_ball_spawn_radius", False))
         self.camera_site_name = env_config["sensing"]["camera_site_name"]
         self.ball_site_name = env_config["sensing"]["ball_site_name"]
         self.camera_site_id = mujoco.mj_name2id(self.initial_mj_model, mujoco.mjtObj.mjOBJ_SITE, self.camera_site_name)
@@ -273,12 +275,17 @@ class MessiDribblingEnv:
 
 
     def sample_ball_reset(self, qpos, qvel, internal_state, key):
+        if self.curriculum_ball_spawn_radius:
+            ball_spawn_radius = self.ball_spawn_radius_min + internal_state["env_curriculum_coeff"] * (self.ball_spawn_radius - self.ball_spawn_radius_min)
+        else:
+            ball_spawn_radius = self.ball_spawn_radius
+
         if self.spawn_ball_in_vision:
             relative_angle = jax.random.uniform(key, minval=-self.ball_spawn_half_angle, maxval=self.ball_spawn_half_angle)
             angle = self.root_yaw_from_qpos(qpos) + relative_angle
         else:
             angle = jax.random.uniform(key, minval=-jnp.pi, maxval=jnp.pi)
-        ball_xy = qpos[:2] + self.ball_spawn_radius * jnp.array([jnp.cos(angle), jnp.sin(angle)])
+        ball_xy = qpos[:2] + ball_spawn_radius * jnp.array([jnp.cos(angle), jnp.sin(angle)])
         ball_z = self.terrain_function.ground_height_at(internal_state, ball_xy[0], ball_xy[1]) + self.ball_radius
         ball_qpos = jnp.array([ball_xy[0], ball_xy[1], ball_z, 1.0, 0.0, 0.0, 0.0])
 
@@ -509,14 +516,6 @@ class MessiDribblingEnv:
         key, initial_state_key, terrain_key, domain_randomization_key, observation_key, gait_manager_key, ball_reset_key, command_reset_key = jax.random.split(state.key, 8)
         state = state.replace(key=key)
 
-        mjx_model = self.terrain_function.sample(state.mjx_model, state.internal_state, terrain_key)
-
-        data = self.mjx_data
-        qpos, qvel = self.initial_state_function.setup(mjx_model, state.internal_state, initial_state_key)
-        qpos, qvel = self.sample_ball_reset(qpos, qvel, state.internal_state, ball_reset_key)
-        data = data.replace(qpos=qpos, qvel=qvel, ctrl=jnp.zeros(self.nr_actuator_joints))
-        data = mjx.forward(mjx_model, data)
-
         new_state = state
 
         if self.update_env_curriculum:
@@ -536,6 +535,14 @@ class MessiDribblingEnv:
             new_state.internal_state["env_curriculum_levels_in_a_row"] = 0.0
         new_state.internal_state["env_curriculum_coeff"] = jnp.where(new_state.internal_state["in_eval_mode"], 1.0, new_state.internal_state["env_curriculum_coeff"])
 
+        mjx_model = self.terrain_function.sample(new_state.mjx_model, new_state.internal_state, terrain_key)
+
+        data = self.mjx_data
+        qpos, qvel = self.initial_state_function.setup(mjx_model, new_state.internal_state, initial_state_key)
+        qpos, qvel = self.sample_ball_reset(qpos, qvel, new_state.internal_state, ball_reset_key)
+        data = data.replace(qpos=qpos, qvel=qvel, ctrl=jnp.zeros(self.nr_actuator_joints))
+        data = mjx.forward(mjx_model, data)
+
         new_state.internal_state["imu_orientation_rotation"] = Rotation.from_matrix(data.site_xmat[self.imu_site_id].reshape(3, 3))
         new_state.internal_state["imu_orientation_rotation_inverse"] = new_state.internal_state["imu_orientation_rotation"].inv()
         new_state.internal_state["imu_orientation_euler"] = new_state.internal_state["imu_orientation_rotation"].as_euler("xyz")
@@ -547,6 +554,7 @@ class MessiDribblingEnv:
         data, mjx_model = self.handle_domain_randomization(new_state.internal_state, mjx_model, data, domain_randomization_key, is_episode_start=True)
         self.command_function.get_next_command(new_state.internal_state, True, command_reset_key)
         self.update_ball_sensing(data, new_state.internal_state, new_state.info, True)
+        new_state.info["env_curriculum/coefficient"] = new_state.internal_state["env_curriculum_coeff"]
 
         next_observation = self.get_observation(data, mjx_model, new_state.internal_state, observation_key, jnp.zeros(self.nr_actuator_joints))
         reward = 0.0
