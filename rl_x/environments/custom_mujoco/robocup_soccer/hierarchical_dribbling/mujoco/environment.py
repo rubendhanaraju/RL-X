@@ -51,6 +51,20 @@ class HierarchicalDribblingEnv(gym.Env):
         self.add_goal_arrow = env_config["add_goal_arrow"]
         self.nr_envs = nr_envs
         self.residual_action_clip = float(env_config["hierarchical_policy"]["residual_action_clip"])
+        self.delta_command_clip = float(env_config["hierarchical_policy"]["delta_command_clip"])
+        self.nominal_command_ball_velocity_gain = float(env_config["hierarchical_policy"]["nominal_command_ball_velocity_gain"])
+        self.nominal_command_position_gain_x = float(env_config["hierarchical_policy"]["nominal_command_position_gain_x"])
+        self.nominal_command_position_gain_y = float(env_config["hierarchical_policy"]["nominal_command_position_gain_y"])
+        self.nominal_command_yaw_gain = float(env_config["hierarchical_policy"]["nominal_command_yaw_gain"])
+        self.nominal_command_target_ball = np.array([
+            float(env_config["hierarchical_policy"]["nominal_command_target_ball_x"]),
+            float(env_config["hierarchical_policy"]["nominal_command_target_ball_y"]),
+        ], dtype=np.float32)
+        self.nominal_command_max = np.array([
+            float(env_config["hierarchical_policy"]["nominal_command_max_x"]),
+            float(env_config["hierarchical_policy"]["nominal_command_max_y"]),
+            float(env_config["hierarchical_policy"]["nominal_command_max_yaw"]),
+        ], dtype=np.float32)
         self.ball_spawn_radius = float(env_config["ball"]["spawn_radius"])
         self.ball_spawn_half_angle = np.deg2rad(float(env_config["ball"]["spawn_half_angle_degrees"]))
         self.ball_spawn_in_vision = bool(env_config["ball"]["spawn_in_vision"])
@@ -220,8 +234,8 @@ class HierarchicalDribblingEnv(gym.Env):
         self.low_level_action_low = np.array(lower_joint_limit, dtype=np.float32)
         self.low_level_action_high = np.array(upper_joint_limit, dtype=np.float32)
         max_command_velocity = min(self.robot_dimensions_mean * self.command_function.max_velocity_per_m_factor, self.command_function.clip_max_velocity)
-        command_low = -max_command_velocity * np.ones(3, dtype=np.float32)
-        command_high = max_command_velocity * np.ones(3, dtype=np.float32)
+        command_low = -self.delta_command_clip * np.ones(3, dtype=np.float32)
+        command_high = self.delta_command_clip * np.ones(3, dtype=np.float32)
         residual_low = -self.residual_action_clip * np.ones(self.nr_actuator_joints, dtype=np.float32)
         residual_high = self.residual_action_clip * np.ones(self.nr_actuator_joints, dtype=np.float32)
         self.action_space = BoxSpace(
@@ -251,6 +265,10 @@ class HierarchicalDribblingEnv(gym.Env):
             "actuator_joint_nominal_positions": self.initial_qpos[self.actuator_joint_mask_qpos],
             "actuator_joint_max_velocities": self.actuator_joint_max_velocities,
             "goal_velocities": np.array([0.0, 0.0, 0.0]),
+            "nominal_goal_velocities": np.array([0.0, 0.0, 0.0]),
+            "current_delta_command": np.array([0.0, 0.0, 0.0]),
+            "last_delta_command": np.array([0.0, 0.0, 0.0]),
+            "second_last_delta_command": np.array([0.0, 0.0, 0.0]),
             "ball_velocity_command": np.array([0.0, 0.0]),
             "imu_orientation_rotation": Rotation.from_quat([0.0, 0.0, 0.0, 1.0]),
             "imu_orientation_rotation_inverse": Rotation.from_quat([0.0, 0.0, 0.0, 1.0]).inv(),
@@ -497,6 +515,23 @@ class HierarchicalDribblingEnv(gym.Env):
         return np.concatenate([ball_rel_base_xy, ball_pos[2:3] - base_pos[2:3]])
 
 
+    def compute_nominal_robot_command(self):
+        ball_rel_base = self.relative_ball_position_base()
+        ball_velocity_command_base = self.rotate_world_to_base_xy(
+            self.internal_state["ball_velocity_command"],
+            self.internal_state["imu_orientation_euler"][2],
+        )
+        ball_position_error = ball_rel_base[:2] - self.nominal_command_target_ball
+        heading_error = np.arctan2(ball_rel_base[1], ball_rel_base[0])
+
+        nominal_command = np.array([
+            self.nominal_command_ball_velocity_gain * ball_velocity_command_base[0] + self.nominal_command_position_gain_x * ball_position_error[0],
+            self.nominal_command_ball_velocity_gain * ball_velocity_command_base[1] + self.nominal_command_position_gain_y * ball_position_error[1],
+            self.nominal_command_yaw_gain * heading_error,
+        ], dtype=np.float32)
+        return np.clip(nominal_command, -self.nominal_command_max, self.nominal_command_max)
+
+
     def trunc2(self, value):
         return np.trunc(np.asarray(value) * 100.0) / 100.0
 
@@ -684,6 +719,11 @@ class HierarchicalDribblingEnv(gym.Env):
         self.internal_state["imu_orientation_rotation"] = Rotation.from_matrix(self.internal_state["data"].site_xmat[self.imu_site_id].reshape(3, 3))
         self.internal_state["imu_orientation_rotation_inverse"] = self.internal_state["imu_orientation_rotation"].inv()
         self.internal_state["imu_orientation_euler"] = self.internal_state["imu_orientation_rotation"].as_euler("xyz")
+        self.internal_state["goal_velocities"] = np.zeros(3)
+        self.internal_state["nominal_goal_velocities"] = np.zeros(3)
+        self.internal_state["current_delta_command"] = np.zeros(3)
+        self.internal_state["last_delta_command"] = np.zeros(3)
+        self.internal_state["second_last_delta_command"] = np.zeros(3)
         self.internal_state["last_action"] = np.zeros(self.nr_actuator_joints)
         self.internal_state["second_last_action"] = np.zeros(self.nr_actuator_joints)
         self.internal_state["last_residual_action"] = np.zeros(self.nr_actuator_joints)
@@ -710,16 +750,20 @@ class HierarchicalDribblingEnv(gym.Env):
 
 
     def step(self, action):
-        raw_goal_velocities = np.asarray(action[:3], dtype=np.float32)
+        raw_delta_command = np.asarray(action[:3], dtype=np.float32)
         raw_residual_action = np.asarray(action[3:3 + self.nr_actuator_joints], dtype=np.float32)
 
         max_command_velocity = self.internal_state["max_command_velocity"]
-        goal_velocities = np.clip(raw_goal_velocities, -max_command_velocity, max_command_velocity)
+        nominal_goal_velocities = self.compute_nominal_robot_command()
+        delta_command = np.clip(raw_delta_command, -self.delta_command_clip, self.delta_command_clip)
+        goal_velocities = np.clip(nominal_goal_velocities + delta_command, -max_command_velocity, max_command_velocity)
         goal_velocities = np.where(
             np.abs(goal_velocities) < (self.command_function.zero_clip_threshold_percentage * max_command_velocity),
             0.0,
             goal_velocities,
         )
+        self.internal_state["nominal_goal_velocities"] = nominal_goal_velocities
+        self.internal_state["current_delta_command"] = delta_command
         self.internal_state["goal_velocities"] = goal_velocities
         actuator_joint_keep_nominal = np.where(
             np.all(goal_velocities == 0.0),
@@ -787,6 +831,8 @@ class HierarchicalDribblingEnv(gym.Env):
 
         self.internal_state["second_last_action"] = self.internal_state["last_action"].copy()
         self.internal_state["last_action"] = chosen_action.copy()
+        self.internal_state["second_last_delta_command"] = self.internal_state["last_delta_command"].copy()
+        self.internal_state["last_delta_command"] = delta_command.copy()
         self.internal_state["second_last_residual_action"] = self.internal_state["last_residual_action"].copy()
         self.internal_state["last_residual_action"] = residual_action.copy()
         self.internal_state["info_episode_store"]["episode_step"] += 1

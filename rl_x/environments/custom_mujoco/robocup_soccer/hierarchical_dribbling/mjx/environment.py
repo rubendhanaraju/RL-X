@@ -54,6 +54,20 @@ class HierarchicalDribblingEnv:
         self.add_goal_arrow = env_config["add_goal_arrow"]
         self.nr_envs = nr_envs
         self.residual_action_clip = float(env_config["hierarchical_policy"]["residual_action_clip"])
+        self.delta_command_clip = float(env_config["hierarchical_policy"]["delta_command_clip"])
+        self.nominal_command_ball_velocity_gain = float(env_config["hierarchical_policy"]["nominal_command_ball_velocity_gain"])
+        self.nominal_command_position_gain_x = float(env_config["hierarchical_policy"]["nominal_command_position_gain_x"])
+        self.nominal_command_position_gain_y = float(env_config["hierarchical_policy"]["nominal_command_position_gain_y"])
+        self.nominal_command_yaw_gain = float(env_config["hierarchical_policy"]["nominal_command_yaw_gain"])
+        self.nominal_command_target_ball = jnp.array([
+            float(env_config["hierarchical_policy"]["nominal_command_target_ball_x"]),
+            float(env_config["hierarchical_policy"]["nominal_command_target_ball_y"]),
+        ], dtype=jnp.float32)
+        self.nominal_command_max = jnp.array([
+            float(env_config["hierarchical_policy"]["nominal_command_max_x"]),
+            float(env_config["hierarchical_policy"]["nominal_command_max_y"]),
+            float(env_config["hierarchical_policy"]["nominal_command_max_yaw"]),
+        ], dtype=jnp.float32)
         self.ball_spawn_radius = float(env_config["ball"]["spawn_radius"])
         self.ball_spawn_half_angle = np.deg2rad(float(env_config["ball"]["spawn_half_angle_degrees"]))
         self.ball_spawn_in_vision = bool(env_config["ball"]["spawn_in_vision"])
@@ -237,8 +251,8 @@ class HierarchicalDribblingEnv:
         self.low_level_action_low = jnp.array(lower_joint_limit, dtype=jnp.float32)
         self.low_level_action_high = jnp.array(upper_joint_limit, dtype=jnp.float32)
         max_command_velocity = min(self.robot_dimensions_mean * self.command_function.max_velocity_per_m_factor, self.command_function.clip_max_velocity)
-        command_low = -max_command_velocity * jnp.ones(3, dtype=jnp.float32)
-        command_high = max_command_velocity * jnp.ones(3, dtype=jnp.float32)
+        command_low = -self.delta_command_clip * jnp.ones(3, dtype=jnp.float32)
+        command_high = self.delta_command_clip * jnp.ones(3, dtype=jnp.float32)
         residual_low = -self.residual_action_clip * jnp.ones(self.nr_actuator_joints, dtype=jnp.float32)
         residual_high = self.residual_action_clip * jnp.ones(self.nr_actuator_joints, dtype=jnp.float32)
         self.single_action_space = BoxSpace(
@@ -429,6 +443,23 @@ class HierarchicalDribblingEnv:
         base_pos = self.base_position_world(data)
         ball_rel_base_xy = self.rotate_world_to_base_xy(ball_pos[:2] - base_pos[:2], internal_state["imu_orientation_euler"][2])
         return jnp.concatenate([ball_rel_base_xy, ball_pos[2:3] - base_pos[2:3]])
+
+
+    def compute_nominal_robot_command(self, data, internal_state):
+        ball_rel_base = self.relative_ball_position_base(data, internal_state)
+        ball_velocity_command_base = self.rotate_world_to_base_xy(
+            internal_state["ball_velocity_command"],
+            internal_state["imu_orientation_euler"][2],
+        )
+        ball_position_error = ball_rel_base[:2] - self.nominal_command_target_ball
+        heading_error = jnp.atan2(ball_rel_base[1], ball_rel_base[0])
+
+        nominal_command = jnp.array([
+            self.nominal_command_ball_velocity_gain * ball_velocity_command_base[0] + self.nominal_command_position_gain_x * ball_position_error[0],
+            self.nominal_command_ball_velocity_gain * ball_velocity_command_base[1] + self.nominal_command_position_gain_y * ball_position_error[1],
+            self.nominal_command_yaw_gain * heading_error,
+        ])
+        return jnp.clip(nominal_command, -self.nominal_command_max, self.nominal_command_max)
 
 
     def trunc2(self, value):
@@ -647,6 +678,10 @@ class HierarchicalDribblingEnv:
             "actuator_joint_nominal_positions": self.initial_qpos[self.actuator_joint_mask_qpos],
             "actuator_joint_max_velocities": self.actuator_joint_max_velocities,
             "goal_velocities": jnp.array([0.0, 0.0, 0.0]),
+            "nominal_goal_velocities": jnp.array([0.0, 0.0, 0.0]),
+            "current_delta_command": jnp.array([0.0, 0.0, 0.0]),
+            "last_delta_command": jnp.array([0.0, 0.0, 0.0]),
+            "second_last_delta_command": jnp.array([0.0, 0.0, 0.0]),
             "ball_velocity_command": jnp.array([0.0, 0.0]),
             "imu_orientation_rotation": Rotation.from_quat([0.0, 0.0, 0.0, 1.0]),
             "imu_orientation_rotation_inverse": Rotation.from_quat([0.0, 0.0, 0.0, 1.0]).inv(),
@@ -724,6 +759,11 @@ class HierarchicalDribblingEnv:
         new_state.internal_state["imu_orientation_rotation"] = Rotation.from_matrix(data.site_xmat[self.imu_site_id].reshape(3, 3))
         new_state.internal_state["imu_orientation_rotation_inverse"] = new_state.internal_state["imu_orientation_rotation"].inv()
         new_state.internal_state["imu_orientation_euler"] = new_state.internal_state["imu_orientation_rotation"].as_euler("xyz")
+        new_state.internal_state["goal_velocities"] = jnp.zeros(3)
+        new_state.internal_state["nominal_goal_velocities"] = jnp.zeros(3)
+        new_state.internal_state["current_delta_command"] = jnp.zeros(3)
+        new_state.internal_state["last_delta_command"] = jnp.zeros(3)
+        new_state.internal_state["second_last_delta_command"] = jnp.zeros(3)
         new_state.internal_state["last_action"] = jnp.zeros(self.nr_actuator_joints)
         new_state.internal_state["second_last_action"] = jnp.zeros(self.nr_actuator_joints)
         new_state.internal_state["last_residual_action"] = jnp.zeros(self.nr_actuator_joints)
@@ -773,16 +813,20 @@ class HierarchicalDribblingEnv:
         key, action_delay_key, domain_randomization_key, ball_command_key, observation_key, terrain_key = jax.random.split(state.key, 6)
         state = state.replace(key=key)
 
-        raw_goal_velocities = action[:3]
+        raw_delta_command = action[:3]
         raw_residual_action = action[3:3 + self.nr_actuator_joints]
 
         max_command_velocity = state.internal_state["max_command_velocity"]
-        goal_velocities = jnp.clip(raw_goal_velocities, -max_command_velocity, max_command_velocity)
+        nominal_goal_velocities = self.compute_nominal_robot_command(state.data, state.internal_state)
+        delta_command = jnp.clip(raw_delta_command, -self.delta_command_clip, self.delta_command_clip)
+        goal_velocities = jnp.clip(nominal_goal_velocities + delta_command, -max_command_velocity, max_command_velocity)
         goal_velocities = jnp.where(
             jnp.abs(goal_velocities) < (self.command_function.zero_clip_threshold_percentage * max_command_velocity),
             0.0,
             goal_velocities,
         )
+        state.internal_state["nominal_goal_velocities"] = nominal_goal_velocities
+        state.internal_state["current_delta_command"] = delta_command
         state.internal_state["goal_velocities"] = goal_velocities
         actuator_joint_keep_nominal = jnp.where(
             jnp.all(goal_velocities == 0.0),
@@ -864,6 +908,8 @@ class HierarchicalDribblingEnv:
 
         state.internal_state["second_last_action"] = state.internal_state["last_action"]
         state.internal_state["last_action"] = chosen_action
+        state.internal_state["second_last_delta_command"] = state.internal_state["last_delta_command"]
+        state.internal_state["last_delta_command"] = delta_command
         state.internal_state["second_last_residual_action"] = state.internal_state["last_residual_action"]
         state.internal_state["last_residual_action"] = residual_action
         state.info_episode_store["episode_step"] += 1

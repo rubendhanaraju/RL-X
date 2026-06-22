@@ -47,6 +47,8 @@ class DefaultReward:
         self.active_sensing_coeff = env.env_config["reward"]["active_sensing_coeff"] * env.dt
         self.residual_action_coeff = env.env_config["reward"]["residual_action_coeff"] * env.dt
         self.residual_action_smoothness_coeff = env.env_config["reward"]["residual_action_smoothness_coeff"] * env.dt
+        self.delta_command_coeff = env.env_config["reward"]["delta_command_coeff"] * env.dt
+        self.delta_command_smoothness_coeff = env.env_config["reward"]["delta_command_smoothness_coeff"] * env.dt
 
         self.feet_symmetry_pairs = env.feet_symmetry_pairs
 
@@ -269,13 +271,21 @@ class DefaultReward:
         residual_action_reward = self.residual_action_coeff * -residual_action_norm
         residual_action_smoothness_reward = self.residual_action_smoothness_coeff * -residual_action_smoothness_norm
 
+        # Command residual penalties
+        delta_command = self.env.internal_state["current_delta_command"]
+        delta_command_delta = delta_command - self.env.internal_state["last_delta_command"]
+        delta_command_norm = np.sum(np.square(delta_command))
+        delta_command_smoothness_norm = np.sum(np.square(delta_command_delta))
+        delta_command_reward = self.delta_command_coeff * -delta_command_norm
+        delta_command_smoothness_reward = self.delta_command_smoothness_coeff * -delta_command_smoothness_norm
+
         # Total reward
         tracking_reward = tracking_xy_velocity_command_reward + tracking_yaw_velocity_command_reward + feet_phase_reward + ball_velocity_tracking_reward + chasing_ball_reward + yaw_alignment_reward + active_sensing_reward
         reward_penalty = z_velocity_reward + imu_acceleration_reward + angular_velocity_reward + angular_position_reward + \
                          actuator_joint_nominal_diff_reward +  joint_position_limit_reward + joint_velocity_limit_reward + joint_velocity_reward + \
                          acceleration_reward + torque_reward + power_draw_penalty_reward + action_rate_reward + action_smoothness_reward + \
                          collision_reward + base_height_reward + foot_air_time_reward + symmetry_air_reward + foot_slip_reward + foot_z_velocity_reward + feet_flat_reward + feet_yaw_reward + \
-                         residual_action_reward + residual_action_smoothness_reward
+                         residual_action_reward + residual_action_smoothness_reward + delta_command_reward + delta_command_smoothness_reward
         reward = tracking_reward + reward_penalty + alive_clipped_reward
         reward = np.maximum(reward, 0.0) + alive_unclipped_reward
         reward = np.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
@@ -313,6 +323,8 @@ class DefaultReward:
         self.env.internal_state["info"][f"reward/active_sensing"] = active_sensing_reward
         self.env.internal_state["info"][f"reward/residual_action"] = residual_action_reward
         self.env.internal_state["info"][f"reward/residual_action_smoothness"] = residual_action_smoothness_reward
+        self.env.internal_state["info"][f"reward/delta_command"] = delta_command_reward
+        self.env.internal_state["info"][f"reward/delta_command_smoothness"] = delta_command_smoothness_reward
         self.env.internal_state["info"][f"reward/total"] = reward
         self.env.internal_state["info"][f"env_info/xy_vel_diff_abs"] = np.nan_to_num(np.mean(np.minimum(np.abs(xy_difference), 2*self.env.internal_state["max_command_velocity"])), nan=2*self.env.internal_state["max_command_velocity"], posinf=2*self.env.internal_state["max_command_velocity"], neginf=2*self.env.internal_state["max_command_velocity"])
         self.env.internal_state["info"][f"env_info/ball_velocity_tracking_error"] = np.sqrt(ball_velocity_tracking_error)
@@ -321,8 +333,16 @@ class DefaultReward:
         self.env.internal_state["info"][f"env_info/robot_command_x"] = self.env.internal_state["goal_velocities"][0]
         self.env.internal_state["info"][f"env_info/robot_command_y"] = self.env.internal_state["goal_velocities"][1]
         self.env.internal_state["info"][f"env_info/robot_command_yaw"] = self.env.internal_state["goal_velocities"][2]
+        self.env.internal_state["info"][f"env_info/nominal_robot_command_x"] = self.env.internal_state["nominal_goal_velocities"][0]
+        self.env.internal_state["info"][f"env_info/nominal_robot_command_y"] = self.env.internal_state["nominal_goal_velocities"][1]
+        self.env.internal_state["info"][f"env_info/nominal_robot_command_yaw"] = self.env.internal_state["nominal_goal_velocities"][2]
+        self.env.internal_state["info"][f"env_info/delta_command_x"] = delta_command[0]
+        self.env.internal_state["info"][f"env_info/delta_command_y"] = delta_command[1]
+        self.env.internal_state["info"][f"env_info/delta_command_yaw"] = delta_command[2]
         self.env.internal_state["info"][f"env_info/ball_velocity_command_x"] = ball_velocity_command[0]
         self.env.internal_state["info"][f"env_info/ball_velocity_command_y"] = ball_velocity_command[1]
+        self.env.internal_state["info"][f"env_info/delta_command_norm"] = np.sqrt(delta_command_norm)
+        self.env.internal_state["info"][f"env_info/delta_command_smoothness_norm"] = np.sqrt(delta_command_smoothness_norm)
         self.env.internal_state["info"][f"env_info/residual_action_norm"] = np.sqrt(residual_action_norm)
         self.env.internal_state["info"][f"env_info/residual_action_smoothness_norm"] = np.sqrt(residual_action_smoothness_norm)
         self.env.internal_state["info"][f"env_info/residual_action_head_norm"] = np.sqrt(residual_action_head_norm)

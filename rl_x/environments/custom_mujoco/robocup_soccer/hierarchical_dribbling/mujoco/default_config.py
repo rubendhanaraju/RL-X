@@ -14,6 +14,16 @@ def get_config(environment_name):
         "hierarchical_policy": {
             "base_policy_checkpoint": "rl_x/environments/custom_mujoco/robocup_soccer/latest.model",
             "residual_action_clip": 0.25,
+            "delta_command_clip": 0.3,
+            "nominal_command_ball_velocity_gain": 0.4,
+            "nominal_command_position_gain_x": 1.0,
+            "nominal_command_position_gain_y": 1.5,
+            "nominal_command_yaw_gain": 1.0,
+            "nominal_command_target_ball_x": 0.2,
+            "nominal_command_target_ball_y": 0.0,
+            "nominal_command_max_x": 0.5,
+            "nominal_command_max_y": 0.35,
+            "nominal_command_max_yaw": 0.8,
         },
         "ball": {
             "spawn_radius": 0.30,
@@ -194,6 +204,8 @@ def get_config(environment_name):
             "residual_action_smoothness_coeff": 1.0,
             "residual_action_head_l2_weight": 0.0,
             "residual_action_head_smoothness_weight": 0.1,
+            "delta_command_coeff": 0.05,
+            "delta_command_smoothness_coeff": 0.02,
         },
         "termination": {
             "type": "below_height",
