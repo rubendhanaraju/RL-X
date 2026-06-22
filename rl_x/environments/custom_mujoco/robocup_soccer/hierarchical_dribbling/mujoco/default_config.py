@@ -13,8 +13,8 @@ def get_config(environment_name):
         "control_type": "pd",
         "hierarchical_policy": {
             "base_policy_checkpoint": "rl_x/environments/custom_mujoco/robocup_soccer/latest.model",
-            "residual_action_clip": 0.25,
-            "delta_command_clip": 0.3,
+            "residual_action_clip": 0.10,
+            "delta_command_clip": 0.15,
             "nominal_command_ball_velocity_gain": 0.4,
             "nominal_command_position_gain_x": 1.0,
             "nominal_command_position_gain_y": 1.5,
