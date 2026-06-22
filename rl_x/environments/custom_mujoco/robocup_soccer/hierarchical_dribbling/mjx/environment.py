@@ -552,6 +552,73 @@ class HierarchicalDribblingEnv:
         return tight_possession_lost, immediate_possession_lost
 
 
+    def get_height_termination_info(self, internal_state):
+        current_height = internal_state["robot_imu_height_over_ground"]
+        nominal_height = internal_state["robot_nominal_imu_height_over_ground"]
+        curriculum_threshold = (
+            (1.0 - internal_state["env_curriculum_coeff"])
+            * float(self.env_config["termination"]["height_percentage_threshold"])
+            * nominal_height
+        )
+        fall_threshold = (
+            float(self.env_config["termination"]["fall_height_percentage_threshold"])
+            * nominal_height
+        )
+        curriculum_below_height = current_height < curriculum_threshold
+        fall_below_height = current_height < fall_threshold
+        height_ratio = current_height / jnp.maximum(nominal_height, 1e-6)
+        return (
+            curriculum_below_height,
+            fall_below_height,
+            current_height,
+            nominal_height,
+            height_ratio,
+            curriculum_threshold,
+            fall_threshold,
+        )
+
+
+    def update_termination_info(
+        self,
+        data,
+        internal_state,
+        info,
+        height_termination,
+        ball_unseen_too_long,
+        tight_possession_lost,
+        immediate_possession_lost,
+        qvel_limit_termination,
+        terminated,
+        truncated,
+    ):
+        (
+            curriculum_below_height,
+            fall_below_height,
+            current_height,
+            nominal_height,
+            height_ratio,
+            curriculum_threshold,
+            fall_threshold,
+        ) = self.get_height_termination_info(internal_state)
+
+        info["env_info/termination_height"] = jnp.asarray(height_termination, dtype=jnp.float32)
+        info["env_info/termination_curriculum_height"] = jnp.asarray(curriculum_below_height, dtype=jnp.float32)
+        info["env_info/termination_fall_height"] = jnp.asarray(fall_below_height, dtype=jnp.float32)
+        info["env_info/termination_ball_unseen"] = jnp.asarray(ball_unseen_too_long, dtype=jnp.float32)
+        info["env_info/termination_tight_possession"] = jnp.asarray(tight_possession_lost, dtype=jnp.float32)
+        info["env_info/termination_immediate_possession"] = jnp.asarray(immediate_possession_lost, dtype=jnp.float32)
+        info["env_info/termination_qvel_limit"] = jnp.asarray(qvel_limit_termination, dtype=jnp.float32)
+        info["env_info/terminated"] = jnp.asarray(terminated, dtype=jnp.float32)
+        info["env_info/truncated"] = jnp.asarray(truncated, dtype=jnp.float32)
+        info["env_info/robot_imu_height_over_ground"] = current_height
+        info["env_info/robot_nominal_imu_height_over_ground"] = nominal_height
+        info["env_info/robot_height_ratio"] = height_ratio
+        info["env_info/curriculum_height_threshold"] = curriculum_threshold
+        info["env_info/fall_height_threshold"] = fall_threshold
+        info["env_info/root_qvel_norm"] = jnp.linalg.norm(data.qvel[:3])
+        info["env_info/root_qvel_max_abs"] = jnp.max(jnp.abs(data.qvel[:3]))
+
+
     def _get_robot_observation_prefix(self, data, mjx_model, internal_state, action):
         return jnp.concatenate([
             data.qpos[self.actuator_joint_mask_qpos],
@@ -719,6 +786,7 @@ class HierarchicalDribblingEnv:
         self.reward_function.reward_and_info(data, mjx_model, internal_state, jnp.zeros(self.nr_actuator_joints), info)
         self.update_ball_sensing(data, internal_state, info, True, 0)
         self.update_ball_possession_info(data, internal_state, info, 0)
+        self.update_termination_info(data, internal_state, info, False, False, False, False, False, False, False)
         info["rollout/episode_return"] = reward
         info["rollout/episode_length"] = 0
         info["env_curriculum/coefficient"] = internal_state["env_curriculum_coeff"]
@@ -778,6 +846,7 @@ class HierarchicalDribblingEnv:
         self.sample_ball_velocity_command(new_state.internal_state, True, ball_command_key)
         self.update_ball_sensing(data, new_state.internal_state, new_state.info, True, 0)
         self.update_ball_possession_info(data, new_state.internal_state, new_state.info, 0)
+        self.update_termination_info(data, new_state.internal_state, new_state.info, False, False, False, False, False, False, False)
 
         next_observation = self.get_observation(data, mjx_model, new_state.internal_state, observation_key, jnp.zeros(self.nr_actuator_joints))
         reward = 0.0
@@ -892,15 +961,29 @@ class HierarchicalDribblingEnv:
         )
         
         next_observation = self.get_observation(data, mjx_model, state.internal_state, observation_key, chosen_action)
+        height_termination = self.termination_function.should_terminate(state.internal_state)
+        qvel_limit_termination = jnp.any(jnp.abs(data.qvel[:3]) >= 100.0)
         terminated = (
-            self.termination_function.should_terminate(state.internal_state)
+            height_termination
             | state.internal_state["ball_unseen_too_long"]
             | tight_possession_lost
             | immediate_possession_lost
-            | jnp.any(jnp.abs(data.qvel[:3]) == 100.0)
+            | qvel_limit_termination
         )
         truncated = state.info_episode_store["episode_step"] >= (self.horizon - 1)
         done = terminated | truncated
+        self.update_termination_info(
+            data,
+            state.internal_state,
+            state.info,
+            height_termination,
+            state.internal_state["ball_unseen_too_long"],
+            tight_possession_lost,
+            immediate_possession_lost,
+            qvel_limit_termination,
+            terminated,
+            truncated,
+        )
 
         data = self.terrain_function.post_step(data, mjx_model, state.internal_state, terrain_key)
         self.reward_function.step(data, state.internal_state)
@@ -918,9 +1001,41 @@ class HierarchicalDribblingEnv:
         state.info["rollout/episode_return"] = jnp.where(done, state.info_episode_store["episode_return"], state.info["rollout/episode_return"])
         state.info["rollout/episode_length"] = jnp.where(done, state.info_episode_store["episode_step"], state.info["rollout/episode_length"])
         state.info["env_curriculum/coefficient"] = state.internal_state["env_curriculum_coeff"]
+        terminal_info_keys = (
+            "rollout/episode_return",
+            "rollout/episode_length",
+            "env_curriculum/coefficient",
+            "env_info/ball_visible",
+            "env_info/ball_unseen_time",
+            "env_info/ball_unseen_too_long",
+            "env_info/ball_unseen_termination_active",
+            "env_info/ball_rel_base_x",
+            "env_info/ball_rel_base_y",
+            "env_info/tight_possession_lost",
+            "env_info/immediate_possession_lost",
+            "env_info/termination_height",
+            "env_info/termination_curriculum_height",
+            "env_info/termination_fall_height",
+            "env_info/termination_ball_unseen",
+            "env_info/termination_tight_possession",
+            "env_info/termination_immediate_possession",
+            "env_info/termination_qvel_limit",
+            "env_info/terminated",
+            "env_info/truncated",
+            "env_info/robot_imu_height_over_ground",
+            "env_info/robot_nominal_imu_height_over_ground",
+            "env_info/robot_height_ratio",
+            "env_info/curriculum_height_threshold",
+            "env_info/fall_height_threshold",
+            "env_info/root_qvel_norm",
+            "env_info/root_qvel_max_abs",
+        )
+        terminal_info = {key: state.info[key] for key in terminal_info_keys}
 
         def when_done(_):
             start_state = self._reset(state)
+            for key, value in terminal_info.items():
+                start_state.info[key] = value
             start_state = start_state.replace(actual_next_observation=next_observation, reward=reward, terminated=terminated, truncated=truncated)
             return start_state
         def when_not_done(_):

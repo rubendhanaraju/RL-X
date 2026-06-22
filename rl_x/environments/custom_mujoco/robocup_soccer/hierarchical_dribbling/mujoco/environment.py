@@ -318,6 +318,7 @@ class HierarchicalDribblingEnv(gym.Env):
         self.reward_function.reward_and_info(np.zeros(self.nr_actuator_joints))
         self.update_ball_sensing(reset_timer=True)
         self.update_ball_possession_info(0)
+        self.update_termination_info(False, False, False, False, False, False, False)
 
         if self.should_render:
             self.viewer = MujocoViewer(self.initial_mj_model, self.dt)
@@ -615,6 +616,71 @@ class HierarchicalDribblingEnv(gym.Env):
         return tight_possession_lost, immediate_possession_lost
 
 
+    def get_height_termination_info(self):
+        current_height = self.internal_state["robot_imu_height_over_ground"]
+        nominal_height = self.internal_state["robot_nominal_imu_height_over_ground"]
+        curriculum_threshold = (
+            (1.0 - self.internal_state["env_curriculum_coeff"])
+            * float(self.env_config["termination"]["height_percentage_threshold"])
+            * nominal_height
+        )
+        fall_threshold = (
+            float(self.env_config["termination"]["fall_height_percentage_threshold"])
+            * nominal_height
+        )
+        curriculum_below_height = current_height < curriculum_threshold
+        fall_below_height = current_height < fall_threshold
+        height_ratio = current_height / max(nominal_height, 1e-6)
+        return (
+            curriculum_below_height,
+            fall_below_height,
+            current_height,
+            nominal_height,
+            height_ratio,
+            curriculum_threshold,
+            fall_threshold,
+        )
+
+
+    def update_termination_info(
+        self,
+        height_termination,
+        ball_unseen_too_long,
+        tight_possession_lost,
+        immediate_possession_lost,
+        qvel_limit_termination,
+        terminated,
+        truncated,
+    ):
+        (
+            curriculum_below_height,
+            fall_below_height,
+            current_height,
+            nominal_height,
+            height_ratio,
+            curriculum_threshold,
+            fall_threshold,
+        ) = self.get_height_termination_info()
+
+        info = self.internal_state["info"]
+        info["env_info/termination_height"] = float(height_termination)
+        info["env_info/termination_curriculum_height"] = float(curriculum_below_height)
+        info["env_info/termination_fall_height"] = float(fall_below_height)
+        info["env_info/termination_ball_unseen"] = float(ball_unseen_too_long)
+        info["env_info/termination_tight_possession"] = float(tight_possession_lost)
+        info["env_info/termination_immediate_possession"] = float(immediate_possession_lost)
+        info["env_info/termination_qvel_limit"] = float(qvel_limit_termination)
+        info["env_info/terminated"] = float(terminated)
+        info["env_info/truncated"] = float(truncated)
+        info["env_info/robot_imu_height_over_ground"] = current_height
+        info["env_info/robot_nominal_imu_height_over_ground"] = nominal_height
+        info["env_info/robot_height_ratio"] = height_ratio
+        info["env_info/curriculum_height_threshold"] = curriculum_threshold
+        info["env_info/fall_height_threshold"] = fall_threshold
+        info["env_info/root_qvel_norm"] = np.linalg.norm(self.internal_state["data"].qvel[:3])
+        info["env_info/root_qvel_max_abs"] = np.max(np.abs(self.internal_state["data"].qvel[:3]))
+
+
     def _get_robot_observation_prefix(self, action):
         return np.concatenate([
             self.internal_state["data"].qpos[self.actuator_joint_mask_qpos],
@@ -738,6 +804,7 @@ class HierarchicalDribblingEnv(gym.Env):
         self.sample_ball_velocity_command(True)
         self.update_ball_sensing(reset_timer=True)
         self.update_ball_possession_info(0)
+        self.update_termination_info(False, False, False, False, False, False, False)
 
         next_observation = self.get_observation(np.zeros(self.nr_actuator_joints))
         self.internal_state["info_episode_store"] = {
@@ -815,15 +882,26 @@ class HierarchicalDribblingEnv(gym.Env):
         )
         
         next_observation = self.get_observation(chosen_action)
+        height_termination = self.termination_function.should_terminate()
+        qvel_limit_termination = np.any(np.abs(self.internal_state["data"].qvel[:3]) >= 100.0)
         terminated = (
-            self.termination_function.should_terminate()
+            height_termination
             | self.internal_state["ball_unseen_too_long"]
             | tight_possession_lost
             | immediate_possession_lost
-            | np.any(np.abs(self.internal_state["data"].qvel[:3]) == 100.0)
+            | qvel_limit_termination
         )
         truncated = self.internal_state["info_episode_store"]["episode_step"] >= (self.horizon - 1)
         done = terminated | truncated
+        self.update_termination_info(
+            height_termination,
+            self.internal_state["ball_unseen_too_long"],
+            tight_possession_lost,
+            immediate_possession_lost,
+            qvel_limit_termination,
+            terminated,
+            truncated,
+        )
 
         self.terrain_function.post_step()
         self.reward_function.step()
