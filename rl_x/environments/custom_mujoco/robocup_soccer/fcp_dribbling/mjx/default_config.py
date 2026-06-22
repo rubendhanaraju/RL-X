@@ -1,0 +1,83 @@
+from ml_collections import config_dict
+
+
+def get_config(environment_name):
+    config = {
+        "name": environment_name,
+        "nr_envs": 4096,
+        "seed": 1,
+        "render": False,
+        "device": "gpu",
+        "copy_train_env_for_eval": True,
+        "train_robot": "booster_t1",
+        "timestep": 0.005,
+        "control_frequency_hz": 50,
+        "episode_length_in_seconds": 20.0,
+        "control": {
+            "p_gain": 100.0,
+            "d_gain": 2.0,
+            "solver_iterations": 1,
+            "solver_ls_iterations": 4,
+        },
+        "walk": {
+            "type": "nao_walk",
+            "ts_per_step": 8,
+            "swing_height": 0.02,
+            "action_scale": 0.665,
+            "ik_iterations": 12,
+            "ik_damping": 1e-3,
+            "ik_max_delta": 0.08,
+            "ik_rotation_weight": 0.35,
+        },
+        "ball": {
+            "radius": 0.11,
+            "mass": 0.41,
+            "friction": "0.4 0.01 0.01",
+            "solref": "-5000 -20",
+            "reset_rel_x_range": [0.22, 0.34],
+            "reset_rel_y_range": [-0.08, 0.08],
+            "reset_velocity_std": 0.15,
+            "velocity_observation_scale": 10.0,
+        },
+        "sensing": {
+            "camera_site_name": "camera",
+            "ball_site_name": "B-vismarker",
+            "half_horizontal_range": 60.0,
+            "half_vertical_range": 90.0,
+            "max_ball_unseen_seconds": 0.06,
+        },
+        "target": {
+            "max_rotation_diff": 20.0,
+            "max_rotation_dist": 80.0,
+            "orientation_change_probability": 3 / 50,
+            "return_to_base_on_radius": 5.0,
+            "return_to_base_off_radius": 2.0,
+            "eval_initial_orientation": -180.0,
+            "eval_left_x": -6.5,
+            "eval_right_x": -3.5,
+            "eval_left_orientation": 10.0,
+            "eval_right_orientation": 170.0,
+        },
+        "reward": {
+            "alive_bonus": 0.1,
+            "scale": 10.0,
+        },
+        "termination": {
+            "min_imu_height": 0.4,
+            "ball_grace_steps": 50,
+            "ball_soft_x_min": -0.10,
+            "ball_soft_x_max": 0.45,
+            "ball_soft_abs_y_max": 0.25,
+            "ball_hard_x_min": -0.25,
+            "ball_hard_x_max": 0.70,
+            "ball_hard_abs_y_max": 0.40,
+            "eval_max_steps": 1200,
+        },
+        "reset": {
+            "root_position_xyz": [0.0, 0.0, 0.6385],
+            "random_yaw": True,
+            "settle_steps": 4,
+        },
+    }
+
+    return config_dict.ConfigDict(config)
