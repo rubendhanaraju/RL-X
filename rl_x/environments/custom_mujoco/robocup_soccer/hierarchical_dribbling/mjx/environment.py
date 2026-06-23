@@ -135,6 +135,7 @@ class HierarchicalDribblingEnv:
         self.sensing_half_vertical_range = float(env_config["sensing"]["half_vertical_range"])
         self.max_ball_unseen_seconds = float(env_config["sensing"]["max_ball_unseen_seconds"])
         self.initial_unseen_grace_steps = int(round(float(env_config["sensing"]["initial_unseen_grace_seconds"]) * 50.0))
+        self.ball_relative_position_noise = float(env_config["domain_randomization"]["observation_noise"]["ball_relative_position"])
         self.home_qpos = self.initial_mj_model.keyframe("home").qpos.copy()
         self.home_qpos[self.ball_qposadr:self.ball_qposadr + 7] = np.array([self.ball_spawn_radius, 0.0, self.ball_radius, 1.0, 0.0, 0.0, 0.0])
         self.data = mujoco.MjData(self.initial_mj_model)
@@ -517,6 +518,33 @@ class HierarchicalDribblingEnv:
         info["env_info/ball_detection_elevation"] = internal_state["ball_detection_elevation"]
 
 
+    def update_known_ball_info(self, data, internal_state, info):
+        relative_ball_position = self.relative_ball_position_base(data, internal_state)
+        distance = jnp.linalg.norm(relative_ball_position)
+        azimuth = jnp.degrees(jnp.atan2(relative_ball_position[1], relative_ball_position[0]))
+        elevation = jnp.where(
+            distance == 0.0,
+            0.0,
+            jnp.degrees(jnp.arcsin(jnp.clip(relative_ball_position[2] / distance, -1.0, 1.0))),
+        )
+
+        internal_state["ball_visible"] = True
+        internal_state["time_since_ball_seen"] = 0.0
+        internal_state["ball_unseen_too_long"] = False
+        internal_state["ball_detection_distance"] = distance
+        internal_state["ball_detection_azimuth"] = azimuth
+        internal_state["ball_detection_elevation"] = elevation
+        internal_state["ball_detection_local_pos"] = relative_ball_position
+
+        info["env_info/ball_visible"] = jnp.asarray(1.0, dtype=jnp.float32)
+        info["env_info/ball_unseen_time"] = jnp.asarray(0.0, dtype=jnp.float32)
+        info["env_info/ball_unseen_too_long"] = jnp.asarray(0.0, dtype=jnp.float32)
+        info["env_info/ball_unseen_termination_active"] = jnp.asarray(0.0, dtype=jnp.float32)
+        info["env_info/ball_detection_distance"] = distance
+        info["env_info/ball_detection_azimuth"] = azimuth
+        info["env_info/ball_detection_elevation"] = elevation
+
+
     def get_ball_possession_termination(self, data, internal_state, episode_step):
         ball_rel_base = self.relative_ball_position_base(data, internal_state)
         ball_rel_x = ball_rel_base[0]
@@ -764,7 +792,7 @@ class HierarchicalDribblingEnv:
             "robot_dimensions_mean": self.robot_dimensions_mean,
             "max_command_velocity": jnp.minimum(self.robot_dimensions_mean * self.command_function.max_velocity_per_m_factor, self.command_function.clip_max_velocity),
             "max_ball_velocity": float(self.env_config["ball_command"]["max_velocity"]),
-            "ball_visible": False,
+            "ball_visible": True,
             "time_since_ball_seen": 0.0,
             "ball_unseen_too_long": False,
             "ball_detection_distance": 0.0,
@@ -784,7 +812,7 @@ class HierarchicalDribblingEnv:
 
         info = {}
         self.reward_function.reward_and_info(data, mjx_model, internal_state, jnp.zeros(self.nr_actuator_joints), info)
-        self.update_ball_sensing(data, internal_state, info, True, 0)
+        self.update_known_ball_info(data, internal_state, info)
         self.update_ball_possession_info(data, internal_state, info, 0)
         self.update_termination_info(data, internal_state, info, False, False, False, False, False, False, False)
         info["rollout/episode_return"] = reward
@@ -844,7 +872,7 @@ class HierarchicalDribblingEnv:
         self.domain_randomization_action_delay_function.setup(new_state.internal_state)
         data, mjx_model = self.handle_domain_randomization(new_state.internal_state, mjx_model, data, domain_randomization_key, is_episode_start=True)
         self.sample_ball_velocity_command(new_state.internal_state, True, ball_command_key)
-        self.update_ball_sensing(data, new_state.internal_state, new_state.info, True, 0)
+        self.update_known_ball_info(data, new_state.internal_state, new_state.info)
         self.update_ball_possession_info(data, new_state.internal_state, new_state.info, 0)
         self.update_termination_info(data, new_state.internal_state, new_state.info, False, False, False, False, False, False, False)
 
@@ -952,7 +980,7 @@ class HierarchicalDribblingEnv:
         resampling_steps = int(round(float(self.env_config["ball_command"]["resampling_time_s"]) * self.control_frequency_hz))
         should_sample_ball_command = ((state.info_episode_store["episode_step"] + 1) % resampling_steps) == 0
         self.sample_ball_velocity_command(state.internal_state, should_sample_ball_command, ball_command_key)
-        self.update_ball_sensing(data, state.internal_state, state.info, False, state.info_episode_store["episode_step"])
+        self.update_known_ball_info(data, state.internal_state, state.info)
         tight_possession_lost, immediate_possession_lost = self.update_ball_possession_info(
             data,
             state.internal_state,
@@ -965,7 +993,6 @@ class HierarchicalDribblingEnv:
         qvel_limit_termination = jnp.any(jnp.abs(data.qvel[:3]) >= 100.0)
         terminated = (
             height_termination
-            | state.internal_state["ball_unseen_too_long"]
             | tight_possession_lost
             | immediate_possession_lost
             | qvel_limit_termination
@@ -977,7 +1004,7 @@ class HierarchicalDribblingEnv:
             state.internal_state,
             state.info,
             height_termination,
-            state.internal_state["ball_unseen_too_long"],
+            False,
             tight_possession_lost,
             immediate_possession_lost,
             qvel_limit_termination,
@@ -1046,12 +1073,18 @@ class HierarchicalDribblingEnv:
 
 
     def get_observation(self, data, mjx_model, internal_state, key, action):
+        observation_noise_key, ball_noise_key = jax.random.split(key, 2)
         ball_pos_world = self.ball_position_world(data)
         ball_vel_world = self.ball_velocity_world(data)
         base_pos_world = self.base_position_world(data)
-        ball_visible = jnp.array([jnp.asarray(internal_state["ball_visible"], dtype=jnp.float32)])
         relative_ball_position = self.relative_ball_position_base(data, internal_state)
-        perceived_ball_position = internal_state["ball_detection_local_pos"]
+        ball_relative_position_noise = internal_state["env_curriculum_coeff"] * jax.random.uniform(
+            ball_noise_key,
+            shape=(3,),
+            minval=-self.ball_relative_position_noise,
+            maxval=self.ball_relative_position_noise,
+        )
+        noisy_relative_ball_position = relative_ball_position + ball_relative_position_noise
         current_imu_angular_velocity = data.sensordata[self.imu_angular_velocity_sensor_adr:self.imu_angular_velocity_sensor_adr + self.imu_angular_velocity_sensor_dim]
         base_yaw = internal_state["imu_orientation_euler"][2]
         base_yaw_rate = current_imu_angular_velocity[2]
@@ -1060,8 +1093,7 @@ class HierarchicalDribblingEnv:
             self._get_robot_observation_prefix(data, mjx_model, internal_state, action),
             internal_state["ball_velocity_command"],
             relative_ball_position,
-            perceived_ball_position,
-            ball_visible,
+            noisy_relative_ball_position,
             ball_pos_world,
             ball_vel_world,
             base_pos_world,
@@ -1071,7 +1103,7 @@ class HierarchicalDribblingEnv:
         ])
 
         # Add noise
-        observation = self.observation_noise_function.modify_observation(internal_state, observation, key)
+        observation = self.observation_noise_function.modify_observation(internal_state, observation, observation_noise_key)
 
         # Normalize and clip
         observation = observation.at[self.joint_positions_obs_idx].set((observation[self.joint_positions_obs_idx] - internal_state["actuator_joint_nominal_positions"]) / 3.14)
@@ -1088,8 +1120,7 @@ class HierarchicalDribblingEnv:
             observation = observation.at[self.critic_exteroception_obs_idx].set(jnp.clip((observation[self.critic_exteroception_obs_idx] / (10.0 / 2)) - 1.0, -1.0, 1.0))
         observation = observation.at[self.ball_velocity_command_obs_idx].set(jnp.clip(observation[self.ball_velocity_command_obs_idx] / internal_state["max_ball_velocity"], -1.0, 1.0))
         observation = observation.at[self.relative_ball_position_obs_idx].set(jnp.clip(observation[self.relative_ball_position_obs_idx] / self.ball_spawn_radius, -1.0, 1.0))
-        observation = observation.at[self.perceived_ball_position_obs_idx].set(jnp.clip(observation[self.perceived_ball_position_obs_idx] / self.ball_spawn_radius, -1.0, 1.0))
-        observation = observation.at[self.ball_visible_obs_idx].set((observation[self.ball_visible_obs_idx] / 0.5) - 1.0)
+        observation = observation.at[self.noisy_relative_ball_position_obs_idx].set(jnp.clip(observation[self.noisy_relative_ball_position_obs_idx] / self.ball_spawn_radius, -1.0, 1.0))
         observation = observation.at[self.ball_position_world_obs_idx].set(jnp.clip(observation[self.ball_position_world_obs_idx] / self.ball_spawn_radius, -1.0, 1.0))
         observation = observation.at[self.ball_velocity_world_obs_idx].set(jnp.clip(observation[self.ball_velocity_world_obs_idx] / internal_state["max_ball_velocity"], -1.0, 1.0))
         observation = observation.at[self.base_position_world_obs_idx].set(jnp.clip(observation[self.base_position_world_obs_idx] / self.ball_spawn_radius, -1.0, 1.0))
@@ -1187,10 +1218,8 @@ class HierarchicalDribblingEnv:
         current_observation_idx += 2
         self.relative_ball_position_obs_idx = jnp.array([current_observation_idx + i for i in range(3)])
         current_observation_idx += 3
-        self.perceived_ball_position_obs_idx = jnp.array([current_observation_idx + i for i in range(3)])
+        self.noisy_relative_ball_position_obs_idx = jnp.array([current_observation_idx + i for i in range(3)])
         current_observation_idx += 3
-        self.ball_visible_obs_idx = jnp.array([current_observation_idx])
-        current_observation_idx += 1
         self.ball_position_world_obs_idx = jnp.array([current_observation_idx + i for i in range(3)])
         current_observation_idx += 3
         self.ball_velocity_world_obs_idx = jnp.array([current_observation_idx + i for i in range(3)])
@@ -1215,9 +1244,7 @@ class HierarchicalDribblingEnv:
             self.gait_phase_obs_idx,
             self.gravity_vector_obs_idx,
             self.ball_velocity_command_obs_idx,
-            self.relative_ball_position_obs_idx,
-            self.perceived_ball_position_obs_idx,
-            self.ball_visible_obs_idx,
+            self.noisy_relative_ball_position_obs_idx,
             self.base_policy_action_obs_idx,
             self.last_residual_action_obs_idx,
             self.policy_exteroception_obs_idx,
@@ -1227,8 +1254,6 @@ class HierarchicalDribblingEnv:
             self.base_critic_observation_indices,
             self.ball_velocity_command_obs_idx,
             self.relative_ball_position_obs_idx,
-            self.perceived_ball_position_obs_idx,
-            self.ball_visible_obs_idx,
             self.ball_position_world_obs_idx,
             self.ball_velocity_world_obs_idx,
             self.base_position_world_obs_idx,

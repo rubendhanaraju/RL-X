@@ -100,11 +100,12 @@ def get_config(environment_name):
             "observation_noise": {
                 "type": "default",
                 "joint_position": 0.01,
-                "joint_velocity": 0.5,
-                "imu_angular_velocity": 0.1,
-                "gravity_vector": 0.02,
-                "exteroception": 0.01,
-            },
+            "joint_velocity": 0.5,
+            "imu_angular_velocity": 0.1,
+            "gravity_vector": 0.02,
+            "exteroception": 0.01,
+            "ball_relative_position": 0.02,
+        },
             "perturbation": {
                 "sampling_type": "step_probability",
                 "type": "default",

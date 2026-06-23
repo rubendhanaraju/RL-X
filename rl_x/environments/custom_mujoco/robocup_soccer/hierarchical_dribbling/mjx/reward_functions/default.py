@@ -259,9 +259,8 @@ class DefaultReward:
         ball_velocity_tracking_reward = self.ball_velocity_tracking_coeff * jnp.exp(-ball_velocity_tracking_error / self.ball_velocity_tracking_temperature)
         ball_distance_to_base = jnp.linalg.norm(ball_pos_world[:2] - base_pos_world[:2])
         chasing_ball_reward = self.chasing_ball_coeff * jnp.exp(-jnp.square(ball_distance_to_base) / self.chasing_ball_temperature)
-        ball_visible = jnp.asarray(internal_state["ball_visible"], dtype=jnp.float32)
-        yaw_alignment_reward = self.yaw_alignment_coeff * self.reward_yaw_alignment(base_yaw, base_pos_world[:2], ball_pos_world[:2], ball_velocity_command) * ball_visible
-        active_sensing_reward = self.active_sensing_coeff * ball_visible
+        yaw_alignment_reward = self.yaw_alignment_coeff * self.reward_yaw_alignment(base_yaw, base_pos_world[:2], ball_pos_world[:2], ball_velocity_command)
+        active_sensing_reward = jnp.asarray(0.0, dtype=jnp.float32)
 
         # Hierarchical residual penalties
         residual_action = internal_state["current_residual_action"]

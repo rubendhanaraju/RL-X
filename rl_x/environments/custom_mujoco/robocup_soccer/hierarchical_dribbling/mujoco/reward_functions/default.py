@@ -255,9 +255,8 @@ class DefaultReward:
         ball_velocity_tracking_reward = self.ball_velocity_tracking_coeff * np.exp(-ball_velocity_tracking_error / self.ball_velocity_tracking_temperature)
         ball_distance_to_base = np.linalg.norm(ball_pos_world[:2] - base_pos_world[:2])
         chasing_ball_reward = self.chasing_ball_coeff * np.exp(-np.square(ball_distance_to_base) / self.chasing_ball_temperature)
-        ball_visible = float(self.env.internal_state["ball_visible"])
-        yaw_alignment_reward = self.yaw_alignment_coeff * self.reward_yaw_alignment(base_yaw, base_pos_world[:2], ball_pos_world[:2], ball_velocity_command) * ball_visible
-        active_sensing_reward = self.active_sensing_coeff * ball_visible
+        yaw_alignment_reward = self.yaw_alignment_coeff * self.reward_yaw_alignment(base_yaw, base_pos_world[:2], ball_pos_world[:2], ball_velocity_command)
+        active_sensing_reward = 0.0
 
         # Hierarchical residual penalties
         residual_action = self.env.internal_state["current_residual_action"]

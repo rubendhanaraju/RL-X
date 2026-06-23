@@ -32,6 +32,7 @@ def get_config(environment_name):
         "observation": {
             "type": "walk_rl3",
             "history_length": 0,
+            "foot_position_frame_offset": [0.0, 0.0, 0.24],
         },
         "reset": {
             "root_position_xyz": [0.0, 0.0, 0.6385],

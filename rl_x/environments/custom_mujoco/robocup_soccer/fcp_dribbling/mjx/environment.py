@@ -153,6 +153,11 @@ class FcpDribblingEnv:
             ],
             dtype=jnp.int32,
         )
+        self.foot_site_indices = jnp.array(
+            [self.t1.ids.left.site_id, self.t1.ids.right.site_id],
+            dtype=jnp.int32,
+        )
+        self.nominal_foot_front_x_rel_waist = self._nominal_foot_front_x_rel_waist()
 
         self.actuator_joint_names = [
             mujoco.mj_id2name(
@@ -210,6 +215,15 @@ class FcpDribblingEnv:
         self.imu_angular_velocity_sensor_dim = self.initial_mj_model.sensor_dim[
             imu_angular_velocity_sensor_id
         ]
+        imu_linear_velocity_sensor_id = self.initial_mj_model.sensor(
+            "imu_linear_velocity"
+        ).id
+        self.imu_linear_velocity_sensor_adr = self.initial_mj_model.sensor_adr[
+            imu_linear_velocity_sensor_id
+        ]
+        self.imu_linear_velocity_sensor_dim = self.initial_mj_model.sensor_dim[
+            imu_linear_velocity_sensor_id
+        ]
 
         self.reset_root_position = jnp.array(
             env_config["reset"]["root_position_xyz"], dtype=jnp.float32
@@ -223,8 +237,20 @@ class FcpDribblingEnv:
         self.ball_reset_rel_y_range = jnp.array(
             env_config["ball"]["reset_rel_y_range"], dtype=jnp.float32
         )
+        self.ball_reset_use_foot_clearance = bool(
+            env_config["ball"]["reset_use_foot_clearance"]
+        )
+        self.ball_reset_foot_clearance_range = jnp.array(
+            env_config["ball"]["reset_foot_clearance_range"], dtype=jnp.float32
+        )
         self.ball_reset_velocity_std = jnp.float32(
             env_config["ball"]["reset_velocity_std"]
+        )
+        self.ball_observation_frame_offset = jnp.array(
+            env_config["ball"]["observation_frame_offset"], dtype=jnp.float32
+        )
+        self.ball_observation_distance_xy_only = bool(
+            env_config["ball"]["observation_distance_xy_only"]
         )
         self.ball_velocity_observation_scale = jnp.float32(
             env_config["ball"]["velocity_observation_scale"]
@@ -412,10 +438,25 @@ class FcpDribblingEnv:
             "env_info/ball_unseen_time": jnp.float32(0.0),
             "env_info/ball_unseen_too_long": jnp.float32(0.0),
             "env_info/ball_distance_waist": jnp.float32(0.0),
+            "env_info/ball_rel_waist_x": jnp.float32(0.0),
+            "env_info/ball_rel_waist_y": jnp.float32(0.0),
+            "env_info/ball_rel_waist_z": jnp.float32(0.0),
+            "env_info/ball_distance_observation": jnp.float32(0.0),
+            "env_info/ball_rel_observation_x": jnp.float32(0.0),
+            "env_info/ball_rel_observation_y": jnp.float32(0.0),
+            "env_info/ball_rel_observation_z": jnp.float32(0.0),
+            "env_info/ball_clearance_foot_front": jnp.float32(0.0),
             "env_info/ball_speed": jnp.float32(0.0),
             "env_info/dribble_raw_reward": jnp.float32(0.0),
             "env_info/desired_abs_orientation": jnp.float32(0.0),
             "env_info/root_height": jnp.float32(0.0),
+            "env_info/termination_ball_out": jnp.float32(0.0),
+            "env_info/termination_ball_unseen": jnp.float32(0.0),
+            "env_info/termination_clipped": jnp.float32(0.0),
+            "env_info/termination_eval_timeout": jnp.float32(0.0),
+            "env_info/termination_fallen": jnp.float32(0.0),
+            "env_info/termination_hard_ball_out": jnp.float32(0.0),
+            "env_info/termination_soft_ball_out": jnp.float32(0.0),
             "reward/total": jnp.float32(0.0),
             "reward/dribble": jnp.float32(0.0),
             "reward/alive": jnp.float32(0.0),
@@ -463,7 +504,7 @@ class FcpDribblingEnv:
         data = self._settle_data(state.mjx_model, data)
 
         qpos, qvel = self._sample_ball_reset(
-            data.qpos, data.qvel, state.internal_state["in_eval_mode"], ball_key
+            data, state.internal_state["in_eval_mode"], ball_key
         )
         data = data.replace(qpos=qpos, qvel=qvel, ctrl=self.initial_ctrl)
         data = mjx.forward(state.mjx_model, data)
@@ -472,7 +513,7 @@ class FcpDribblingEnv:
         ball_sensing = self._ball_sensing_values(
             data, jnp.float32(0.0), reset_timer=jnp.bool_(True)
         )
-        ball_rel_waist = self.ball_position_waist(data)
+        ball_rel_observation = self.ball_position_observation_frame(data)
         ball_xy = self.ball_position_world(data)[:2]
 
         random_orientation = jax.random.uniform(
@@ -495,14 +536,22 @@ class FcpDribblingEnv:
             ball_visible=ball_sensing["ball_visible"],
         )
 
-        current_observation, current_head_z, observation_ball_rel = (
+        (
+            current_observation,
+            current_head_z,
+            current_imu_linear_velocity,
+            observation_ball_rel,
+            ball_rel_velocity_obs,
+        ) = (
             self._build_fcp_observation(
                 data=data,
                 init=jnp.bool_(True),
                 step_counter=jnp.int32(0),
                 walk_core_state=walk_core_state,
                 previous_head_z=data.xpos[self.head_body_id, 2],
-                previous_ball_rel_waist=ball_rel_waist,
+                previous_imu_linear_velocity=jnp.zeros(3, dtype=jnp.float32),
+                previous_ball_rel_observation=ball_rel_observation,
+                previous_ball_rel_velocity_obs=jnp.zeros(3, dtype=jnp.float32),
                 internal_rel_orientation=internal_rel_orientation,
                 internal_target_vel=internal_target_vel,
                 ball_visible=ball_sensing["ball_visible"],
@@ -513,7 +562,9 @@ class FcpDribblingEnv:
             "last_action": jnp.zeros(self.ACTION_DIM, dtype=jnp.float32),
             "second_last_action": jnp.zeros(self.ACTION_DIM, dtype=jnp.float32),
             "previous_head_z": current_head_z,
-            "previous_ball_rel_waist": observation_ball_rel,
+            "previous_imu_linear_velocity": current_imu_linear_velocity,
+            "previous_ball_rel_observation": observation_ball_rel,
+            "previous_ball_rel_velocity_obs": ball_rel_velocity_obs,
             "last_ball_xy": ball_xy,
             "walk_core_state": walk_core_state,
             "virtual_orientation": virtual_orientation,
@@ -588,14 +639,28 @@ class FcpDribblingEnv:
             ball_visible=ball_sensing["ball_visible"],
         )
 
-        current_observation, current_head_z, observation_ball_rel = (
+        (
+            current_observation,
+            current_head_z,
+            current_imu_linear_velocity,
+            observation_ball_rel,
+            ball_rel_velocity_obs,
+        ) = (
             self._build_fcp_observation(
                 data=data,
                 init=jnp.bool_(False),
                 step_counter=walk_core_state.step_counter,
                 walk_core_state=walk_core_state,
                 previous_head_z=state.internal_state["previous_head_z"],
-                previous_ball_rel_waist=state.internal_state["previous_ball_rel_waist"],
+                previous_imu_linear_velocity=state.internal_state[
+                    "previous_imu_linear_velocity"
+                ],
+                previous_ball_rel_observation=state.internal_state[
+                    "previous_ball_rel_observation"
+                ],
+                previous_ball_rel_velocity_obs=state.internal_state[
+                    "previous_ball_rel_velocity_obs"
+                ],
                 internal_rel_orientation=internal_rel_orientation,
                 internal_target_vel=internal_target_vel,
                 ball_visible=ball_sensing["ball_visible"],
@@ -603,15 +668,30 @@ class FcpDribblingEnv:
         )
 
         episode_step = state.info_episode_store["episode_step"] + 1
-        terminated = self._should_terminate(
+        termination_flags = self._termination_flags(
             data,
             walk_core_state.step_counter,
             state.internal_state["in_eval_mode"],
             ball_sensing["ball_unseen_too_long"],
         )
+        terminated = (
+            termination_flags["fallen"]
+            | termination_flags["clipped"]
+            | termination_flags["ball_unseen"]
+            | termination_flags["ball_out"]
+            | termination_flags["eval_timeout"]
+        )
         truncated = episode_step >= self.horizon
         done = terminated | truncated
         episode_return = state.info_episode_store["episode_return"] + reward
+        ball_rel_waist = self.ball_position_waist(data)
+        ball_rel_observation = self.ball_position_observation_frame(data)
+        ball_observation_distance = self.ball_observation_distance(
+            ball_rel_observation
+        )
+        ball_clearance_foot_front = (
+            ball_rel_waist[0] - self.ball_radius - self.nominal_foot_front_x_rel_waist
+        )
 
         transition_info = {
             "rollout/episode_return": jnp.where(
@@ -625,7 +705,25 @@ class FcpDribblingEnv:
             "env_info/ball_unseen_too_long": ball_sensing[
                 "ball_unseen_too_long"
             ].astype(jnp.float32),
-            "env_info/ball_distance_waist": jnp.linalg.norm(self.ball_position_waist(data)),
+            "env_info/ball_distance_waist": jnp.linalg.norm(ball_rel_waist),
+            "env_info/ball_rel_waist_x": ball_rel_waist[0].astype(jnp.float32),
+            "env_info/ball_rel_waist_y": ball_rel_waist[1].astype(jnp.float32),
+            "env_info/ball_rel_waist_z": ball_rel_waist[2].astype(jnp.float32),
+            "env_info/ball_distance_observation": ball_observation_distance.astype(
+                jnp.float32
+            ),
+            "env_info/ball_rel_observation_x": ball_rel_observation[0].astype(
+                jnp.float32
+            ),
+            "env_info/ball_rel_observation_y": ball_rel_observation[1].astype(
+                jnp.float32
+            ),
+            "env_info/ball_rel_observation_z": ball_rel_observation[2].astype(
+                jnp.float32
+            ),
+            "env_info/ball_clearance_foot_front": ball_clearance_foot_front.astype(
+                jnp.float32
+            ),
             "env_info/ball_speed": ball_speed.astype(jnp.float32),
             "env_info/dribble_raw_reward": dribble_raw_reward.astype(jnp.float32),
             "env_info/desired_abs_orientation": desired_abs_orientation.astype(
@@ -634,6 +732,27 @@ class FcpDribblingEnv:
             "env_info/root_height": data.site_xpos[self.imu_site_id, 2].astype(
                 jnp.float32
             ),
+            "env_info/termination_ball_out": termination_flags["ball_out"].astype(
+                jnp.float32
+            ),
+            "env_info/termination_ball_unseen": termination_flags[
+                "ball_unseen"
+            ].astype(jnp.float32),
+            "env_info/termination_clipped": termination_flags["clipped"].astype(
+                jnp.float32
+            ),
+            "env_info/termination_eval_timeout": termination_flags[
+                "eval_timeout"
+            ].astype(jnp.float32),
+            "env_info/termination_fallen": termination_flags["fallen"].astype(
+                jnp.float32
+            ),
+            "env_info/termination_hard_ball_out": termination_flags[
+                "hard_ball_out"
+            ].astype(jnp.float32),
+            "env_info/termination_soft_ball_out": termination_flags[
+                "soft_ball_out"
+            ].astype(jnp.float32),
             "reward/total": reward.astype(jnp.float32),
             "reward/dribble": (dribble_raw_reward / self.reward_scale).astype(
                 jnp.float32
@@ -647,7 +766,9 @@ class FcpDribblingEnv:
             "last_action": chosen_action,
             "second_last_action": previous_action,
             "previous_head_z": current_head_z,
-            "previous_ball_rel_waist": observation_ball_rel,
+            "previous_imu_linear_velocity": current_imu_linear_velocity,
+            "previous_ball_rel_observation": observation_ball_rel,
+            "previous_ball_rel_velocity_obs": ball_rel_velocity_obs,
             "last_ball_xy": ball_xy,
             "walk_core_state": walk_core_state,
             "virtual_orientation": virtual_state["virtual_orientation"],
@@ -702,26 +823,46 @@ class FcpDribblingEnv:
         qvel = jnp.zeros(self.initial_mj_model.nv, dtype=jnp.float32)
         return qpos, qvel
 
-    def _sample_ball_reset(self, qpos, qvel, in_eval_mode, key):
-        x_key, y_key, velocity_key = jax.random.split(key, 3)
+    def _sample_ball_reset(self, data, in_eval_mode, key):
+        x_key, y_key, clearance_key, velocity_key = jax.random.split(key, 4)
+        qpos = data.qpos
+        qvel = data.qvel
         ball_rel_x = jax.random.uniform(
             x_key,
             minval=self.ball_reset_rel_x_range[0],
             maxval=self.ball_reset_rel_x_range[1],
         )
+        ball_clearance = jax.random.uniform(
+            clearance_key,
+            minval=self.ball_reset_foot_clearance_range[0],
+            maxval=self.ball_reset_foot_clearance_range[1],
+        )
+        ball_clearance = jnp.where(
+            in_eval_mode,
+            jnp.mean(self.ball_reset_foot_clearance_range),
+            ball_clearance,
+        )
+        ball_rel_x_from_clearance = (
+            self.nominal_foot_front_x_rel_waist + self.ball_radius + ball_clearance
+        )
+        ball_rel_x_fallback = jnp.where(
+            in_eval_mode, jnp.mean(self.ball_reset_rel_x_range), ball_rel_x
+        )
+        if self.ball_reset_use_foot_clearance:
+            ball_rel_x = ball_rel_x_from_clearance
+        else:
+            ball_rel_x = ball_rel_x_fallback
         ball_rel_y = jax.random.uniform(
             y_key,
             minval=self.ball_reset_rel_y_range[0],
             maxval=self.ball_reset_rel_y_range[1],
         )
-        ball_rel_x = jnp.where(
-            in_eval_mode, jnp.mean(self.ball_reset_rel_x_range), ball_rel_x
-        )
         ball_rel_y = jnp.where(in_eval_mode, jnp.float32(0.0), ball_rel_y)
         ball_rel_xy = jnp.array([ball_rel_x, ball_rel_y], dtype=jnp.float32)
 
         yaw = self.root_yaw_from_qpos(qpos)
-        ball_xy = qpos[:2] + rotate_xy_from_body_to_world(ball_rel_xy, yaw)
+        waist_pos = data.xpos[self.t1.ids.waist_body_id]
+        ball_xy = waist_pos[:2] + rotate_xy_from_body_to_world(ball_rel_xy, yaw)
         ball_qpos = jnp.array(
             [ball_xy[0], ball_xy[1], self.ball_radius, 1.0, 0.0, 0.0, 0.0],
             dtype=jnp.float32,
@@ -751,6 +892,28 @@ class FcpDribblingEnv:
         waist_pos = data.xpos[self.t1.ids.waist_body_id]
         waist_mat = data.xmat[self.t1.ids.waist_body_id].reshape(3, 3)
         return waist_mat.T @ (self.ball_position_world(data) - waist_pos)
+
+    def ball_position_observation_frame(self, data):
+        return self.ball_position_waist(data) + self.ball_observation_frame_offset
+
+    def ball_observation_distance(self, ball_rel_observation):
+        if self.ball_observation_distance_xy_only:
+            return jnp.linalg.norm(ball_rel_observation[:2])
+        return jnp.linalg.norm(ball_rel_observation)
+
+    def _nominal_foot_front_x_rel_waist(self):
+        foot_geom_xpos = self.mjx_data.geom_xpos[self.foot_geom_indices]
+        foot_geom_xmat = self.mjx_data.geom_xmat[self.foot_geom_indices].reshape(
+            2, 3, 3
+        )
+        foot_half_x = self.initial_mjx_model.geom_size[self.foot_geom_indices, 0]
+        foot_front_world = (
+            foot_geom_xpos + foot_geom_xmat[:, :, 0] * foot_half_x[:, None]
+        )
+        waist_pos = self.mjx_data.xpos[self.t1.ids.waist_body_id]
+        waist_mat = self.mjx_data.xmat[self.t1.ids.waist_body_id].reshape(3, 3)
+        foot_front_rel_waist = (foot_front_world - waist_pos) @ waist_mat
+        return jnp.max(foot_front_rel_waist[:, 0]).astype(jnp.float32)
 
     def sense_ball(self, data):
         camera_pos = data.site_xpos[self.camera_site_id]
@@ -890,7 +1053,9 @@ class FcpDribblingEnv:
         step_counter,
         walk_core_state,
         previous_head_z,
-        previous_ball_rel_waist,
+        previous_imu_linear_velocity,
+        previous_ball_rel_observation,
+        previous_ball_rel_velocity_obs,
         internal_rel_orientation,
         internal_target_vel,
         ball_visible,
@@ -909,7 +1074,15 @@ class FcpDribblingEnv:
             * 180.0
             / jnp.pi
         )
-        acc = data.qacc[:3]
+        current_imu_linear_velocity = data.sensordata[
+            self.imu_linear_velocity_sensor_adr:
+            self.imu_linear_velocity_sensor_adr + self.imu_linear_velocity_sensor_dim
+        ]
+        acc = jnp.where(
+            init,
+            jnp.zeros(3, dtype=jnp.float32),
+            (current_imu_linear_velocity - previous_imu_linear_velocity) / self.dt,
+        )
 
         obs = obs.at[0].set(jnp.minimum(step_counter, 12 * 8) / 100.0)
         obs = obs.at[1].set(head_z * 3.0)
@@ -919,9 +1092,7 @@ class FcpDribblingEnv:
         obs = obs.at[5:8].set(gyro_deg / 100.0)
         obs = obs.at[8:11].set(acc / 10.0)
 
-        contacts = self.feet_floor_contact(data).astype(jnp.float32)
-        left_frp = jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, contacts[0]], dtype=jnp.float32)
-        right_frp = jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, contacts[1]], dtype=jnp.float32)
+        left_frp, right_frp = self.feet_frp_observation(data)
         obs = obs.at[11:17].set(left_frp)
         obs = obs.at[17:23].set(right_frp)
 
@@ -951,31 +1122,41 @@ class FcpDribblingEnv:
         )
         obs = obs.at[66].set(jnp.where(init, 0.0, step_phase_sin))
 
-        measured_ball_rel_waist = self.ball_position_waist(data)
+        measured_ball_rel_observation = self.ball_position_observation_frame(data)
         use_current_ball = init | ball_visible
         observation_ball_rel = jnp.where(
-            use_current_ball, measured_ball_rel_waist, previous_ball_rel_waist
+            use_current_ball,
+            measured_ball_rel_observation,
+            previous_ball_rel_observation,
         )
         ball_rel_velocity_obs = jnp.where(
             init,
             jnp.zeros(3, dtype=jnp.float32),
             jnp.where(
                 ball_visible,
-                (observation_ball_rel - previous_ball_rel_waist)
+                (observation_ball_rel - previous_ball_rel_observation)
                 * self.ball_velocity_observation_scale,
-                jnp.zeros(3, dtype=jnp.float32),
+                previous_ball_rel_velocity_obs,
             ),
         )
         obs = obs.at[67:70].set(ball_rel_velocity_obs)
         obs = obs.at[70:73].set(observation_ball_rel)
-        obs = obs.at[73].set(jnp.linalg.norm(observation_ball_rel) * 2.0)
+        obs = obs.at[73].set(
+            self.ball_observation_distance(observation_ball_rel) * 2.0
+        )
         obs = obs.at[74].set(internal_rel_orientation / self.max_rotation_dist)
         obs = obs.at[75].set(internal_target_vel / self.max_rotation_diff)
 
         obs = jnp.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
-        return obs.astype(jnp.float32), head_z.astype(jnp.float32), observation_ball_rel
+        return (
+            obs.astype(jnp.float32),
+            head_z.astype(jnp.float32),
+            current_imu_linear_velocity.astype(jnp.float32),
+            observation_ball_rel,
+            ball_rel_velocity_obs.astype(jnp.float32),
+        )
 
-    def feet_floor_contact(self, data):
+    def _feet_floor_contact_indices(self, data):
         contact_pairs = jnp.stack(
             [
                 jnp.full_like(self.foot_geom_indices, self.floor_geom_id),
@@ -999,10 +1180,66 @@ class FcpDribblingEnv:
         mask = mask1 | mask2
         masked_dist = jnp.where(mask, data._impl.contact.dist[None, :], 1e4)
         indices = masked_dist.argmin(axis=1)
-        dists = data._impl.contact.dist[indices] * mask[jnp.arange(mask.shape[0]), indices]
-        return dists < 0.0
+        matched = mask[jnp.arange(mask.shape[0]), indices]
+        dists = jnp.where(matched, data._impl.contact.dist[indices], 1e4)
+        return indices, dists < 0.0
 
-    def _should_terminate(self, data, step_counter, in_eval_mode, ball_unseen_too_long):
+    def feet_floor_contact(self, data):
+        _, contacts = self._feet_floor_contact_indices(data)
+        return contacts
+
+    def _foot_contact_force_world(self, data, contact_indices):
+        contact = data._impl.contact
+        efc_addresses = jnp.asarray(contact.efc_address)[contact_indices]
+        safe_addresses = jnp.maximum(efc_addresses, 0)
+        pyramid_offsets = safe_addresses[:, None] + jnp.arange(10, dtype=jnp.int32)
+        pyramid_forces = jnp.take(
+            jnp.asarray(data._impl.efc_force), pyramid_offsets, mode="clip"
+        )
+        friction = jnp.asarray(contact.friction)[contact_indices]
+
+        force_contact = jnp.zeros((2, 3), dtype=jnp.float32)
+        force_contact = force_contact.at[:, 0].set(jnp.sum(pyramid_forces, axis=1))
+        force_contact = force_contact.at[:, 1].set(
+            (pyramid_forces[:, 0] - pyramid_forces[:, 1]) * friction[:, 0]
+        )
+        force_contact = force_contact.at[:, 2].set(
+            (pyramid_forces[:, 2] - pyramid_forces[:, 3]) * friction[:, 1]
+        )
+        force_contact = jnp.where(
+            (efc_addresses >= 0)[:, None], force_contact, jnp.zeros_like(force_contact)
+        )
+        return jnp.einsum(
+            "bi,bij->bj", force_contact, jnp.asarray(contact.frame)[contact_indices]
+        )
+
+    def feet_frp_observation(self, data):
+        contact_indices, contacts = self._feet_floor_contact_indices(data)
+        foot_site_pos = data.site_xpos[self.foot_site_indices]
+        foot_site_mat = data.site_xmat[self.foot_site_indices].reshape(2, 3, 3)
+
+        contact_pos_world = jnp.asarray(data._impl.contact.pos)[contact_indices]
+        contact_pos_local = jnp.einsum(
+            "bij,bj->bi",
+            jnp.swapaxes(foot_site_mat, 1, 2),
+            contact_pos_world - foot_site_pos,
+        )
+
+        force_world = self._foot_contact_force_world(data, contact_indices)
+        force_local = jnp.einsum(
+            "bij,bj->bi", jnp.swapaxes(foot_site_mat, 1, 2), force_world
+        )
+        force_local = jnp.where(force_local[:, 2:3] < 0.0, -force_local, force_local)
+
+        frp = jnp.concatenate([contact_pos_local, force_local], axis=1)
+        frp_scale = jnp.array(
+            [10.0, 10.0, 10.0, 0.01, 0.01, 0.01], dtype=jnp.float32
+        )
+        frp = frp * frp_scale
+        frp = jnp.where(contacts[:, None], frp, jnp.zeros_like(frp))
+        return frp[0].astype(jnp.float32), frp[1].astype(jnp.float32)
+
+    def _termination_flags(self, data, step_counter, in_eval_mode, ball_unseen_too_long):
         ball_rel = self.ball_position_waist(data)
         soft_ball_out = (
             (ball_rel[0] < self.ball_soft_x_min)
@@ -1018,7 +1255,27 @@ class FcpDribblingEnv:
         fallen = data.site_xpos[self.imu_site_id, 2] < self.min_imu_height
         clipped = jnp.any(jnp.abs(data.qvel[:3]) >= 100.0)
         eval_timeout = (step_counter > self.eval_max_steps) & in_eval_mode
-        return fallen | clipped | ball_unseen_too_long | ball_out | eval_timeout
+        return {
+            "ball_out": ball_out,
+            "ball_unseen": ball_unseen_too_long,
+            "clipped": clipped,
+            "eval_timeout": eval_timeout,
+            "fallen": fallen,
+            "hard_ball_out": hard_ball_out,
+            "soft_ball_out": soft_ball_out,
+        }
+
+    def _should_terminate(self, data, step_counter, in_eval_mode, ball_unseen_too_long):
+        flags = self._termination_flags(
+            data, step_counter, in_eval_mode, ball_unseen_too_long
+        )
+        return (
+            flags["fallen"]
+            | flags["clipped"]
+            | flags["ball_unseen"]
+            | flags["ball_out"]
+            | flags["eval_timeout"]
+        )
 
     def _settle_data(self, mjx_model, data):
         def settle_fn(settle_data, _):

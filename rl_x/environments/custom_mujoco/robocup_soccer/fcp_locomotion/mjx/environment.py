@@ -76,6 +76,10 @@ class FcpLocomotionEnv:
             ],
             dtype=jnp.int32,
         )
+        self.foot_site_indices = jnp.array(
+            [self.t1.ids.left.site_id, self.t1.ids.right.site_id],
+            dtype=jnp.int32,
+        )
 
         self.actuator_joint_names = [
             mujoco.mj_id2name(
@@ -138,6 +142,15 @@ class FcpLocomotionEnv:
         ]
         self.imu_angular_velocity_sensor_dim = self.initial_mj_model.sensor_dim[
             imu_angular_velocity_sensor_id
+        ]
+        imu_linear_velocity_sensor_id = self.initial_mj_model.sensor(
+            "imu_linear_velocity"
+        ).id
+        self.imu_linear_velocity_sensor_adr = self.initial_mj_model.sensor_adr[
+            imu_linear_velocity_sensor_id
+        ]
+        self.imu_linear_velocity_sensor_dim = self.initial_mj_model.sensor_dim[
+            imu_linear_velocity_sensor_id
         ]
 
         self.initial_ctrl = self.initial_qpos[self.actuator_joint_mask_qpos]
@@ -214,6 +227,7 @@ class FcpLocomotionEnv:
                     (self.history_length, self.base_observation_dim), dtype=jnp.float32
                 ),
                 "previous_head_z": jnp.float32(0.0),
+                "previous_imu_linear_velocity": jnp.zeros(3, dtype=jnp.float32),
                 "walk_core_state": self.control_function.init_state(),
                 "last_joint_target_speed": jnp.zeros(16, dtype=jnp.float32),
                 "virtual_target": jnp.zeros(2, dtype=jnp.float32),
@@ -262,6 +276,7 @@ class FcpLocomotionEnv:
             "second_last_action": last_action,
             "obs_history": obs_history,
             "previous_head_z": data.xpos[self.head_body_id, 2],
+            "previous_imu_linear_velocity": jnp.zeros(3, dtype=jnp.float32),
             "walk_core_state": walk_core_state,
             "last_joint_target_speed": jnp.zeros(16, dtype=jnp.float32),
             **target_state,
@@ -285,7 +300,7 @@ class FcpLocomotionEnv:
             self.target_function.internal_abs_orientation(data, internal_rel_orientation)
         )
 
-        current_base_observation, current_head_z = (
+        current_base_observation, current_head_z, current_imu_linear_velocity = (
             self.observation_function.build_current_base_observation(
                 data=data,
                 init=jnp.bool_(True),
@@ -296,12 +311,16 @@ class FcpLocomotionEnv:
                 walk_core_state=walk_core_state,
                 last_joint_target_speed=internal_state["last_joint_target_speed"],
                 previous_head_z=internal_state["previous_head_z"],
+                previous_imu_linear_velocity=internal_state[
+                    "previous_imu_linear_velocity"
+                ],
             )
         )
         next_observation = self.observation_function.compose(
             current_base_observation, obs_history
         )
         internal_state["previous_head_z"] = current_head_z
+        internal_state["previous_imu_linear_velocity"] = current_imu_linear_velocity
 
         return state.replace(
             data=data,
@@ -388,7 +407,7 @@ class FcpLocomotionEnv:
             data, internal_rel_orientation
         )
 
-        current_base_observation, current_head_z = (
+        current_base_observation, current_head_z, current_imu_linear_velocity = (
             self.observation_function.build_current_base_observation(
                 data=data,
                 init=jnp.bool_(False),
@@ -399,6 +418,9 @@ class FcpLocomotionEnv:
                 walk_core_state=walk_core_state,
                 last_joint_target_speed=last_joint_target_speed,
                 previous_head_z=state.internal_state["previous_head_z"],
+                previous_imu_linear_velocity=state.internal_state[
+                    "previous_imu_linear_velocity"
+                ],
             )
         )
         next_observation = self.observation_function.compose(
@@ -434,6 +456,7 @@ class FcpLocomotionEnv:
             "second_last_action": previous_action,
             "obs_history": next_obs_history,
             "previous_head_z": current_head_z,
+            "previous_imu_linear_velocity": current_imu_linear_velocity,
             "walk_core_state": walk_core_state,
             "last_joint_target_speed": last_joint_target_speed,
             "virtual_target": virtual_target_state["virtual_target"],

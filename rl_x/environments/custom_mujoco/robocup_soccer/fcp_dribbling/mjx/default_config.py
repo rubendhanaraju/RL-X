@@ -34,9 +34,13 @@ def get_config(environment_name):
             "mass": 0.41,
             "friction": "0.4 0.01 0.01",
             "solref": "-5000 -20",
-            "reset_rel_x_range": [0.22, 0.34],
-            "reset_rel_y_range": [-0.08, 0.08],
-            "reset_velocity_std": 0.15,
+            "reset_rel_x_range": [0.21, 0.25],
+            "reset_rel_y_range": [-0.025, 0.025],
+            "reset_use_foot_clearance": True,
+            "reset_foot_clearance_range": [0.01, 0.045],
+            "reset_velocity_std": 0.0,
+            "observation_frame_offset": [0.0, 0.0, 0.24],
+            "observation_distance_xy_only": True,
             "velocity_observation_scale": 10.0,
         },
         "sensing": {
@@ -59,8 +63,8 @@ def get_config(environment_name):
             "eval_right_orientation": 170.0,
         },
         "reward": {
-            "alive_bonus": 0.1,
-            "scale": 10.0,
+            "alive_bonus": 0.01,
+            "scale": 1.0,
         },
         "termination": {
             "min_imu_height": 0.4,

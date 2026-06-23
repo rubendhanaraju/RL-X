@@ -7,11 +7,15 @@ from ..math_functions.rotation import roll_pitch_from_mat_deg
 
 class WalkRl3Observation:
     def __init__(self, env):
+        observation_config = env.env_config["observation"]
         self.env = env
         self.history_length = 0
         self.base_observation_dim = 63
+        self.foot_position_frame_offset = jnp.array(
+            observation_config["foot_position_frame_offset"], dtype=jnp.float32
+        )
 
-    def feet_floor_contact(self, data):
+    def _feet_floor_contact_indices(self, data):
         contact_pairs = jnp.stack(
             [
                 jnp.full_like(self.env.foot_geom_indices, self.env.floor_geom_id),
@@ -35,8 +39,64 @@ class WalkRl3Observation:
         mask = mask1 | mask2
         masked_dist = jnp.where(mask, data._impl.contact.dist[None, :], 1e4)
         indices = masked_dist.argmin(axis=1)
-        dists = data._impl.contact.dist[indices] * mask[jnp.arange(mask.shape[0]), indices]
-        return dists < 0.0
+        matched = mask[jnp.arange(mask.shape[0]), indices]
+        dists = jnp.where(matched, data._impl.contact.dist[indices], 1e4)
+        return indices, dists < 0.0
+
+    def feet_floor_contact(self, data):
+        _, contacts = self._feet_floor_contact_indices(data)
+        return contacts
+
+    def _foot_contact_force_world(self, data, contact_indices):
+        contact = data._impl.contact
+        efc_addresses = jnp.asarray(contact.efc_address)[contact_indices]
+        safe_addresses = jnp.maximum(efc_addresses, 0)
+        pyramid_offsets = safe_addresses[:, None] + jnp.arange(10, dtype=jnp.int32)
+        pyramid_forces = jnp.take(
+            jnp.asarray(data._impl.efc_force), pyramid_offsets, mode="clip"
+        )
+        friction = jnp.asarray(contact.friction)[contact_indices]
+
+        force_contact = jnp.zeros((2, 3), dtype=jnp.float32)
+        force_contact = force_contact.at[:, 0].set(jnp.sum(pyramid_forces, axis=1))
+        force_contact = force_contact.at[:, 1].set(
+            (pyramid_forces[:, 0] - pyramid_forces[:, 1]) * friction[:, 0]
+        )
+        force_contact = force_contact.at[:, 2].set(
+            (pyramid_forces[:, 2] - pyramid_forces[:, 3]) * friction[:, 1]
+        )
+        force_contact = jnp.where(
+            (efc_addresses >= 0)[:, None], force_contact, jnp.zeros_like(force_contact)
+        )
+        return jnp.einsum(
+            "bi,bij->bj", force_contact, jnp.asarray(contact.frame)[contact_indices]
+        )
+
+    def feet_frp_observation(self, data):
+        contact_indices, contacts = self._feet_floor_contact_indices(data)
+        foot_site_pos = data.site_xpos[self.env.foot_site_indices]
+        foot_site_mat = data.site_xmat[self.env.foot_site_indices].reshape(2, 3, 3)
+
+        contact_pos_world = jnp.asarray(data._impl.contact.pos)[contact_indices]
+        contact_pos_local = jnp.einsum(
+            "bij,bj->bi",
+            jnp.swapaxes(foot_site_mat, 1, 2),
+            contact_pos_world - foot_site_pos,
+        )
+
+        force_world = self._foot_contact_force_world(data, contact_indices)
+        force_local = jnp.einsum(
+            "bij,bj->bi", jnp.swapaxes(foot_site_mat, 1, 2), force_world
+        )
+        force_local = jnp.where(force_local[:, 2:3] < 0.0, -force_local, force_local)
+
+        frp = jnp.concatenate([contact_pos_local, force_local], axis=1)
+        frp_scale = jnp.array(
+            [10.0, 10.0, 10.0, 0.01, 0.01, 0.01], dtype=jnp.float32
+        )
+        frp = frp * frp_scale
+        frp = jnp.where(contacts[:, None], frp, jnp.zeros_like(frp))
+        return frp[0].astype(jnp.float32), frp[1].astype(jnp.float32)
 
     def build_current_base_observation(
         self,
@@ -49,6 +109,7 @@ class WalkRl3Observation:
         walk_core_state,
         last_joint_target_speed,
         previous_head_z,
+        previous_imu_linear_velocity,
     ):
         obs = jnp.zeros(self.base_observation_dim, dtype=jnp.float32)
 
@@ -68,7 +129,16 @@ class WalkRl3Observation:
             * 180.0
             / jnp.pi
         )
-        proper_acc = data.qacc[:3]
+        current_imu_linear_velocity = data.sensordata[
+            self.env.imu_linear_velocity_sensor_adr:
+            self.env.imu_linear_velocity_sensor_adr
+            + self.env.imu_linear_velocity_sensor_dim
+        ]
+        proper_acc = jnp.where(
+            init,
+            jnp.zeros(3, dtype=jnp.float32),
+            (current_imu_linear_velocity - previous_imu_linear_velocity) / self.env.dt,
+        )
 
         obs = obs.at[0].set(jnp.minimum(step_counter, 15 * 8) / 100.0)
         obs = obs.at[1].set(head_pos[2] * 3.0)
@@ -78,16 +148,14 @@ class WalkRl3Observation:
         obs = obs.at[5:8].set(imu_angular_velocity_deg / 100.0)
         obs = obs.at[8:11].set(proper_acc / 10.0)
 
-        contacts = self.feet_floor_contact(data).astype(jnp.float32)
-        left_frp = jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, contacts[0]], dtype=jnp.float32)
-        right_frp = jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, contacts[1]], dtype=jnp.float32)
+        left_frp, right_frp = self.feet_frp_observation(data)
         obs = obs.at[11:17].set(left_frp)
         obs = obs.at[17:23].set(right_frp)
 
-        left_foot_pos = self._site_pos_in_body_frame(
+        left_foot_pos = self._site_pos_in_observation_frame(
             data, self.env.t1.ids.waist_body_id, self.env.t1.ids.left.site_id
         )
-        right_foot_pos = self._site_pos_in_body_frame(
+        right_foot_pos = self._site_pos_in_observation_frame(
             data, self.env.t1.ids.waist_body_id, self.env.t1.ids.right.site_id
         )
         left_foot_rot = self._site_rpy_in_body_frame_deg(
@@ -137,7 +205,11 @@ class WalkRl3Observation:
         )
 
         obs = jnp.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
-        return obs.astype(jnp.float32), head_pos[2].astype(jnp.float32)
+        return (
+            obs.astype(jnp.float32),
+            head_pos[2].astype(jnp.float32),
+            current_imu_linear_velocity.astype(jnp.float32),
+        )
 
     def compose(self, current_base_observation, obs_history):
         del obs_history
@@ -160,6 +232,12 @@ class WalkRl3Observation:
         body_pos = data.xpos[body_id]
         body_mat = data.xmat[body_id].reshape(3, 3)
         return body_mat.T @ (data.site_xpos[site_id] - body_pos)
+
+    def _site_pos_in_observation_frame(self, data, body_id, site_id):
+        return (
+            self._site_pos_in_body_frame(data, body_id, site_id)
+            + self.foot_position_frame_offset
+        )
 
     @staticmethod
     def _site_rpy_in_body_frame_deg(data, body_id, site_id):
