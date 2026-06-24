@@ -228,6 +228,7 @@ class FcpLocomotionEnv:
                 ),
                 "previous_head_z": jnp.float32(0.0),
                 "previous_imu_linear_velocity": jnp.zeros(3, dtype=jnp.float32),
+                "previous_forward_x": jnp.float32(0.0),
                 "walk_core_state": self.control_function.init_state(),
                 "last_joint_target_speed": jnp.zeros(16, dtype=jnp.float32),
                 "virtual_target": jnp.zeros(2, dtype=jnp.float32),
@@ -277,6 +278,7 @@ class FcpLocomotionEnv:
             "obs_history": obs_history,
             "previous_head_z": data.xpos[self.head_body_id, 2],
             "previous_imu_linear_velocity": jnp.zeros(3, dtype=jnp.float32),
+            "previous_forward_x": data.qpos[0].astype(jnp.float32),
             "walk_core_state": walk_core_state,
             "last_joint_target_speed": jnp.zeros(16, dtype=jnp.float32),
             **target_state,
@@ -372,6 +374,7 @@ class FcpLocomotionEnv:
             internal_abs_target=state.internal_state["internal_abs_target"],
             internal_linear_distance=state.internal_state["internal_linear_distance"],
             internal_abs_orientation=state.internal_state["internal_abs_orientation"],
+            previous_forward_x=state.internal_state["previous_forward_x"],
         )
 
         random_target_state = self.target_function.update_virtual_target(
@@ -445,10 +448,12 @@ class FcpLocomotionEnv:
             "env_info/linear_distance": reward_info["linear_distance"],
             "env_info/angular_distance": reward_info["angular_distance"],
             "env_info/root_height": data.site_xpos[self.imu_site_id, 2],
+            "env_info/forward_x": data.qpos[0].astype(jnp.float32),
             "reward/total": reward,
             "reward/progress": reward_info["progress"],
             "reward/orientation_multiplier": reward_info["orientation_multiplier"],
             "reward/idle": reward_info["idle"],
+            "reward/forward_displacement": reward_info["forward_displacement"],
         }
         next_internal_state = {
             "in_eval_mode": state.internal_state["in_eval_mode"],
@@ -457,6 +462,7 @@ class FcpLocomotionEnv:
             "obs_history": next_obs_history,
             "previous_head_z": current_head_z,
             "previous_imu_linear_velocity": current_imu_linear_velocity,
+            "previous_forward_x": data.qpos[0].astype(jnp.float32),
             "walk_core_state": walk_core_state,
             "last_joint_target_speed": last_joint_target_speed,
             "virtual_target": virtual_target_state["virtual_target"],

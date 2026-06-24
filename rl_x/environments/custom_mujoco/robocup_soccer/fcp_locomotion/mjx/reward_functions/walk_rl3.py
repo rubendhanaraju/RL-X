@@ -22,10 +22,12 @@ class WalkRl3Reward:
             "env_info/linear_distance": jnp.float32(0.0),
             "env_info/angular_distance": jnp.float32(0.0),
             "env_info/root_height": jnp.float32(0.0),
+            "env_info/forward_x": jnp.float32(0.0),
             "reward/total": jnp.float32(0.0),
             "reward/progress": jnp.float32(0.0),
             "reward/orientation_multiplier": jnp.float32(1.0),
             "reward/idle": jnp.float32(0.0),
+            "reward/forward_displacement": jnp.float32(0.0),
         }
 
     def reward_and_info(
@@ -35,7 +37,9 @@ class WalkRl3Reward:
         internal_abs_target,
         internal_linear_distance,
         internal_abs_orientation,
+        previous_forward_x=None,
     ):
+        del previous_forward_x
         head_xy = data.xpos[self.env.head_body_id, :2]
         linear_distance = jnp.linalg.norm(internal_abs_target - head_xy)
         linear_distance_diff = internal_linear_distance - linear_distance
@@ -63,5 +67,6 @@ class WalkRl3Reward:
             "progress": (linear_distance_diff / self.visual_step).astype(jnp.float32),
             "orientation_multiplier": orientation_multiplier.astype(jnp.float32),
             "idle": idle_reward.astype(jnp.float32),
+            "forward_displacement": jnp.float32(0.0),
         }
         return reward, info

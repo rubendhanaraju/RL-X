@@ -3,8 +3,10 @@
 Paper-style benchmark for explicit GMM learning with GMM-constrained BMS.
 
 Compares:
-  - our_gmm: corrected Brownian-bridge/SI direct-GMM BMS
-  - our_gmm_iw: importance-weighted endpoint projection baseline (not the plain BMS fixed-point update)
+  - our_gmm: corrected Brownian-bridge/SI direct-GMM BMS, using --our_covariance_type
+  - our_gmm_<cov>: direct-GMM BMS with cov in {diagonal,spherical,lowrank,tied,full}
+  - our_gmm_<cov>_iw: endpoint-IW diagnostic for the same covariance family
+  - our_gmm_all / our_gmm_all_iw: expand to all covariance families
   - pure_bms: regular BMS sampler endpoint samples
   - bms_posthoc_kmeans: train BMS, fit diagonal GMM to BMS samples with kmeans++ EM
   - bms_posthoc_ourinit: train BMS, fit diagonal GMM to BMS samples initialized from our GMM init
@@ -41,7 +43,7 @@ Example high-dimensional run:
   python gmm_bms_paper_experiments.py \
     --dims 16,32,64,100 \
     --seeds 0,1,2 \
-    --methods bms_posthoc_kmeans,bms_posthoc_ourinit,our_gmm,oracle_em \
+    --methods bms_posthoc_kmeans,bms_posthoc_ourinit,our_gmm_diagonal,our_gmm_lowrank,oracle_em \
     --target_modes 20 --mode_scale 20 --target_var 1.0 \
     --gmm_components 32 \
     --steps 50000 --our_steps 50000 \
@@ -103,7 +105,7 @@ def write_csv(path, rows):
 def summarize_rows(rows):
     if not rows:
         return []
-    group_keys = ['method', 'dim', 'target_modes', 'gmm_components', 'em_init', 'importance_weights']
+    group_keys = ['method', 'covariance_type', 'dim', 'target_modes', 'gmm_components', 'em_init', 'importance_weights']
     groups = {}
     for r in rows:
         key = tuple(r.get(k, '') for k in group_keys)
@@ -281,24 +283,101 @@ def sliced_tvd_np(x, y, n_proj=100, bins=50, rng=None):
     return float(np.mean(tvds))
 
 
+def _gmm_covariance_type_np(gmm):
+    return str(gmm.get('covariance_type', 'diagonal'))
+
+
+def log_general_gmm_np(x, gmm):
+    """Log density for diagonal/spherical/lowrank/tied/full GMM dictionaries.
+
+    The learned covariance-generic GMMs always include either a diagonal
+    projection (`vars`) or full component covariances (`covs`).  For non-diagonal
+    families, use the full covariance when available so density metrics evaluate
+    the actual model rather than its diagonal projection.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    weights = np.asarray(gmm['weights'], dtype=np.float64)
+    weights = np.maximum(weights, 1e-300)
+    weights = weights / weights.sum()
+    means = np.asarray(gmm['means'], dtype=np.float64)
+    cov_type = _gmm_covariance_type_np(gmm)
+
+    if cov_type in ('diagonal', 'spherical') or 'covs' not in gmm:
+        return log_diag_gmm_np(x, weights, means, np.asarray(gmm['vars'], dtype=np.float64))
+
+    covs = np.asarray(gmm['covs'], dtype=np.float64)
+    n, d = x.shape
+    k = means.shape[0]
+    log_comp = np.empty((n, k), dtype=np.float64)
+    const = d * np.log(2.0 * np.pi)
+    for i in range(k):
+        cov = 0.5 * (covs[i] + covs[i].T)
+        # Add a tiny jitter only for numerical robustness in offline metrics.
+        jitter = 1e-10 * (np.trace(cov) / max(d, 1) + 1.0)
+        L = np.linalg.cholesky(cov + jitter * np.eye(d))
+        diff = x - means[i]
+        sol = np.linalg.solve(L, diff.T).T
+        quad = np.sum(sol**2, axis=1)
+        logdet = 2.0 * np.sum(np.log(np.diag(L)))
+        log_comp[:, i] = np.log(weights[i]) - 0.5 * (const + logdet + quad)
+    return _logsumexp_np(log_comp, axis=1)
+
+
+def sample_general_gmm_np(rng, gmm, n):
+    weights = np.asarray(gmm['weights'], dtype=np.float64)
+    weights = np.maximum(weights, 0.0)
+    weights = weights / weights.sum()
+    means = np.asarray(gmm['means'], dtype=np.float64)
+    cov_type = _gmm_covariance_type_np(gmm)
+    comp = rng.choice(means.shape[0], size=n, p=weights)
+    d = means.shape[1]
+
+    if cov_type in ('diagonal', 'spherical') or 'covs' not in gmm:
+        vars_ = np.asarray(gmm['vars'], dtype=np.float64)
+        eps = rng.normal(size=(n, d))
+        return (means[comp] + np.sqrt(vars_[comp]) * eps).astype(np.float32)
+
+    if cov_type == 'lowrank' and 'diag_vars' in gmm and 'lowrank_factors' in gmm:
+        diag_vars = np.asarray(gmm['diag_vars'], dtype=np.float64)
+        U = np.asarray(gmm['lowrank_factors'], dtype=np.float64)
+        r = U.shape[-1]
+        eps_d = rng.normal(size=(n, d))
+        eps_r = rng.normal(size=(n, r))
+        return (means[comp] + np.sqrt(diag_vars[comp]) * eps_d + np.einsum('ndr,nr->nd', U[comp], eps_r)).astype(
+            np.float32)
+
+    covs = np.asarray(gmm['covs'], dtype=np.float64)
+    out = np.empty((n, d), dtype=np.float64)
+    for i in range(means.shape[0]):
+        idx = np.where(comp == i)[0]
+        if len(idx) == 0:
+            continue
+        cov = 0.5 * (covs[i] + covs[i].T)
+        jitter = 1e-10 * (np.trace(cov) / max(d, 1) + 1.0)
+        L = np.linalg.cholesky(cov + jitter * np.eye(d))
+        eps = rng.normal(size=(len(idx), d))
+        out[idx] = means[i] + eps @ L.T
+    return out.astype(np.float32)
+
+
 def estimate_forward_kl_to_gmm(rng, target, gmm, n=20000):
     x = sample_target_np(rng, target, n)
     logp = target_log_prob_np(x, target)
-    logq = log_diag_gmm_np(x, gmm['weights'], gmm['means'], gmm['vars'])
+    logq = log_general_gmm_np(x, gmm)
     return float(np.mean(logp - logq))
 
 
 def estimate_reverse_kl_to_target(rng, target, gmm, n=20000):
-    x = sample_diag_gmm_np(rng, gmm, n)
-    logq = log_diag_gmm_np(x, gmm['weights'], gmm['means'], gmm['vars'])
+    x = sample_general_gmm_np(rng, gmm, n)
+    logq = log_general_gmm_np(x, gmm)
     logp = target_log_prob_np(x, target)
     return float(np.mean(logq - logp))
 
 
 def estimate_importance_ess(rng, target, gmm, n=20000):
-    x = sample_diag_gmm_np(rng, gmm, n)
+    x = sample_general_gmm_np(rng, gmm, n)
     logp = target_log_prob_np(x, target)
-    logq = log_diag_gmm_np(x, gmm['weights'], gmm['means'], gmm['vars'])
+    logq = log_general_gmm_np(x, gmm)
     lw = logp - logq
     lw = lw - np.max(lw)
     w = np.exp(lw)
@@ -628,29 +707,134 @@ def train_pure_bms(args, key, target, dim):
 
 # -----------------------------------------------------------------------------
 # Our corrected Brownian-bridge/SI GMM-BMS
+# Supports spherical, diagonal, low-rank+diagonal, tied full, and full terminal
+# covariance parameterizations.  All variants use the same corrected path:
+#   S_k(t) = (1-t)^2 v0 I + t^2 Sigma_k + sigma^2 t(1-t) I.
 # -----------------------------------------------------------------------------
+
+COVARIANCE_TYPES = ('diagonal', 'spherical', 'lowrank', 'tied', 'full')
+COVARIANCE_ALIASES = {
+    'diag': 'diagonal',
+    'diagonal': 'diagonal',
+    'sphere': 'spherical',
+    'spherical': 'spherical',
+    'lowrank': 'lowrank',
+    'lowrankdiag': 'lowrank',
+    'lowrank_diag': 'lowrank',
+    'lowrank+diag': 'lowrank',
+    'tied': 'tied',
+    'full': 'full',
+}
+
+
+def normalize_covariance_type(covariance_type: str) -> str:
+    key = str(covariance_type).strip().lower().replace('-', '_')
+    if key not in COVARIANCE_ALIASES:
+        raise ValueError(f'Unknown covariance type {covariance_type!r}; valid types are {COVARIANCE_TYPES}')
+    return COVARIANCE_ALIASES[key]
+
+
+def parse_covariance_type_list(s: str):
+    return [normalize_covariance_type(x) for x in str(s).split(',') if x.strip()]
 
 
 def positive_terminal_vars(raw_logvars: jnp.ndarray, var_floor: float) -> jnp.ndarray:
-    """Map unconstrained parameters to strictly positive diagonal variances.
+    """Map unconstrained parameters to strictly positive variances.
 
-    The original exp(clip(.)) map is numerically safe, but it creates zero
-    gradients once a variance parameter leaves the clipping interval.  Softplus
-    preserves useful gradients while still enforcing positivity.  The argument
-    name is kept for backward compatibility with the rest of the script.
+    Softplus preserves gradients while still enforcing positivity.  The argument
+    name is kept for backward compatibility with the original diagonal script.
     """
     return var_floor + jax.nn.softplus(raw_logvars) + 1e-8
 
 
+def _inv_softplus_np(y: float) -> float:
+    y = float(max(y, 1e-8))
+    if y > 20.0:
+        return y
+    return float(np.log(np.expm1(y)))
+
+
+def positive_cholesky_from_raw(raw_chol: jnp.ndarray, var_floor: float) -> jnp.ndarray:
+    """Lower-triangular Cholesky factor with positive diagonal.
+
+    raw_chol may have shape (..., d, d). Off-diagonal lower-triangular entries
+    are unconstrained. The diagonal is sqrt(var_floor)+softplus(raw_diag), so
+    L L^T is strictly positive definite.
+    """
+    raw_chol = jnp.asarray(raw_chol)
+    lower = jnp.tril(raw_chol, k=-1)
+    raw_diag = jnp.diagonal(raw_chol, axis1=-2, axis2=-1)
+    diag = jnp.sqrt(jnp.asarray(var_floor, dtype=raw_chol.dtype)) + jax.nn.softplus(raw_diag)
+    eye = jnp.eye(raw_chol.shape[-1], dtype=raw_chol.dtype)
+    return lower + jnp.einsum('...i,ij->...ij', diag, eye)
+
+
+def _covariance_type_from_params(params) -> str:
+    if 'raw_chol_T' in params:
+        return 'full'
+    if 'raw_tied_chol_T' in params:
+        return 'tied'
+    if 'lowrank_factors_T' in params:
+        return 'lowrank'
+    if 'raw_spherical_logvars_T' in params:
+        return 'spherical'
+    if 'raw_logvars_T' in params:
+        return 'diagonal'
+    raise ValueError(f'Cannot infer covariance type from parameter keys: {sorted(params.keys())}')
+
+
 def terminal_params_from_flax_params(params, var_floor: float):
+    """Return a covariance-generic description of q_{phi,1}.
+
+    Structures:
+      diagonal/spherical: {kind, logits, means, vars}
+      lowrank:            {kind, logits, means, diag_vars, U}
+      tied/full:          {kind, logits, means, covs}
+    """
+    kind = _covariance_type_from_params(params)
     logits = params['logits']
     means_T = params['means_T']
-    vars_T = positive_terminal_vars(params['raw_logvars_T'], var_floor)
-    return logits, means_T, vars_T
+    k, dim = means_T.shape
+
+    if kind == 'diagonal':
+        vars_T = positive_terminal_vars(params['raw_logvars_T'], var_floor)
+        return {'kind': kind, 'logits': logits, 'means': means_T, 'vars': vars_T}
+
+    if kind == 'spherical':
+        scalar_vars = positive_terminal_vars(params['raw_spherical_logvars_T'], var_floor)
+        vars_T = jnp.broadcast_to(scalar_vars[:, None], (k, dim))
+        return {'kind': kind, 'logits': logits, 'means': means_T, 'vars': vars_T, 'spherical_vars': scalar_vars}
+
+    if kind == 'lowrank':
+        diag_vars = positive_terminal_vars(params['raw_logvars_T'], var_floor)
+        U = params['lowrank_factors_T']
+        return {'kind': kind, 'logits': logits, 'means': means_T, 'diag_vars': diag_vars, 'U': U}
+
+    if kind == 'full':
+        L = positive_cholesky_from_raw(params['raw_chol_T'], var_floor)
+        covs = jnp.einsum('kij,klj->kil', L, L)
+        return {'kind': kind, 'logits': logits, 'means': means_T, 'covs': covs, 'chol': L}
+
+    if kind == 'tied':
+        L = positive_cholesky_from_raw(params['raw_tied_chol_T'], var_floor)
+        cov = L @ L.T
+        covs = jnp.broadcast_to(cov[None, :, :], (k, dim, dim))
+        return {'kind': kind, 'logits': logits, 'means': means_T, 'covs': covs, 'chol': L}
+
+    raise ValueError(f'Unknown covariance type: {kind}')
 
 
-def terminal_gmm_log_prob_jax(params, x, var_floor):
-    logits, means_T, vars_T = terminal_params_from_flax_params(params, var_floor)
+def terminal_diag_variances_for_metrics(params, var_floor: float) -> jnp.ndarray:
+    """Diagonal of terminal covariance, used for diagnostics/regularization."""
+    info = terminal_params_from_flax_params(params, var_floor)
+    if 'vars' in info:
+        return info['vars']
+    if info['kind'] == 'lowrank':
+        return info['diag_vars'] + jnp.sum(info['U']**2, axis=-1)
+    return jnp.diagonal(info['covs'], axis1=-2, axis2=-1)
+
+
+def _diag_terminal_log_prob_jax(logits, means_T, vars_T, x: jnp.ndarray) -> jnp.ndarray:
     diff = x[:, None, :] - means_T[None, :, :]
     log_weights = jax.nn.log_softmax(logits)
     log_comp = log_weights[None, :] - 0.5 * jnp.sum(
@@ -658,63 +842,185 @@ def terminal_gmm_log_prob_jax(params, x, var_floor):
     return jax.nn.logsumexp(log_comp, axis=-1)
 
 
-def sample_terminal_gmm_jax(params, key, n: int, var_floor: float):
-    logits, means_T, vars_T = terminal_params_from_flax_params(params, var_floor)
-    key_comp, key_noise = jax.random.split(key)
-    comp = jax.random.categorical(key_comp, logits, shape=(n,))
-    eps = jax.random.normal(key_noise, (n, means_T.shape[-1]), dtype=means_T.dtype)
-    return means_T[comp] + jnp.sqrt(vars_T[comp]) * eps
+def _lowrank_solve_logdet_jax(diag_vars: jnp.ndarray, U: jnp.ndarray, y: jnp.ndarray):
+    """Solve (D + U U^T)z = y and compute logdet via Woodbury.
 
-
-def gmm_path_control_from_raw(logits, means_T, raw_logvars_T, x, t, sigma, var_floor, prior_var):
-    """Corrected direct-GMM BMS/SI control u_phi(x,t).
-
-    Terminal model:
-        q_phi,1(x) = sum_k pi_k N(x; mu_k, diag(v_k)).
-
-    The BMS bridge / linear stochastic-interpolant samples are
-        X_t = (1-t)X_0 + tX_1 + sigma*sqrt(t(1-t))*Z,
-    with X_0 ~ N(0, prior_var I) and X_1|C=k ~ N(mu_k, diag(v_k)).
-    Therefore the component marginal path is
-        m_k(t) = t mu_k,
-        S_k(t) = (1-t)^2 prior_var I + t^2 diag(v_k)
-                 + sigma^2 t(1-t) I.
-
-    The physical forward SDE drift preserving this path is
-        b_k(x,t) = mu_k + A_k(t)(x - t mu_k),
-        A_k(t) = 0.5*(dS_k/dt - sigma^2 I)*S_k(t)^{-1}
-               = [t(diag(v_k)-sigma^2 I) - (1-t)prior_var I] S_k(t)^{-1}.
-
-    The returned value is the BMS control u_phi=b_phi/sigma, where
-        b_phi(x,t)=sum_k r_k(x,t)b_k(x,t).
+    Shapes:
+      diag_vars: (B,K,d)
+      U:         (B,K,d,r)
+      y:         (B,K,d)
     """
-    # Training already samples t in [t_eps, 1-t_eps]; this guard only prevents
-    # accidental endpoint singularities in responsibilities and drift factors.
+    d_inv_y = y / diag_vars
+    d_inv_U = U / diag_vars[..., None]
+    gram = jnp.einsum('bkdr,bkds->bkrs', U, d_inv_U)
+    r = U.shape[-1]
+    middle = gram + jnp.eye(r, dtype=U.dtype)[None, None, :, :]
+    rhs = jnp.einsum('bkdr,bkd->bkr', U, d_inv_y)
+    alpha = jnp.linalg.solve(middle, rhs[..., None])[..., 0]
+    correction = jnp.einsum('bkdr,bkr->bkd', d_inv_U, alpha)
+    z = d_inv_y - correction
+    _, logdet_middle = jnp.linalg.slogdet(middle)
+    logdet = jnp.sum(jnp.log(diag_vars), axis=-1) + logdet_middle
+    return z, logdet
+
+
+def _lowrank_terminal_log_prob_jax(logits, means_T, diag_vars, U, x: jnp.ndarray) -> jnp.ndarray:
+    diff = x[:, None, :] - means_T[None, :, :]
+    b = x.shape[0]
+    diag_b = jnp.broadcast_to(diag_vars[None, :, :], (b,) + diag_vars.shape)
+    U_b = jnp.broadcast_to(U[None, :, :, :], (b,) + U.shape)
+    z, logdet = _lowrank_solve_logdet_jax(diag_b, U_b, diff)
+    quad = jnp.sum(diff * z, axis=-1)
+    log_weights = jax.nn.log_softmax(logits)
+    dim = means_T.shape[-1]
+    log_comp = log_weights[None, :] - 0.5 * (dim * jnp.log(2.0 * jnp.pi) + logdet + quad)
+    return jax.nn.logsumexp(log_comp, axis=-1)
+
+
+def _full_terminal_log_prob_jax(logits, means_T, covs, x: jnp.ndarray) -> jnp.ndarray:
+    diff = x[:, None, :] - means_T[None, :, :]
+    z = jnp.linalg.solve(covs[None, :, :, :], diff[..., None])[..., 0]
+    quad = jnp.sum(diff * z, axis=-1)
+    _, logdet = jnp.linalg.slogdet(covs)
+    log_weights = jax.nn.log_softmax(logits)
+    dim = means_T.shape[-1]
+    log_comp = log_weights[None, :] - 0.5 * (dim * jnp.log(2.0 * jnp.pi) + logdet[None, :] + quad)
+    return jax.nn.logsumexp(log_comp, axis=-1)
+
+
+def terminal_gmm_log_prob_jax(params, x, var_floor):
+    info = terminal_params_from_flax_params(params, var_floor)
+    if info['kind'] in ('diagonal', 'spherical'):
+        return _diag_terminal_log_prob_jax(info['logits'], info['means'], info['vars'], x)
+    if info['kind'] == 'lowrank':
+        return _lowrank_terminal_log_prob_jax(info['logits'], info['means'], info['diag_vars'], info['U'], x)
+    if info['kind'] in ('full', 'tied'):
+        return _full_terminal_log_prob_jax(info['logits'], info['means'], info['covs'], x)
+    raise ValueError(f"Unknown covariance type: {info['kind']}")
+
+
+def sample_terminal_gmm_jax(params, key, n: int, var_floor: float):
+    info = terminal_params_from_flax_params(params, var_floor)
+    logits = info['logits']
+    means_T = info['means']
+    key_comp, key_noise, key_noise2 = jax.random.split(key, 3)
+    comp = jax.random.categorical(key_comp, logits, shape=(n,))
+    dim = means_T.shape[-1]
+
+    if info['kind'] in ('diagonal', 'spherical'):
+        eps = jax.random.normal(key_noise, (n, dim), dtype=means_T.dtype)
+        return means_T[comp] + jnp.sqrt(info['vars'][comp]) * eps
+
+    if info['kind'] == 'lowrank':
+        eps_d = jax.random.normal(key_noise, (n, dim), dtype=means_T.dtype)
+        r = info['U'].shape[-1]
+        eps_r = jax.random.normal(key_noise2, (n, r), dtype=means_T.dtype)
+        return means_T[comp] + jnp.sqrt(info['diag_vars'][comp]) * eps_d + jnp.einsum(
+            'ndr,nr->nd', info['U'][comp], eps_r)
+
+    if info['kind'] in ('full', 'tied'):
+        eps = jax.random.normal(key_noise, (n, dim), dtype=means_T.dtype)
+        chol = jnp.linalg.cholesky(info['covs'][comp])
+        return means_T[comp] + jnp.einsum('nij,nj->ni', chol, eps)
+
+    raise ValueError(f"Unknown covariance type: {info['kind']}")
+
+
+def _diag_gmm_path_control(info, x: jnp.ndarray, t: jnp.ndarray, sigma: float, prior_var: float) -> jnp.ndarray:
+    logits = info['logits']
+    means_T = info['means']
+    vars_T = info['vars']
     t = jnp.clip(t, 1e-4, 1.0 - 1e-4)
     t3 = t[:, None, None]
-    vars_T = positive_terminal_vars(raw_logvars_T, var_floor)
 
     mu_t = t3 * means_T[None, :, :]
-    dmu_dt = means_T[None, :, :]
-
-    # Correct Brownian-bridge / stochastic-interpolant covariance path.
-    # Do NOT use the old linear covariance (1-t)*prior_var + t*vars_T here;
-    # that is not the marginal covariance of the bridge used by BMS.
     var_t = ((1.0 - t3)**2) * prior_var + (t3**2) * vars_T[None, :, :] + (sigma**2) * t3 * (1.0 - t3)
-
-    # Equivalent to 0.5*(dvar_dt - sigma^2)/var_t for the corrected var_t.
     A_diag = (t3 * (vars_T[None, :, :] - sigma**2) - (1.0 - t3) * prior_var) / var_t
-
     x_centered = x[:, None, :] - mu_t
-    component_drift = dmu_dt + A_diag * x_centered
+    component_drift = means_T[None, :, :] + A_diag * x_centered
+
     log_weights = jax.nn.log_softmax(logits)
-    log_comp = log_weights[None, :] - 0.5 * jnp.sum(
-        jnp.log(2.0 * jnp.pi * var_t) + x_centered**2 / var_t,
-        axis=-1,
-    )
+    log_comp = log_weights[None, :] - 0.5 * jnp.sum(jnp.log(2.0 * jnp.pi * var_t) + x_centered**2 / var_t, axis=-1)
     resp = jax.nn.softmax(log_comp, axis=-1)
     actual_drift = jnp.sum(resp[:, :, None] * component_drift, axis=1)
     return actual_drift / sigma
+
+
+def _lowrank_gmm_path_control(info, x: jnp.ndarray, t: jnp.ndarray, sigma: float, prior_var: float) -> jnp.ndarray:
+    logits = info['logits']
+    means_T = info['means']
+    diag_T = info['diag_vars']
+    U_T = info['U']
+    t = jnp.clip(t, 1e-4, 1.0 - 1e-4)
+    t3 = t[:, None, None]
+    t4 = t[:, None, None, None]
+
+    mu_t = t3 * means_T[None, :, :]
+    y = x[:, None, :] - mu_t
+    diag_t = ((1.0 - t3)**2) * prior_var + (t3**2) * diag_T[None, :, :] + (sigma**2) * t3 * (1.0 - t3)
+    U_t = t4 * U_T[None, :, :, :]
+    z, logdet = _lowrank_solve_logdet_jax(diag_t, U_t, y)
+
+    diag_A_times_z = (t3 * (diag_T[None, :, :] - sigma**2) - (1.0 - t3) * prior_var) * z
+    lowrank_A_times_z = t3 * jnp.einsum('kdr,bkr->bkd', U_T, jnp.einsum('kdr,bkd->bkr', U_T, z))
+    component_drift = means_T[None, :, :] + diag_A_times_z + lowrank_A_times_z
+
+    quad = jnp.sum(y * z, axis=-1)
+    log_weights = jax.nn.log_softmax(logits)
+    dim = means_T.shape[-1]
+    log_comp = log_weights[None, :] - 0.5 * (dim * jnp.log(2.0 * jnp.pi) + logdet + quad)
+    resp = jax.nn.softmax(log_comp, axis=-1)
+    actual_drift = jnp.sum(resp[:, :, None] * component_drift, axis=1)
+    return actual_drift / sigma
+
+
+def _full_gmm_path_control(info, x: jnp.ndarray, t: jnp.ndarray, sigma: float, prior_var: float) -> jnp.ndarray:
+    logits = info['logits']
+    means_T = info['means']
+    covs_T = info['covs']
+    t = jnp.clip(t, 1e-4, 1.0 - 1e-4)
+    dim = means_T.shape[-1]
+    eye = jnp.eye(dim, dtype=x.dtype)
+    t3 = t[:, None, None]
+    t4 = t[:, None, None, None]
+
+    mu_t = t3 * means_T[None, :, :]
+    y = x[:, None, :] - mu_t
+    base_t = ((1.0 - t)**2) * prior_var + (sigma**2) * t * (1.0 - t)
+    S_t = base_t[:, None, None, None] * eye[None, None, :, :] + (t4**2) * covs_T[None, :, :, :]
+    z = jnp.linalg.solve(S_t, y[..., None])[..., 0]
+    _, logdet = jnp.linalg.slogdet(S_t)
+    quad = jnp.sum(y * z, axis=-1)
+
+    B_mat = (t4 * (covs_T[None, :, :, :] - (sigma**2) * eye[None, None, :, :]) -
+             (1.0 - t)[:, None, None, None] * prior_var * eye[None, None, :, :])
+    component_drift = means_T[None, :, :] + jnp.einsum('bkij,bkj->bki', B_mat, z)
+
+    log_weights = jax.nn.log_softmax(logits)
+    log_comp = log_weights[None, :] - 0.5 * (dim * jnp.log(2.0 * jnp.pi) + logdet + quad)
+    resp = jax.nn.softmax(log_comp, axis=-1)
+    actual_drift = jnp.sum(resp[:, :, None] * component_drift, axis=1)
+    return actual_drift / sigma
+
+
+def gmm_path_control_from_params(params, x: jnp.ndarray, t: jnp.ndarray, sigma: float, var_floor: float,
+                                 prior_var: float) -> jnp.ndarray:
+    """Corrected covariance-generic GMM-BMS/SI control u_phi(x,t).
+
+    For every terminal covariance family Sigma_k:
+      m_k(t) = t mu_k,
+      S_k(t) = (1-t)^2 prior_var I + t^2 Sigma_k + sigma^2 t(1-t) I,
+      b_k(x,t) = mu_k + [t(Sigma_k-sigma^2 I) - (1-t)prior_var I] S_k(t)^{-1}(x-t mu_k),
+      u_phi = sigma^{-1} sum_k r_k b_k.
+    """
+    info = terminal_params_from_flax_params(params, var_floor)
+    if info['kind'] in ('diagonal', 'spherical'):
+        return _diag_gmm_path_control(info, x, t, sigma, prior_var)
+    if info['kind'] == 'lowrank':
+        return _lowrank_gmm_path_control(info, x, t, sigma, prior_var)
+    if info['kind'] in ('full', 'tied'):
+        return _full_gmm_path_control(info, x, t, sigma, prior_var)
+    raise ValueError(f"Unknown covariance type: {info['kind']}")
 
 
 class DirectGMMPath(nn.Module):
@@ -724,22 +1030,53 @@ class DirectGMMPath(nn.Module):
     prior_var: float = 1.0
     init_mean_scale: float = 12.0
     init_terminal_std: float = 2.5
+    covariance_type: str = 'diagonal'
+    lowrank_rank: int = 1
+    lowrank_init_scale: float = 0.1
 
     @nn.compact
     def __call__(self, x, t, sigma):
+        cov_type = normalize_covariance_type(self.covariance_type)
+        if cov_type == 'lowrank' and self.lowrank_rank <= 0:
+            raise ValueError('lowrank covariance requires lowrank_rank > 0')
+
         logits = self.param('logits', nn.initializers.zeros, (self.k,))
         means_T = self.param('means_T', nn.initializers.normal(self.init_mean_scale), (self.k, self.dim))
 
         def raw_logvar_init(key, shape, dtype=jnp.float32):
             del key
-            init_var_minus_floor = jnp.maximum(jnp.asarray(self.init_terminal_std**2 - self.var_floor, dtype=dtype),
-                                               jnp.asarray(1e-6, dtype=dtype))
-            safe_y = jnp.minimum(init_var_minus_floor, jnp.asarray(20.0, dtype=dtype))
-            raw = jnp.where(init_var_minus_floor > 20.0, init_var_minus_floor, jnp.log(jnp.expm1(safe_y)))
+            init_var_minus_floor = max(float(self.init_terminal_std**2 - self.var_floor), 1e-6)
+            raw = _inv_softplus_np(init_var_minus_floor)
             return jnp.full(shape, raw, dtype=dtype)
 
-        raw_logvars_T = self.param('raw_logvars_T', raw_logvar_init, (self.k, self.dim))
-        return gmm_path_control_from_raw(logits, means_T, raw_logvars_T, x, t, sigma, self.var_floor, self.prior_var)
+        def raw_chol_init(key, shape, dtype=jnp.float32):
+            del key
+            diag_target = max(float(self.init_terminal_std - np.sqrt(self.var_floor)), 1e-6)
+            raw_diag = _inv_softplus_np(diag_target)
+            arr = np.zeros(shape, dtype=np.float32)
+            diag_idx = np.arange(self.dim)
+            if len(shape) == 3:
+                arr[:, diag_idx, diag_idx] = raw_diag
+            else:
+                arr[diag_idx, diag_idx] = raw_diag
+            return jnp.asarray(arr, dtype=dtype)
+
+        params = {'logits': logits, 'means_T': means_T}
+        if cov_type == 'diagonal':
+            params['raw_logvars_T'] = self.param('raw_logvars_T', raw_logvar_init, (self.k, self.dim))
+        elif cov_type == 'spherical':
+            params['raw_spherical_logvars_T'] = self.param('raw_spherical_logvars_T', raw_logvar_init, (self.k,))
+        elif cov_type == 'lowrank':
+            params['raw_logvars_T'] = self.param('raw_logvars_T', raw_logvar_init, (self.k, self.dim))
+            params['lowrank_factors_T'] = self.param('lowrank_factors_T',
+                                                     nn.initializers.normal(self.lowrank_init_scale),
+                                                     (self.k, self.dim, self.lowrank_rank))
+        elif cov_type == 'full':
+            params['raw_chol_T'] = self.param('raw_chol_T', raw_chol_init, (self.k, self.dim, self.dim))
+        elif cov_type == 'tied':
+            params['raw_tied_chol_T'] = self.param('raw_tied_chol_T', raw_chol_init, (self.dim, self.dim))
+
+        return gmm_path_control_from_params(params, x, t, sigma, self.var_floor, self.prior_var)
 
 
 @partial(jax.jit, static_argnames=('batch_size', 'use_importance_weights'))
@@ -748,9 +1085,7 @@ def train_step_our_gmm(state, ref_params, key, batch_size: int, sigma: float, pr
                        use_importance_weights: bool, max_log_weight_span: float, weights, means, vars_):
     key_x0, key_xT, key_t, key_bridge = jax.random.split(key, 4)
     x0 = jnp.sqrt(prior_var) * jax.random.normal(key_x0, (batch_size, means.shape[-1]), dtype=jnp.float32)
-    # Fixed-point BMS builds the bridge measure from the frozen previous iterate
-    # q_{bar phi,1}; the sampled endpoint must not depend on the candidate params
-    # being optimized in this gradient step.
+    # Fixed-point BMS builds the bridge measure from the frozen previous iterate.
     xT = sample_terminal_gmm_jax(ref_params, key_xT, batch_size, var_floor)
     xT = jax.lax.stop_gradient(xT)
     t = jax.random.uniform(key_t, (batch_size,), minval=t_eps, maxval=1.0 - t_eps)
@@ -763,11 +1098,8 @@ def train_step_our_gmm(state, ref_params, key, batch_size: int, sigma: float, pr
     u_ref = jax.lax.stop_gradient(u_ref)
 
     if use_importance_weights:
-        # Diagnostic / ablation only: this is not the standard BMS fixed-point
-        # update.  It approximates an endpoint-reweighted ideal objective by
-        # self-normalized importance sampling.  The proposal must be the law
-        # that actually generated xT, namely the frozen reference endpoint law
-        # q_{bar phi,1}.
+        # Diagnostic / ablation only.  The proposal must be the frozen endpoint
+        # law q_{bar phi,1} that actually generated xT.
         log_q = terminal_gmm_log_prob_jax(ref_params, xT, var_floor)
         log_w = target_log_prob_jax(xT, weights, means, vars_) - log_q
         log_w = jax.lax.stop_gradient(log_w)
@@ -787,21 +1119,19 @@ def train_step_our_gmm(state, ref_params, key, batch_size: int, sigma: float, pr
         per_damp = 0.5 * eta * jnp.sum((u - u_ref)**2, axis=-1)
         drift_mse = jnp.sum(sample_weights * per_mse)
         damping = jnp.sum(sample_weights * per_damp)
-        logits, means_T, vars_T = terminal_params_from_flax_params(params, var_floor)
-        pi = jax.nn.softmax(logits)
-        # Optional numerical regularizers. With the fixed defaults
-        # entropy_coef=var_reg=0, this is exactly the damped
-        # GMM-constrained BMS regression objective.
+        info = terminal_params_from_flax_params(params, var_floor)
+        pi = jax.nn.softmax(info['logits'])
+        diag_vars = terminal_diag_variances_for_metrics(params, var_floor)
         entropy_loss = entropy_coef * jnp.sum(pi * jnp.log(pi + 1e-8))
-        var_loss = var_reg * jnp.mean(jnp.log(vars_T)**2)
+        var_loss = var_reg * jnp.mean(jnp.log(diag_vars)**2)
         loss = drift_mse + damping + entropy_loss + var_loss
         metrics = {
             'loss': loss,
             'mse': drift_mse,
             'damp': damping,
             'entropy': -jnp.sum(pi * jnp.log(pi + 1e-8)),
-            'mean_norm': jnp.mean(jnp.linalg.norm(means_T, axis=-1)),
-            'avg_var': jnp.mean(vars_T),
+            'mean_norm': jnp.mean(jnp.linalg.norm(info['means'], axis=-1)),
+            'avg_var': jnp.mean(diag_vars),
             'weight_ess': weight_ess,
             'weight_max': weight_max
         }
@@ -817,30 +1147,62 @@ def train_step_our_gmm(state, ref_params, key, batch_size: int, sigma: float, pr
 
 
 def gmm_params_to_np(params, var_floor):
-    logits, means_T, vars_T = terminal_params_from_flax_params(params, var_floor)
-    return {
-        'weights': np.asarray(jax.nn.softmax(logits), dtype=np.float32),
-        'means': np.asarray(means_T, dtype=np.float32),
-        'vars': np.asarray(vars_T, dtype=np.float32)
+    info = terminal_params_from_flax_params(params, var_floor)
+    weights = np.asarray(jax.nn.softmax(info['logits']), dtype=np.float32)
+    means = np.asarray(info['means'], dtype=np.float32)
+    out = {
+        'covariance_type': info['kind'],
+        'weights': weights,
+        'means': means,
     }
+    if info['kind'] in ('diagonal', 'spherical'):
+        vars_np = np.asarray(info['vars'], dtype=np.float32)
+        out['vars'] = vars_np
+        out['covs'] = np.asarray([np.diag(v) for v in vars_np], dtype=np.float32)
+        if info['kind'] == 'spherical':
+            out['spherical_vars'] = np.asarray(info['spherical_vars'], dtype=np.float32)
+    elif info['kind'] == 'lowrank':
+        diag_vars = np.asarray(info['diag_vars'], dtype=np.float32)
+        U = np.asarray(info['U'], dtype=np.float32)
+        eye = np.eye(means.shape[-1], dtype=np.float32)
+        covs = diag_vars[:, :, None] * eye[None, :, :] + np.einsum('kdr,ker->kde', U, U)
+        out['diag_vars'] = diag_vars
+        out['lowrank_factors'] = U
+        out['vars'] = np.diagonal(covs, axis1=-2, axis2=-1).astype(np.float32)
+        out['covs'] = covs.astype(np.float32)
+    else:
+        covs = np.asarray(info['covs'], dtype=np.float32)
+        out['covs'] = covs
+        out['vars'] = np.diagonal(covs, axis1=-2, axis2=-1).astype(np.float32)
+        if info['kind'] == 'tied':
+            out['tied_cov'] = covs[0]
+    return out
 
 
-def make_initial_our_gmm(args, key, dim):
-    k = args.gmm_components
+def make_initial_our_gmm(args, key, dim, covariance_type=None, k_override=None):
+    """Return the post-initialization GMM, projected to diagonal for EM init."""
+    k = int(k_override) if k_override is not None else args.gmm_components
+    cov_type = normalize_covariance_type(covariance_type or args.our_covariance_type)
     key_init, _ = jax.random.split(key)
     model = DirectGMMPath(k=k,
                           dim=dim,
                           var_floor=args.our_var_floor,
                           prior_var=args.our_prior_var,
                           init_mean_scale=args.our_init_mean_scale,
-                          init_terminal_std=args.our_init_terminal_std)
+                          init_terminal_std=args.our_init_terminal_std,
+                          covariance_type=cov_type,
+                          lowrank_rank=args.our_lowrank_rank,
+                          lowrank_init_scale=args.our_lowrank_init_scale)
     dummy_x = jnp.zeros((4, dim), dtype=jnp.float32)
     dummy_t = jnp.ones((4,), dtype=jnp.float32) * 0.5
     variables = model.init(key_init, dummy_x, dummy_t, args.our_sigma)
-    return gmm_params_to_np(variables['params'], args.our_var_floor)
+    gmm = gmm_params_to_np(variables['params'], args.our_var_floor)
+    # The post-hoc EM baseline is diagonal, so return the diagonal projection.
+    return {'weights': gmm['weights'], 'means': gmm['means'], 'vars': gmm['vars']}
 
 
-def train_our_gmm(args, key, target, dim, use_importance_weights=False):
+def train_our_gmm(args, key, target, dim, covariance_type='diagonal', use_importance_weights=False):
+    covariance_type = normalize_covariance_type(covariance_type)
     weights, means, vars_ = target_arrays_jax(target)
     key_init, key_train = jax.random.split(key)
     model = DirectGMMPath(k=args.gmm_components,
@@ -848,7 +1210,10 @@ def train_our_gmm(args, key, target, dim, use_importance_weights=False):
                           var_floor=args.our_var_floor,
                           prior_var=args.our_prior_var,
                           init_mean_scale=args.our_init_mean_scale,
-                          init_terminal_std=args.our_init_terminal_std)
+                          init_terminal_std=args.our_init_terminal_std,
+                          covariance_type=covariance_type,
+                          lowrank_rank=args.our_lowrank_rank,
+                          lowrank_init_scale=args.our_lowrank_init_scale)
     dummy_x = jnp.zeros((4, dim), dtype=jnp.float32)
     dummy_t = jnp.ones((4,), dtype=jnp.float32) * 0.5
     variables = model.init(key_init, dummy_x, dummy_t, args.our_sigma)
@@ -869,9 +1234,9 @@ def train_our_gmm(args, key, target, dim, use_importance_weights=False):
         last_metrics = metrics
         if args.verbose and (step == 1 or step % args.log_every == 0):
             m = jax.device_get(metrics)
-            print(
-                f'[OUR-GMM d={dim} step={step:6d} iw={use_importance_weights}] loss={float(m["loss"]):10.4f} mse={float(m["mse"]):10.4f} ESS={float(m["weight_ess"]):8.1f}'
-            )
+            print(f'[OUR-GMM {covariance_type} d={dim} step={step:6d} iw={use_importance_weights}] '
+                  f'loss={float(m["loss"]):10.4f} mse={float(m["mse"]):10.4f} '
+                  f'damp={float(m["damp"]):9.4f} ESS={float(m["weight_ess"]):8.1f}')
     return state, time.time() - start, last_metrics
 
 
@@ -951,24 +1316,23 @@ def run_one(args, dim: int, seed: int, methods):
             if args.save_plots and dim == 2:
                 samples_for_plot['pure_bms'] = bms_samples_eval[:args.plot_samples]
 
-    initial_our_gmm = make_initial_our_gmm(args, key_our, dim)
+    initial_our_gmm = make_initial_our_gmm(args, key_our, dim, covariance_type=args.em_our_init_covariance_type)
 
     for m in methods:
-        if m == 'our_gmm' or m == 'our_gmm_iw':
-            use_iw = (m == 'our_gmm_iw')
-            print(f'=== Training {m} dim={dim} seed={seed} ===')
+        if is_our_gmm_method(m):
+            covariance_type, use_iw = parse_our_gmm_method(m, args)
+            print(f'=== Training {m} cov={covariance_type} dim={dim} seed={seed} ===')
             if use_iw:
-                print(
-                    '[note] our_gmm_iw is not the plain practical BMS fixed-point update; it is an endpoint self-normalized importance-weighted ablation.'
-                )
-            offset = 777 if use_iw else 0
+                print('[note] endpoint-IW variants are diagnostics, not the plain practical BMS fixed-point update.')
+            offset = 1000 * COVARIANCE_TYPES.index(covariance_type) + (777 if use_iw else 0)
             state, train_time, _ = train_our_gmm(args,
                                                  jax.random.fold_in(key_our, offset),
                                                  target,
                                                  dim,
+                                                 covariance_type=covariance_type,
                                                  use_importance_weights=use_iw)
             gmm = gmm_params_to_np(state.params, args.our_var_floor)
-            samples = sample_diag_gmm_np(rng, gmm, args.eval_samples)
+            samples = sample_general_gmm_np(rng, gmm, args.eval_samples)
             metrics = evaluate_samples_and_density(rng,
                                                    target,
                                                    samples,
@@ -977,7 +1341,7 @@ def run_one(args, dim: int, seed: int, methods):
                                                    n_proj=args.sliced_projections,
                                                    bins=args.sliced_bins,
                                                    kl_samples=args.eval_samples)
-            row = base_row(args, m, dim, seed, use_iw, '')
+            row = base_row(args, m, dim, seed, use_iw, '', covariance_type=covariance_type)
             row.update(metrics)
             row['train_time_sec'] = train_time
             rows.append(row)
@@ -1090,9 +1454,10 @@ def run_one(args, dim: int, seed: int, methods):
     return rows
 
 
-def base_row(args, method, dim, seed, importance_weights, em_init):
+def base_row(args, method, dim, seed, importance_weights, em_init, covariance_type=''):
     return {
         'method': method,
+        'covariance_type': covariance_type,
         'dim': dim,
         'seed': seed,
         'target_modes': args.target_modes,
@@ -1111,6 +1476,7 @@ def base_row(args, method, dim, seed, importance_weights, em_init):
         'our_prior_var': args.our_prior_var,
         'eta': args.eta,
         'our_eta': args.our_eta,
+        'our_lowrank_rank': args.our_lowrank_rank,
     }
 
 
@@ -1127,10 +1493,12 @@ def parse_args():
     p.add_argument(
         '--methods',
         type=str,
-        default='pure_bms,bms_posthoc_kmeans,bms_posthoc_ourinit,our_gmm,oracle_em',
+        default='pure_bms,bms_posthoc_kmeans,bms_posthoc_ourinit,our_gmm_diagonal,oracle_em',
         help=
-        'Comma-separated methods: pure_bms,bms_posthoc_kmeans,bms_posthoc_ourinit,our_gmm,oracle_em,weighted_em_broad. our_gmm_iw is accepted only as a non-strict endpoint-IW diagnostic.'
-    )
+        ('Comma-separated methods. Baselines: pure_bms,bms_posthoc_kmeans,bms_posthoc_ourinit,oracle_em,weighted_em_broad. '
+         'GMM-BMS variants: our_gmm (uses --our_covariance_type), our_gmm_iw, '
+         'our_gmm_diagonal,our_gmm_spherical,our_gmm_lowrank,our_gmm_tied,our_gmm_full, '
+         'plus *_iw versions. Group aliases: our_gmm_all and our_gmm_all_iw.'))
     p.add_argument('--save_plots', action='store_true')
     p.add_argument('--verbose', action='store_true')
 
@@ -1193,6 +1561,18 @@ def parse_args():
                    default=0.0,
                    help='Optional log-variance regularizer. 0.0 gives the exact GMM-BMS objective.')
     p.add_argument('--our_max_log_weight_span', type=float, default=20.0)
+    p.add_argument('--our_covariance_type',
+                   type=str,
+                   default='diagonal',
+                   choices=list(COVARIANCE_TYPES),
+                   help='Covariance family used by the backward-compatible our_gmm / our_gmm_iw method aliases.')
+    p.add_argument('--our_lowrank_rank', type=int, default=4, help='Rank for low-rank+diagonal GMM-BMS variants.')
+    p.add_argument('--our_lowrank_init_scale', type=float, default=0.05, help='Initializer std for low-rank factors.')
+    p.add_argument('--em_our_init_covariance_type',
+                   type=str,
+                   default='diagonal',
+                   choices=list(COVARIANCE_TYPES),
+                   help='Covariance family whose diagonal projection initializes bms_posthoc_ourinit.')
 
     # EM / eval
     p.add_argument('--fit_samples', type=int, default=50000)
@@ -1218,19 +1598,75 @@ def parse_args():
     return args
 
 
+def is_our_gmm_method(method: str) -> bool:
+    if method in ('our_gmm', 'our_gmm_iw'):
+        return True
+    if not method.startswith('our_gmm_'):
+        return False
+    if method in ('our_gmm_all', 'our_gmm_all_iw'):
+        return False
+    suffix = method[len('our_gmm_'):]
+    if suffix.endswith('_iw'):
+        suffix = suffix[:-3]
+    try:
+        normalize_covariance_type(suffix)
+        return True
+    except ValueError:
+        return False
+
+
+def parse_our_gmm_method(method: str, args):
+    if method == 'our_gmm':
+        return normalize_covariance_type(args.our_covariance_type), False
+    if method == 'our_gmm_iw':
+        return normalize_covariance_type(args.our_covariance_type), True
+    if not method.startswith('our_gmm_'):
+        raise ValueError(f'Not an our_gmm method: {method}')
+    suffix = method[len('our_gmm_'):]
+    use_iw = False
+    if suffix.endswith('_iw'):
+        use_iw = True
+        suffix = suffix[:-3]
+    return normalize_covariance_type(suffix), use_iw
+
+
+def expand_method_aliases(methods):
+    out = []
+    for method in methods:
+        if method == 'our_gmm_all':
+            out.extend([f'our_gmm_{cov}' for cov in COVARIANCE_TYPES])
+        elif method == 'our_gmm_all_iw':
+            out.extend([f'our_gmm_{cov}_iw' for cov in COVARIANCE_TYPES])
+        else:
+            out.append(method)
+    # Preserve order while dropping duplicates.
+    seen = set()
+    deduped = []
+    for method in out:
+        if method not in seen:
+            seen.add(method)
+            deduped.append(method)
+    return deduped
+
+
 def validate_methods(methods):
-    valid = {
+    valid_baselines = {
         'pure_bms',
         'bms_posthoc_kmeans',
         'bms_posthoc_ourinit',
-        'our_gmm',
-        'our_gmm_iw',  # non-strict diagnostic; not the exact BMS fixed-point
         'oracle_em',
         'weighted_em_broad',
     }
-    bad = sorted(set(methods) - valid)
+    bad = []
+    for method in methods:
+        if method in valid_baselines or is_our_gmm_method(method):
+            continue
+        bad.append(method)
     if bad:
-        raise ValueError(f'Unknown method(s): {bad}. Valid methods are: {sorted(valid)}')
+        valid_our = (['our_gmm', 'our_gmm_iw', 'our_gmm_all', 'our_gmm_all_iw'] +
+                     [f'our_gmm_{c}' for c in COVARIANCE_TYPES] + [f'our_gmm_{c}_iw' for c in COVARIANCE_TYPES])
+        raise ValueError(
+            f'Unknown method(s): {sorted(bad)}. Valid methods include: {sorted(valid_baselines | set(valid_our))}')
 
 
 def main():
@@ -1241,7 +1677,7 @@ def main():
         raise ValueError('--refresh_every must be nonnegative')
     dims = parse_int_list(args.dims)
     seeds = parse_int_list(args.seeds)
-    methods = parse_method_list(args.methods)
+    methods = expand_method_aliases(parse_method_list(args.methods))
     validate_methods(methods)
     ensure_dir(args.out_dir)
     with open(Path(args.out_dir) / 'config.json', 'w') as f:

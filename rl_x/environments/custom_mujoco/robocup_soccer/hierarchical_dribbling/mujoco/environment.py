@@ -68,6 +68,8 @@ class HierarchicalDribblingEnv(gym.Env):
         self.ball_spawn_radius = float(env_config["ball"]["spawn_radius"])
         self.ball_spawn_half_angle = np.deg2rad(float(env_config["ball"]["spawn_half_angle_degrees"]))
         self.ball_spawn_in_vision = bool(env_config["ball"]["spawn_in_vision"])
+        self.ball_spawn_rel_x_range = np.array(env_config["ball"]["spawn_rel_x_range"], dtype=np.float32)
+        self.ball_spawn_rel_y_range = np.array(env_config["ball"]["spawn_rel_y_range"], dtype=np.float32)
         self.possession_warmup_steps = int(env_config["termination"]["possession_warmup_steps"])
         self.possession_min_x = float(env_config["termination"]["possession_min_x"])
         self.possession_max_x = float(env_config["termination"]["possession_max_x"])
@@ -122,7 +124,15 @@ class HierarchicalDribblingEnv(gym.Env):
         self.initial_unseen_grace_steps = int(round(float(env_config["sensing"]["initial_unseen_grace_seconds"]) * 50.0))
         self.ball_relative_position_noise = float(env_config["domain_randomization"]["observation_noise"]["ball_relative_position"])
         self.home_qpos = self.initial_mj_model.keyframe("home").qpos.copy()
-        self.home_qpos[self.ball_qposadr:self.ball_qposadr + 7] = np.array([self.ball_spawn_radius, 0.0, self.ball_radius, 1.0, 0.0, 0.0, 0.0])
+        home_ball_x = 0.5 * (
+            float(env_config["ball"]["spawn_rel_x_range"][0])
+            + float(env_config["ball"]["spawn_rel_x_range"][1])
+        )
+        home_ball_y = 0.5 * (
+            float(env_config["ball"]["spawn_rel_y_range"][0])
+            + float(env_config["ball"]["spawn_rel_y_range"][1])
+        )
+        self.home_qpos[self.ball_qposadr:self.ball_qposadr + 7] = np.array([home_ball_x, home_ball_y, self.ball_radius, 1.0, 0.0, 0.0, 0.0])
         self.data = mujoco.MjData(self.initial_mj_model)
         self.c_model = deepcopy(self.initial_mj_model)
         self.c_data = mujoco.MjData(self.c_model)
@@ -457,12 +467,34 @@ class HierarchicalDribblingEnv(gym.Env):
 
     def sample_ball_reset(self, qpos, qvel):
         if self.ball_spawn_in_vision:
-            relative_angle = self.np_rng.uniform(-self.ball_spawn_half_angle, self.ball_spawn_half_angle)
-            angle = self.root_yaw_from_qpos(qpos) + relative_angle
+            ball_rel_base = np.array(
+                [
+                    self.np_rng.uniform(
+                        self.ball_spawn_rel_x_range[0],
+                        self.ball_spawn_rel_x_range[1],
+                    ),
+                    self.np_rng.uniform(
+                        self.ball_spawn_rel_y_range[0],
+                        self.ball_spawn_rel_y_range[1],
+                    ),
+                ],
+                dtype=np.float32,
+            )
+            yaw = self.root_yaw_from_qpos(qpos)
+            cos_yaw = np.cos(yaw)
+            sin_yaw = np.sin(yaw)
+            ball_delta_world = np.array(
+                [
+                    cos_yaw * ball_rel_base[0] - sin_yaw * ball_rel_base[1],
+                    sin_yaw * ball_rel_base[0] + cos_yaw * ball_rel_base[1],
+                ],
+                dtype=np.float32,
+            )
+            ball_xy = qpos[:2] + ball_delta_world
         else:
             angle = self.np_rng.uniform(-np.pi, np.pi)
+            ball_xy = qpos[:2] + self.ball_spawn_radius * np.array([np.cos(angle), np.sin(angle)])
 
-        ball_xy = qpos[:2] + self.ball_spawn_radius * np.array([np.cos(angle), np.sin(angle)])
         ball_z = self.ball_radius
         if hasattr(self.terrain_function, "ground_height_at"):
             try:

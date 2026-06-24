@@ -71,6 +71,8 @@ class HierarchicalDribblingEnv:
         self.ball_spawn_radius = float(env_config["ball"]["spawn_radius"])
         self.ball_spawn_half_angle = np.deg2rad(float(env_config["ball"]["spawn_half_angle_degrees"]))
         self.ball_spawn_in_vision = bool(env_config["ball"]["spawn_in_vision"])
+        self.ball_spawn_rel_x_range = jnp.array(env_config["ball"]["spawn_rel_x_range"], dtype=jnp.float32)
+        self.ball_spawn_rel_y_range = jnp.array(env_config["ball"]["spawn_rel_y_range"], dtype=jnp.float32)
         self.possession_warmup_steps = int(env_config["termination"]["possession_warmup_steps"])
         self.possession_min_x = float(env_config["termination"]["possession_min_x"])
         self.possession_max_x = float(env_config["termination"]["possession_max_x"])
@@ -137,7 +139,15 @@ class HierarchicalDribblingEnv:
         self.initial_unseen_grace_steps = int(round(float(env_config["sensing"]["initial_unseen_grace_seconds"]) * 50.0))
         self.ball_relative_position_noise = float(env_config["domain_randomization"]["observation_noise"]["ball_relative_position"])
         self.home_qpos = self.initial_mj_model.keyframe("home").qpos.copy()
-        self.home_qpos[self.ball_qposadr:self.ball_qposadr + 7] = np.array([self.ball_spawn_radius, 0.0, self.ball_radius, 1.0, 0.0, 0.0, 0.0])
+        home_ball_x = 0.5 * (
+            float(env_config["ball"]["spawn_rel_x_range"][0])
+            + float(env_config["ball"]["spawn_rel_x_range"][1])
+        )
+        home_ball_y = 0.5 * (
+            float(env_config["ball"]["spawn_rel_y_range"][0])
+            + float(env_config["ball"]["spawn_rel_y_range"][1])
+        )
+        self.home_qpos[self.ball_qposadr:self.ball_qposadr + 7] = np.array([home_ball_x, home_ball_y, self.ball_radius, 1.0, 0.0, 0.0, 0.0])
         self.data = mujoco.MjData(self.initial_mj_model)
         self.initial_mjx_model = mjx.put_model(self.initial_mj_model)
         self.mjx_data = mjx.make_data(self.initial_mjx_model)
@@ -395,12 +405,37 @@ class HierarchicalDribblingEnv:
 
     def sample_ball_reset(self, qpos, qvel, internal_state, key):
         if self.ball_spawn_in_vision:
-            relative_angle = jax.random.uniform(key, minval=-self.ball_spawn_half_angle, maxval=self.ball_spawn_half_angle)
-            angle = self.root_yaw_from_qpos(qpos) + relative_angle
+            x_key, y_key = jax.random.split(key)
+            ball_rel_base = jnp.array(
+                [
+                    jax.random.uniform(
+                        x_key,
+                        minval=self.ball_spawn_rel_x_range[0],
+                        maxval=self.ball_spawn_rel_x_range[1],
+                    ),
+                    jax.random.uniform(
+                        y_key,
+                        minval=self.ball_spawn_rel_y_range[0],
+                        maxval=self.ball_spawn_rel_y_range[1],
+                    ),
+                ],
+                dtype=jnp.float32,
+            )
+            yaw = self.root_yaw_from_qpos(qpos)
+            cos_yaw = jnp.cos(yaw)
+            sin_yaw = jnp.sin(yaw)
+            ball_delta_world = jnp.array(
+                [
+                    cos_yaw * ball_rel_base[0] - sin_yaw * ball_rel_base[1],
+                    sin_yaw * ball_rel_base[0] + cos_yaw * ball_rel_base[1],
+                ],
+                dtype=jnp.float32,
+            )
+            ball_xy = qpos[:2] + ball_delta_world
         else:
             angle = jax.random.uniform(key, minval=-jnp.pi, maxval=jnp.pi)
+            ball_xy = qpos[:2] + self.ball_spawn_radius * jnp.array([jnp.cos(angle), jnp.sin(angle)])
 
-        ball_xy = qpos[:2] + self.ball_spawn_radius * jnp.array([jnp.cos(angle), jnp.sin(angle)])
         ball_z = self.terrain_function.ground_height_at(internal_state, ball_xy[0], ball_xy[1]) + self.ball_radius
         ball_qpos = jnp.array([ball_xy[0], ball_xy[1], ball_z, 1.0, 0.0, 0.0, 0.0])
 
