@@ -91,7 +91,7 @@ def get_config(environment_name):
                     "fcp_dribble_lateral_coeff": 0.5,
                     "fcp_dribble_forward_clip": 0.8,
                     "fcp_dribble_gate_by_possession": True,
-                    "ball_possession_coeff": 0.5,
+                    "ball_possession_coeff": 0.2,
                 },
                 "termination": {
                     "enable_possession_termination": True,
@@ -383,7 +383,7 @@ def get_config(environment_name):
             "ball_possession_target_x": 0.25,
             "ball_possession_target_y": 0.0,
             "ball_possession_deadzone_x": 0.15,
-            "ball_possession_deadzone_y": 0.10,
+            "ball_possession_deadzone_y": 0.16,
             "ball_possession_scale_x": 0.45,
             "ball_possession_scale_y": 0.30,
         },
