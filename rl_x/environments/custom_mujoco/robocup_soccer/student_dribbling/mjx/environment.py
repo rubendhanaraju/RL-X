@@ -1,6 +1,7 @@
 from copy import deepcopy
 from pathlib import Path
 from functools import partial
+from contextlib import nullcontext
 import json
 import os
 import shutil
@@ -51,8 +52,12 @@ class StudentDribblingEnv:
         self.runner_mode = runner_mode
         self.should_render = render
         self.env_config = env_config
+        self.training_stage = env_config.get("training_stage", "stage_1")
+        self.stage_config = env_config.get("stages", {}).get(self.training_stage, {})
+        self._apply_stage_overrides(self.env_config, self.stage_config)
         self.add_goal_arrow = env_config["add_goal_arrow"]
         self.nr_envs = nr_envs
+        self.teacher_policy_enabled = bool(env_config["teacher_policy"].get("enabled", True))
         self.nominal_command_ball_velocity_gain = float(env_config["teacher_policy"]["nominal_command_ball_velocity_gain"])
         self.nominal_command_position_gain_x = float(env_config["teacher_policy"]["nominal_command_position_gain_x"])
         self.nominal_command_position_gain_y = float(env_config["teacher_policy"]["nominal_command_position_gain_y"])
@@ -96,13 +101,19 @@ class StudentDribblingEnv:
         self.ball_position_resampling_probability = float(env_config["ball"].get("position_resampling_probability", 0.002))
         self.ball_position_resampling_min_steps = int(env_config["ball"].get("position_resampling_min_steps", 50))
         self.ball_position_resampling_in_eval = bool(env_config["ball"].get("position_resampling_in_eval", False))
+        self.ball_command_resample_within_episode = bool(env_config["ball_command"].get("resample_within_episode", True))
         self.enable_possession_termination = bool(env_config["termination"]["enable_possession_termination"])
+        self.enable_ball_stagnation_termination = bool(env_config["termination"].get("enable_ball_stagnation_termination", False))
         self.possession_warmup_steps = int(env_config["termination"]["possession_warmup_steps"])
         self.possession_min_x = float(env_config["termination"]["possession_min_x"])
         self.possession_max_x = float(env_config["termination"]["possession_max_x"])
         self.possession_max_abs_y = float(env_config["termination"]["possession_max_abs_y"])
         self.immediate_possession_max_x = float(env_config["termination"]["immediate_max_x"])
         self.immediate_possession_max_abs_y = float(env_config["termination"]["immediate_max_abs_y"])
+        self.ball_stagnation_warmup_seconds = float(env_config["termination"].get("ball_stagnation_warmup_seconds", 2.0))
+        self.ball_stagnation_max_seconds = float(env_config["termination"].get("ball_stagnation_max_seconds", 2.0))
+        self.ball_stagnation_min_displacement = float(env_config["termination"].get("ball_stagnation_min_displacement", 0.05))
+        self.ball_stagnation_command_speed_threshold = float(env_config["termination"].get("ball_stagnation_command_speed_threshold", 0.15))
 
         xml_path = (self.robot_config["directory_path"] / "data" / "plane.xml").as_posix()
         xml_handle = mjcf.from_path(xml_path)
@@ -296,7 +307,10 @@ class StudentDribblingEnv:
         )
 
         self.single_observation_space = self.get_observation_space()
-        self._load_base_policy(env_config["teacher_policy"]["base_policy_checkpoint"])
+        if self.teacher_policy_enabled:
+            self._load_base_policy(env_config["teacher_policy"]["base_policy_checkpoint"])
+        else:
+            self.base_policy_gru_hidden_dim = 1
 
         self.observation_noise_function.init_attributes()
 
@@ -316,6 +330,24 @@ class StudentDribblingEnv:
                 self.joystick.init()
                 self.joystick_present = True
         del self.c_model, self.c_data
+
+
+    def _apply_stage_overrides(self, config, overrides):
+        if not overrides:
+            return
+        unlock = config.unlocked() if hasattr(config, "unlocked") else nullcontext()
+        with unlock:
+            self._recursive_update_config(config, overrides)
+
+
+    def _recursive_update_config(self, config, overrides):
+        for key, value in overrides.items():
+            if hasattr(value, "items"):
+                if key not in config:
+                    config[key] = config_dict.ConfigDict()
+                self._recursive_update_config(config[key], value)
+            else:
+                config[key] = value
 
 
     def _add_robot_perception_sites_to_xml(self, xml_handle):
@@ -464,7 +496,7 @@ class StudentDribblingEnv:
         return qpos, qvel
 
 
-    def maybe_resample_ball_position(self, data, internal_state, episode_step, reached_ball, key):
+    def maybe_resample_ball_position(self, data, internal_state, episode_step, key):
         decision_key, reset_key = jax.random.split(key)
         mode_allows_resampling = jnp.logical_or(
             jnp.logical_not(internal_state["in_eval_mode"]),
@@ -475,7 +507,8 @@ class StudentDribblingEnv:
         should_resample = (
             jnp.asarray(self.ball_position_resampling_enabled)
             & after_warmup
-            & (reached_ball | (mode_allows_resampling & random_resample))
+            & mode_allows_resampling
+            & random_resample
         )
         qpos, qvel = self.sample_ball_reset(data.qpos, data.qvel, internal_state, reset_key)
         data = data.replace(
@@ -573,6 +606,18 @@ class StudentDribblingEnv:
 
 
     def update_teacher_policy_target(self, data, mjx_model, internal_state, previous_action, teacher_noise_key=None):
+        if not self.teacher_policy_enabled:
+            internal_state["nominal_goal_velocities"] = jnp.zeros(3, dtype=jnp.float32)
+            internal_state["teacher_command_noise"] = jnp.zeros(3, dtype=jnp.float32)
+            internal_state["goal_velocities"] = jnp.zeros(3, dtype=jnp.float32)
+            internal_state["current_delta_command"] = jnp.zeros(3, dtype=jnp.float32)
+            internal_state["actuator_joint_keep_nominal"] = jnp.ones(self.nr_actuator_joints, dtype=bool)
+            internal_state["base_policy_action"] = jnp.zeros(self.nr_actuator_joints, dtype=jnp.float32)
+            internal_state["teacher_action"] = jnp.zeros(self.nr_actuator_joints, dtype=jnp.float32)
+            internal_state["base_policy_next_gru_carry"] = internal_state["base_policy_gru_carry"]
+            internal_state["teacher_contact_blend"] = jnp.asarray(0.0, dtype=jnp.float32)
+            return
+
         max_command_velocity = internal_state["max_command_velocity"]
         teacher_goal_velocities = self.compute_nominal_robot_command(data, internal_state)
         if self.add_teacher_command_noise:
@@ -726,6 +771,44 @@ class StudentDribblingEnv:
         info["env_info/ball_detection_elevation"] = internal_state["ball_detection_elevation"]
 
 
+    def update_ball_motion_info(self, data, internal_state, info, reset_timer, episode_step):
+        ball_xy = self.ball_position_world(data)[:2]
+        command_speed = jnp.linalg.norm(internal_state["ball_velocity_command"])
+        command_active = command_speed >= self.ball_stagnation_command_speed_threshold
+        motion_since_reference = jnp.linalg.norm(ball_xy - internal_state["ball_motion_reference_position"])
+        moved_enough = motion_since_reference >= self.ball_stagnation_min_displacement
+        reset_or_moved_or_inactive = reset_timer | moved_enough | jnp.logical_not(command_active)
+        time_since_ball_moved = jnp.where(
+            reset_or_moved_or_inactive,
+            0.0,
+            internal_state["time_since_ball_moved"] + self.dt,
+        )
+        ball_motion_reference_position = jnp.where(
+            reset_or_moved_or_inactive,
+            ball_xy,
+            internal_state["ball_motion_reference_position"],
+        )
+        completed_time = (episode_step + jnp.where(reset_timer, 0, 1)) * self.dt
+        stagnation_termination_active = (
+            jnp.asarray(self.enable_ball_stagnation_termination)
+            & command_active
+            & (completed_time >= self.ball_stagnation_warmup_seconds)
+        )
+        ball_stagnant_too_long = stagnation_termination_active & (
+            time_since_ball_moved >= self.ball_stagnation_max_seconds
+        )
+
+        internal_state["ball_motion_reference_position"] = ball_motion_reference_position
+        internal_state["time_since_ball_moved"] = time_since_ball_moved
+        internal_state["ball_stagnant_too_long"] = ball_stagnant_too_long
+
+        info["env_info/ball_motion_since_reference"] = motion_since_reference
+        info["env_info/ball_time_since_moved"] = time_since_ball_moved
+        info["env_info/ball_stagnant_too_long"] = ball_stagnant_too_long.astype(jnp.float32)
+        info["env_info/ball_stagnation_termination_active"] = stagnation_termination_active.astype(jnp.float32)
+        return ball_stagnant_too_long
+
+
     def update_known_ball_info(self, data, internal_state, info):
         relative_ball_position = self.relative_ball_position_base(data, internal_state)
         distance = jnp.linalg.norm(relative_ball_position)
@@ -765,23 +848,35 @@ class StudentDribblingEnv:
             | (ball_rel_x > self.possession_max_x)
             | (jnp.abs(ball_rel_y) > self.possession_max_abs_y)
         )
-        tight_possession_lost = after_warmup & outside_tight_box
-        immediate_possession_lost = (
+        inside_possession_pocket = jnp.logical_not(outside_tight_box)
+        ball_possession_armed = internal_state["ball_possession_armed"] | inside_possession_pocket
+        tight_possession_lost = after_warmup & ball_possession_armed & outside_tight_box
+        immediate_possession_lost = ball_possession_armed & (
             (ball_rel_x > self.immediate_possession_max_x)
             | (jnp.abs(ball_rel_y) > self.immediate_possession_max_abs_y)
         )
 
-        return tight_possession_lost, immediate_possession_lost, ball_rel_x, ball_rel_y
+        return tight_possession_lost, immediate_possession_lost, ball_rel_x, ball_rel_y, inside_possession_pocket, ball_possession_armed
 
 
     def update_ball_possession_info(self, data, internal_state, info, episode_step):
-        tight_possession_lost, immediate_possession_lost, ball_rel_x, ball_rel_y = self.get_ball_possession_termination(
+        (
+            tight_possession_lost,
+            immediate_possession_lost,
+            ball_rel_x,
+            ball_rel_y,
+            inside_possession_pocket,
+            ball_possession_armed,
+        ) = self.get_ball_possession_termination(
             data,
             internal_state,
             episode_step,
         )
+        internal_state["ball_possession_armed"] = ball_possession_armed
         info["env_info/ball_rel_base_x"] = ball_rel_x
         info["env_info/ball_rel_base_y"] = ball_rel_y
+        info["env_info/ball_inside_possession_pocket"] = inside_possession_pocket.astype(jnp.float32)
+        info["env_info/ball_possession_armed"] = ball_possession_armed.astype(jnp.float32)
         info["env_info/tight_possession_lost"] = tight_possession_lost.astype(jnp.float32)
         info["env_info/immediate_possession_lost"] = immediate_possession_lost.astype(jnp.float32)
 
@@ -823,6 +918,7 @@ class StudentDribblingEnv:
         ball_unseen_too_long,
         tight_possession_lost,
         immediate_possession_lost,
+        ball_stagnant_too_long,
         qvel_limit_termination,
         terminated,
         truncated,
@@ -843,6 +939,7 @@ class StudentDribblingEnv:
         info["env_info/termination_ball_unseen"] = jnp.asarray(ball_unseen_too_long, dtype=jnp.float32)
         info["env_info/termination_tight_possession"] = jnp.asarray(tight_possession_lost, dtype=jnp.float32)
         info["env_info/termination_immediate_possession"] = jnp.asarray(immediate_possession_lost, dtype=jnp.float32)
+        info["env_info/termination_ball_stagnation"] = jnp.asarray(ball_stagnant_too_long, dtype=jnp.float32)
         info["env_info/termination_qvel_limit"] = jnp.asarray(qvel_limit_termination, dtype=jnp.float32)
         info["env_info/terminated"] = jnp.asarray(terminated, dtype=jnp.float32)
         info["env_info/truncated"] = jnp.asarray(truncated, dtype=jnp.float32)
@@ -858,7 +955,11 @@ class StudentDribblingEnv:
                     jnp.where(
                         immediate_possession_lost,
                         4.0,
-                        jnp.where(qvel_limit_termination, 5.0, jnp.where(truncated, 6.0, 0.0)),
+                        jnp.where(
+                            ball_stagnant_too_long,
+                            5.0,
+                            jnp.where(qvel_limit_termination, 6.0, jnp.where(truncated, 7.0, 0.0)),
+                        ),
                     ),
                 ),
             ),
@@ -1039,6 +1140,10 @@ class StudentDribblingEnv:
             "ball_detection_azimuth": 0.0,
             "ball_detection_elevation": 0.0,
             "ball_detection_local_pos": jnp.zeros(3),
+            "ball_motion_reference_position": jnp.zeros(2),
+            "time_since_ball_moved": 0.0,
+            "ball_stagnant_too_long": False,
+            "ball_possession_armed": False,
             "nr_collisions_in_nominal": 0,
         }
         self.update_time_schedules(internal_state)
@@ -1055,7 +1160,8 @@ class StudentDribblingEnv:
         self.reward_function.reward_and_info(data, mjx_model, internal_state, jnp.zeros(self.nr_actuator_joints), info)
         self.update_ball_sensing(data, internal_state, info, True, 0)
         self.update_ball_possession_info(data, internal_state, info, 0)
-        self.update_termination_info(data, internal_state, info, False, False, False, False, False, False, False)
+        self.update_ball_motion_info(data, internal_state, info, True, 0)
+        self.update_termination_info(data, internal_state, info, False, False, False, False, False, False, False, False)
         self.update_teacher_command_noise_info(internal_state, info)
         self.update_teacher_imitation_info(internal_state, info)
         info["env_info/ball_position_resampled"] = jnp.asarray(0.0, dtype=jnp.float32)
@@ -1126,13 +1232,18 @@ class StudentDribblingEnv:
         self.domain_randomization_action_delay_function.setup(new_state.internal_state)
         data, mjx_model = self.handle_domain_randomization(new_state.internal_state, mjx_model, data, domain_randomization_key, is_episode_start=True)
         self.sample_ball_velocity_command(new_state.internal_state, True, ball_command_key)
+        new_state.internal_state["ball_motion_reference_position"] = self.ball_position_world(data)[:2]
+        new_state.internal_state["time_since_ball_moved"] = jnp.asarray(0.0, dtype=jnp.float32)
+        new_state.internal_state["ball_stagnant_too_long"] = jnp.asarray(False)
+        new_state.internal_state["ball_possession_armed"] = jnp.asarray(False)
         new_state.info["env_info/ball_position_resampled"] = jnp.asarray(0.0, dtype=jnp.float32)
         self.update_ball_sensing(data, new_state.internal_state, new_state.info, True, 0)
         self.update_teacher_policy_target(data, mjx_model, new_state.internal_state, jnp.zeros(self.nr_actuator_joints), teacher_noise_key)
         self.update_teacher_command_noise_info(new_state.internal_state, new_state.info)
         self.update_teacher_imitation_info(new_state.internal_state, new_state.info)
         self.update_ball_possession_info(data, new_state.internal_state, new_state.info, 0)
-        self.update_termination_info(data, new_state.internal_state, new_state.info, False, False, False, False, False, False, False)
+        self.update_ball_motion_info(data, new_state.internal_state, new_state.info, True, 0)
+        self.update_termination_info(data, new_state.internal_state, new_state.info, False, False, False, False, False, False, False, False)
         reset_ball_distance = jnp.linalg.norm(self.ball_position_world(data)[:2] - self.base_position_world(data)[:2])
         reset_ball_distance_to_com = jnp.linalg.norm(self.ball_position_world(data)[:2] - self.robot_com_position_world(data)[:2])
         new_state.info["env_info/ball_distance_to_base"] = reset_ball_distance
@@ -1229,13 +1340,15 @@ class StudentDribblingEnv:
         self.update_teacher_imitation_info(state.internal_state, state.info)
 
         resampling_steps = int(round(float(self.env_config["ball_command"]["resampling_time_s"]) * self.control_frequency_hz))
-        should_sample_ball_command = ((state.info_episode_store["episode_step"] + 1) % resampling_steps) == 0
+        should_sample_ball_command = (
+            jnp.asarray(self.ball_command_resample_within_episode)
+            & (((state.info_episode_store["episode_step"] + 1) % resampling_steps) == 0)
+        )
         self.sample_ball_velocity_command(state.internal_state, should_sample_ball_command, ball_command_key)
         data, ball_position_resampled = self.maybe_resample_ball_position(
             data,
             state.internal_state,
             state.info_episode_store["episode_step"],
-            reached_ball,
             ball_resampling_key,
         )
         data = jax.lax.cond(
@@ -1264,6 +1377,13 @@ class StudentDribblingEnv:
         immediate_possession_lost = self.enable_possession_termination & immediate_possession_lost
         state.info["env_info/tight_possession_lost"] = tight_possession_lost.astype(jnp.float32)
         state.info["env_info/immediate_possession_lost"] = immediate_possession_lost.astype(jnp.float32)
+        ball_stagnant_too_long = self.update_ball_motion_info(
+            data,
+            state.internal_state,
+            state.info,
+            ball_position_resampled,
+            state.info_episode_store["episode_step"],
+        )
         state.internal_state["base_policy_gru_carry"] = state.internal_state["base_policy_next_gru_carry"]
         self.update_teacher_policy_target(data, mjx_model, state.internal_state, chosen_action, teacher_noise_key)
         self.update_teacher_command_noise_info(state.internal_state, state.info)
@@ -1276,6 +1396,7 @@ class StudentDribblingEnv:
             | ball_unseen_too_long
             | tight_possession_lost
             | immediate_possession_lost
+            | ball_stagnant_too_long
             | qvel_limit_termination
         )
         truncated = state.info_episode_store["episode_step"] >= (self.horizon - 1)
@@ -1288,6 +1409,7 @@ class StudentDribblingEnv:
             ball_unseen_too_long,
             tight_possession_lost,
             immediate_possession_lost,
+            ball_stagnant_too_long,
             qvel_limit_termination,
             terminated,
             truncated,
@@ -1319,8 +1441,14 @@ class StudentDribblingEnv:
             "env_info/ball_unseen_time",
             "env_info/ball_unseen_too_long",
             "env_info/ball_unseen_termination_active",
+            "env_info/ball_motion_since_reference",
+            "env_info/ball_time_since_moved",
+            "env_info/ball_stagnant_too_long",
+            "env_info/ball_stagnation_termination_active",
             "env_info/ball_rel_base_x",
             "env_info/ball_rel_base_y",
+            "env_info/ball_inside_possession_pocket",
+            "env_info/ball_possession_armed",
             "env_info/ball_position_resampled",
             "env_info/close_ball_band_target_distance",
             "env_info/close_ball_band_error",
@@ -1335,6 +1463,7 @@ class StudentDribblingEnv:
             "env_info/termination_ball_unseen",
             "env_info/termination_tight_possession",
             "env_info/termination_immediate_possession",
+            "env_info/termination_ball_stagnation",
             "env_info/termination_qvel_limit",
             "env_info/termination_reason",
             "env_info/terminated",

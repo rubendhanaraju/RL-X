@@ -63,13 +63,9 @@ class PPO:
         self.os_shape = self.train_env.single_observation_space.shape
         self.as_shape = self.train_env.single_action_space.shape
         self.horizon = self.train_env.horizon
-        self.bc_teacher_action_indices = getattr(self.train_env, "teacher_action_obs_idx", None)
-        self.bc_teacher_imitation_weight_indices = getattr(self.train_env, "teacher_imitation_weight_obs_idx", None)
-        self.bc_action_scale = jnp.asarray(getattr(self.train_env, "bc_action_scale", jnp.ones(self.as_shape)), dtype=jnp.float32)
-        self.bc_enabled = self.bc_loss_coef != 0.0
-
-        if self.bc_enabled and self.bc_teacher_action_indices is None:
-            raise ValueError("bc_loss_coef is non-zero, but the environment does not expose teacher_action_obs_idx.")
+        self.teacher_action_obs_idx = jnp.array(self.train_env.teacher_action_obs_idx)
+        self.teacher_imitation_weight_obs_idx = jnp.array(self.train_env.teacher_imitation_weight_obs_idx)
+        self.bc_action_scale = jnp.array(self.train_env.bc_action_scale)
 
         if self.evaluation_and_save_frequency % self.batch_size != 0:
             raise ValueError("Evaluation and save frequency must be a multiple of batch size")
@@ -204,19 +200,12 @@ class PPO:
                         new_value = self.critic.apply(critic_params, state_b)
                         critic_loss = 0.5 * (new_value - return_b) ** 2
 
-                        # Auxiliary behavior-cloning loss against the environment-provided teacher action.
-                        if self.bc_enabled:
-                            teacher_action = state_b[self.bc_teacher_action_indices]
-                            bc_unweighted_loss = jnp.mean(jnp.square((action_mean - teacher_action) / self.bc_action_scale))
-                            if self.bc_teacher_imitation_weight_indices is not None:
-                                bc_weight = jnp.squeeze(state_b[self.bc_teacher_imitation_weight_indices])
-                            else:
-                                bc_weight = jnp.asarray(1.0, dtype=pg_loss.dtype)
-                            bc_loss = bc_weight * bc_unweighted_loss
-                        else:
-                            bc_weight = jnp.asarray(0.0, dtype=pg_loss.dtype)
-                            bc_unweighted_loss = jnp.asarray(0.0, dtype=pg_loss.dtype)
-                            bc_loss = jnp.asarray(0.0, dtype=pg_loss.dtype)
+                        # Teacher imitation loss
+                        teacher_action = state_b[self.teacher_action_obs_idx]
+                        teacher_imitation_weight = state_b[self.teacher_imitation_weight_obs_idx][0]
+                        bc_loss = teacher_imitation_weight * jnp.mean(
+                            jnp.square((action_mean.reshape(-1) - teacher_action) / self.bc_action_scale)
+                        )
 
                         # Combine losses
                         loss = pg_loss - self.entropy_coef * entropy_loss + self.critic_coef * critic_loss + self.bc_loss_coef * bc_loss
@@ -227,8 +216,8 @@ class PPO:
                             "loss/critic_loss": critic_loss,
                             "loss/entropy_loss": entropy_loss,
                             "loss/bc_loss": bc_loss,
-                            "loss/bc_unweighted_loss": bc_unweighted_loss,
-                            "loss/bc_weight": bc_weight,
+                            "loss/weighted_bc_loss": self.bc_loss_coef * bc_loss,
+                            "loss/bc_teacher_weight": teacher_imitation_weight,
                             "policy_ratio/approx_kl": approx_kl_div,
                             "policy_ratio/clip_fraction": clip_fraction,
                         }

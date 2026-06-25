@@ -4,5 +4,5 @@ from rl_x.algorithms.ppo_bc.flax_full_jit.default_config import get_config
 from rl_x.algorithms.ppo_bc.flax_full_jit.general_properties import GeneralProperties
 
 
-PPO_FLAX_FULL_JIT = extract_algorithm_name_from_file(__file__)
-register_algorithm(PPO_FLAX_FULL_JIT, get_config, PPO, GeneralProperties)
+PPO_BC_FLAX_FULL_JIT = extract_algorithm_name_from_file(__file__)
+register_algorithm(PPO_BC_FLAX_FULL_JIT, get_config, PPO, GeneralProperties)

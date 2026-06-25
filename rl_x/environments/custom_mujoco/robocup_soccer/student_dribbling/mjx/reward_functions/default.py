@@ -366,6 +366,7 @@ class DefaultReward:
         info[f"reward/feet_yaw"] = feet_yaw_reward
         info[f"reward/feet_lateral_distance"] = feet_lateral_distance_reward
         info[f"reward/ball_velocity_tracking"] = ball_velocity_tracking_reward
+        info[f"reward/projected_ball_velocity"] = ball_velocity_tracking_reward
         info[f"reward/chasing_ball"] = chasing_ball_reward
         info[f"reward/com_chasing_ball"] = com_chasing_ball_reward
         info[f"reward/close_ball_band"] = close_ball_band_reward
@@ -379,6 +380,7 @@ class DefaultReward:
         info[f"reward/total"] = reward
         info[f"env_info/xy_vel_diff_abs"] = jnp.nan_to_num(jnp.mean(jnp.minimum(jnp.abs(xy_difference), 2*internal_state["max_command_velocity"])), nan=2*internal_state["max_command_velocity"], posinf=2*internal_state["max_command_velocity"], neginf=2*internal_state["max_command_velocity"])
         info[f"env_info/ball_velocity_tracking_error"] = jnp.sqrt(ball_velocity_tracking_error)
+        info[f"env_info/projected_ball_velocity_tracking_error"] = jnp.sqrt(ball_velocity_tracking_error)
         info[f"env_info/ball_distance_to_base"] = ball_distance_to_base
         info[f"env_info/ball_distance_to_com"] = ball_distance_to_com
         info[f"env_info/ball_distance_to_base_normalized"] = normalized_ball_distance

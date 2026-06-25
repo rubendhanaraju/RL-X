@@ -17,13 +17,29 @@ from orbax.checkpoint import args as orbax_args
 
 from rl_x.algorithms.ppo_bc.flax_full_jit.default_config import get_config as get_algorithm_config
 from rl_x.algorithms.ppo_bc.flax_full_jit.policy import get_policy
-from rl_x.environments.custom_mujoco.robocup_soccer.student_dribbling.mjx.create_env import create_train_and_eval_env
-from rl_x.environments.custom_mujoco.robocup_soccer.student_dribbling.mjx.default_config import get_config as get_environment_config
+from rl_x.environments.custom_mujoco.robocup_soccer.student_dribbling.mjx.create_env import (
+    create_train_and_eval_env as create_student_dribbling_env,
+)
+from rl_x.environments.custom_mujoco.robocup_soccer.student_dribbling.mjx.default_config import (
+    get_config as get_student_dribbling_config,
+)
+from rl_x.environments.custom_mujoco.robocup_soccer.student_fcp_dribbling.mjx.create_env import (
+    create_train_and_eval_env as create_student_fcp_dribbling_env,
+)
+from rl_x.environments.custom_mujoco.robocup_soccer.student_fcp_dribbling.mjx.default_config import (
+    get_config as get_student_fcp_dribbling_config,
+)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Render a StudentDribbling MJX checkpoint to an MP4.")
+    parser = argparse.ArgumentParser(description="Render a student dribbling MJX checkpoint to an MP4.")
     parser.add_argument("--checkpoint", default=None, help="Path to latest.model or another PPO-BC full-JIT checkpoint.")
+    parser.add_argument(
+        "--env-variant",
+        default="student_dribbling",
+        choices=("student_dribbling", "student_fcp_dribbling"),
+        help="Which student dribbling environment variant the checkpoint was trained with.",
+    )
     parser.add_argument(
         "--policy-source",
         default="student",
@@ -39,10 +55,14 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cpu", choices=("cpu", "gpu"))
+    parser.add_argument("--stage", default="stage_1", help="Student dribbling training stage to render.")
     parser.add_argument("--video-width", type=int, default=640)
     parser.add_argument("--video-height", type=int, default=480)
     parser.add_argument("--ball-vx", type=float, default=None, help="Optional fixed ball velocity command x.")
     parser.add_argument("--ball-vy", type=float, default=None, help="Optional fixed ball velocity command y.")
+    parser.add_argument("--fixed-teacher-vx", type=float, default=None, help="Optional fixed robot x velocity command for the frozen locomotion teacher.")
+    parser.add_argument("--fixed-teacher-vy", type=float, default=None, help="Optional fixed robot y velocity command for the frozen locomotion teacher.")
+    parser.add_argument("--fixed-teacher-wz", type=float, default=None, help="Optional fixed robot yaw velocity command for the frozen locomotion teacher.")
     parser.add_argument("--eval-mode", action="store_true", help="Reset with eval-mode curriculum coefficient 1.0.")
     return parser.parse_args()
 
@@ -97,6 +117,19 @@ def fixed_ball_command(args):
     return jnp.array([args.ball_vx or 0.0, args.ball_vy or 0.0], dtype=jnp.float32)
 
 
+def fixed_teacher_command(args):
+    if args.fixed_teacher_vx is None and args.fixed_teacher_vy is None and args.fixed_teacher_wz is None:
+        return None
+    return jnp.array(
+        [
+            args.fixed_teacher_vx or 0.0,
+            args.fixed_teacher_vy or 0.0,
+            args.fixed_teacher_wz or 0.0,
+        ],
+        dtype=jnp.float32,
+    )
+
+
 def apply_fixed_ball_command(env, state, command):
     if command is None:
         return state
@@ -117,12 +150,87 @@ def apply_fixed_ball_command(env, state, command):
     return state.replace(next_observation=observation, actual_next_observation=observation)
 
 
+def make_fixed_teacher_action_fn(env, command):
+    if command is None:
+        return None
+
+    @jax.jit
+    def apply_fixed_teacher_command(state):
+        def per_env(data, mjx_model, internal_state):
+            goal_velocities = jnp.clip(
+                command,
+                -internal_state["max_command_velocity"],
+                internal_state["max_command_velocity"],
+            )
+            goal_velocities = jnp.where(
+                jnp.abs(goal_velocities) < (
+                    env.command_function.zero_clip_threshold_percentage
+                    * internal_state["max_command_velocity"]
+                ),
+                0.0,
+                goal_velocities,
+            )
+            internal_state["goal_velocities"] = goal_velocities
+            internal_state["nominal_goal_velocities"] = goal_velocities
+            internal_state["current_delta_command"] = jnp.zeros(3, dtype=jnp.float32)
+            internal_state["teacher_command_noise"] = jnp.zeros(3, dtype=jnp.float32)
+            internal_state["teacher_contact_blend"] = jnp.asarray(0.0, dtype=jnp.float32)
+            internal_state["actuator_joint_keep_nominal"] = jnp.where(
+                jnp.all(goal_velocities == 0.0),
+                jnp.ones(env.nr_actuator_joints, dtype=bool),
+                env.command_function.default_actuator_joint_keep_nominal,
+            )
+            low_policy_observation = env.get_locomotion_observation(
+                data,
+                mjx_model,
+                internal_state,
+                internal_state["last_action"],
+            )
+            teacher_action_mean, _, next_base_policy_gru_carry = env.base_policy.apply(
+                env.base_policy_params,
+                low_policy_observation[None, :],
+                internal_state["base_policy_gru_carry"][None, :],
+                method=env.base_policy.apply_one_step,
+            )
+            teacher_action = env.base_get_processed_action(teacher_action_mean)[0]
+            internal_state["base_policy_action"] = teacher_action
+            internal_state["teacher_action"] = teacher_action
+            internal_state["base_policy_next_gru_carry"] = next_base_policy_gru_carry[0]
+            return internal_state
+
+        internal_state = jax.vmap(per_env)(state.data, state.mjx_model, state.internal_state)
+        observation = jax.vmap(env.get_observation, in_axes=(0, 0, 0, 0, 0))(
+            state.data,
+            state.mjx_model,
+            internal_state,
+            state.key,
+            internal_state["last_action"],
+        )
+        return state.replace(
+            internal_state=internal_state,
+            next_observation=observation,
+            actual_next_observation=observation,
+        )
+
+    return apply_fixed_teacher_command
+
+
 def make_env(args):
-    env_config = get_environment_config("custom_mujoco.robocup_soccer.student_dribbling.mjx")
+    if args.env_variant == "student_fcp_dribbling":
+        env_name = "custom_mujoco.robocup_soccer.student_fcp_dribbling.mjx"
+        get_environment_config = get_student_fcp_dribbling_config
+        create_train_and_eval_env = create_student_fcp_dribbling_env
+    else:
+        env_name = "custom_mujoco.robocup_soccer.student_dribbling.mjx"
+        get_environment_config = get_student_dribbling_config
+        create_train_and_eval_env = create_student_dribbling_env
+
+    env_config = get_environment_config(env_name)
     env_config.nr_envs = 1
     env_config.seed = args.seed
     env_config.render = False
     env_config.device = args.device
+    env_config.training_stage = args.stage
     env_config.teacher_policy.base_policy_checkpoint = args.base_policy_checkpoint
 
     config = SimpleNamespace(
@@ -151,11 +259,15 @@ def main():
 
     env_config, env = make_env(args)
     command = fixed_ball_command(args)
+    teacher_command = fixed_teacher_command(args)
+    apply_fixed_teacher_command = make_fixed_teacher_action_fn(env, teacher_command)
 
     key = jax.random.PRNGKey(args.seed)
     key, reset_key = jax.random.split(key)
     state = env.reset(jax.random.split(reset_key, 1), args.eval_mode)
     state = apply_fixed_ball_command(env, state, command)
+    if apply_fixed_teacher_command is not None:
+        state = apply_fixed_teacher_command(state)
 
     if args.policy_source == "student":
         if args.checkpoint is None:
@@ -197,10 +309,14 @@ def main():
         for step in range(args.steps):
             state = rollout_step(state)
             state = apply_fixed_ball_command(env, state, command)
+            if apply_fixed_teacher_command is not None:
+                state = apply_fixed_teacher_command(state)
             if bool(np.asarray(state.terminated[0] | state.truncated[0])):
                 key, reset_key = jax.random.split(key)
                 state = env.reset(jax.random.split(reset_key, 1), args.eval_mode)
                 state = apply_fixed_ball_command(env, state, command)
+                if apply_fixed_teacher_command is not None:
+                    state = apply_fixed_teacher_command(state)
 
             mj_data.qpos[:] = np.asarray(state.data.qpos[0])
             mj_data.qvel[:] = np.asarray(state.data.qvel[0])

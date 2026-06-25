@@ -1,0 +1,22 @@
+class BelowHeightTermination:
+    def __init__(self, env):
+        self.env = env
+
+        self.height_percentage_threshold = self.env.env_config["termination"]["height_percentage_threshold"]
+        self.min_height_percentage_threshold = self.env.env_config["termination"]["min_height_percentage_threshold"]
+        self.fall_height_percentage_threshold = self.env.env_config["termination"]["fall_height_percentage_threshold"]
+
+
+    def should_terminate(self, internal_state):
+        height_threshold = (
+            self.min_height_percentage_threshold
+            + (1 - internal_state["env_curriculum_coeff"])
+            * (self.height_percentage_threshold - self.min_height_percentage_threshold)
+        )
+        curriculum_below_height = internal_state["robot_imu_height_over_ground"] < (
+            height_threshold * internal_state["robot_nominal_imu_height_over_ground"]
+        )
+        fall_below_height = internal_state["robot_imu_height_over_ground"] < (self.fall_height_percentage_threshold * internal_state["robot_nominal_imu_height_over_ground"])
+        below_height = curriculum_below_height | fall_below_height
+
+        return below_height
