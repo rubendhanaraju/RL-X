@@ -79,6 +79,8 @@ class WalkPolicyDribblingEnv:
             ],
             dtype=jnp.float32,
         )
+        self.dribble_use_dynamic_direction = bool(env_config["teacher_policy"].get("dribble_use_dynamic_direction", True))
+        self.dribble_goal_lookahead = float(env_config["teacher_policy"].get("dribble_goal_lookahead", 20.0))
         self.nominal_command_ball_velocity_gain = float(env_config["teacher_policy"]["nominal_command_ball_velocity_gain"])
         self.nominal_command_position_gain_x = float(env_config["teacher_policy"]["nominal_command_position_gain_x"])
         self.nominal_command_position_gain_y = float(env_config["teacher_policy"]["nominal_command_position_gain_y"])
@@ -131,6 +133,8 @@ class WalkPolicyDribblingEnv:
         self.ball_command_resample_within_episode = bool(env_config["ball_command"].get("resample_within_episode", True))
         self.max_rotation_diff = jnp.float32(env_config["target"]["max_rotation_diff"])
         self.max_rotation_dist = jnp.float32(env_config["target"]["max_rotation_dist"])
+        self.train_initial_orientation_min = jnp.float32(env_config["target"].get("train_initial_orientation_min", -180.0))
+        self.train_initial_orientation_max = jnp.float32(env_config["target"].get("train_initial_orientation_max", 180.0))
         self.orientation_change_probability = jnp.float32(env_config["target"]["orientation_change_probability"])
         self.return_to_base_on_radius = jnp.float32(env_config["target"]["return_to_base_on_radius"])
         self.return_to_base_off_radius = jnp.float32(env_config["target"]["return_to_base_off_radius"])
@@ -622,7 +626,11 @@ class WalkPolicyDribblingEnv:
 
 
     def setup_dribble_target(self, data, internal_state, key):
-        initial_orientation = jax.random.uniform(key, minval=-180.0, maxval=180.0)
+        initial_orientation = jax.random.uniform(
+            key,
+            minval=self.train_initial_orientation_min,
+            maxval=self.train_initial_orientation_max,
+        )
         initial_orientation = jnp.where(
             internal_state["in_eval_mode"],
             self.eval_initial_orientation,
@@ -848,10 +856,24 @@ class WalkPolicyDribblingEnv:
         ball_xy = self.ball_position_world(data)[:2]
         base_xy = self.base_position_world(data)[:2]
 
-        ball_to_goal_vec = self.dribble_goal - ball_xy
-        ball_to_goal_dist = jnp.linalg.norm(ball_to_goal_vec)
-        ball_to_goal = ball_to_goal_vec / jnp.maximum(ball_to_goal_dist, 1e-6)
-        ball_to_goal = jnp.where(ball_to_goal_dist > 1e-6, ball_to_goal, jnp.array([1.0, 0.0], dtype=jnp.float32))
+        dynamic_goal_angle = jnp.radians(internal_state["internal_abs_orientation"])
+        dynamic_ball_to_goal = jnp.array(
+            [jnp.cos(dynamic_goal_angle), jnp.sin(dynamic_goal_angle)],
+            dtype=jnp.float32,
+        )
+        fixed_goal_vec = self.dribble_goal - ball_xy
+        fixed_goal_dist = jnp.linalg.norm(fixed_goal_vec)
+        fixed_ball_to_goal = fixed_goal_vec / jnp.maximum(fixed_goal_dist, 1e-6)
+        fixed_ball_to_goal = jnp.where(
+            fixed_goal_dist > 1e-6,
+            fixed_ball_to_goal,
+            jnp.array([1.0, 0.0], dtype=jnp.float32),
+        )
+        ball_to_goal = jnp.where(
+            jnp.asarray(self.dribble_use_dynamic_direction),
+            dynamic_ball_to_goal,
+            fixed_ball_to_goal,
+        )
 
         ball_to_base = base_xy - ball_xy
         along = jnp.dot(ball_to_base, ball_to_goal)

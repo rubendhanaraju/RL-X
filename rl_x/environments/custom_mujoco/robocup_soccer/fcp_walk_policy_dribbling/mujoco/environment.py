@@ -65,6 +65,8 @@ class WalkPolicyDribblingEnv(gym.Env):
             ],
             dtype=np.float32,
         )
+        self.dribble_use_dynamic_direction = bool(env_config["teacher_policy"].get("dribble_use_dynamic_direction", True))
+        self.dribble_goal_lookahead = float(env_config["teacher_policy"].get("dribble_goal_lookahead", 20.0))
         self.teacher_imitation_schedule_enabled = bool(env_config["teacher_imitation_schedule"]["enabled"])
         self.teacher_imitation_start_weight = float(env_config["teacher_imitation_schedule"]["start_weight"])
         self.teacher_imitation_end_weight = float(env_config["teacher_imitation_schedule"]["end_weight"])
@@ -600,12 +602,17 @@ class WalkPolicyDribblingEnv(gym.Env):
         ball_xy = self.ball_position_world()[:2]
         base_xy = self.base_position_world()[:2]
 
-        ball_to_goal_vec = self.dribble_goal - ball_xy
-        ball_to_goal_dist = np.linalg.norm(ball_to_goal_vec)
-        if ball_to_goal_dist > 1e-6:
-            ball_to_goal = ball_to_goal_vec / ball_to_goal_dist
+        command_direction = self.internal_state["ball_velocity_command"]
+        command_direction_norm = np.linalg.norm(command_direction)
+        if self.dribble_use_dynamic_direction and command_direction_norm > 1e-6:
+            ball_to_goal = command_direction / command_direction_norm
         else:
-            ball_to_goal = np.array([1.0, 0.0], dtype=np.float32)
+            ball_to_goal_vec = self.dribble_goal - ball_xy
+            ball_to_goal_dist = np.linalg.norm(ball_to_goal_vec)
+            if ball_to_goal_dist > 1e-6:
+                ball_to_goal = ball_to_goal_vec / ball_to_goal_dist
+            else:
+                ball_to_goal = np.array([1.0, 0.0], dtype=np.float32)
 
         ball_to_base = base_xy - ball_xy
         along = float(np.dot(ball_to_base, ball_to_goal))
