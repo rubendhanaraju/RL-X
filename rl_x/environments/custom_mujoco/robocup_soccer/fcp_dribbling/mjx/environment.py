@@ -66,6 +66,13 @@ class FcpDribblingEnv:
         self.horizon = int(
             round(env_config["episode_length_in_seconds"] * self.control_frequency_hz)
         )
+        self.action_clip = bool(env_config.get("action", {}).get("clip", True))
+        self.action_clip_range = jnp.float32(
+            env_config.get("action", {}).get("clip_range", 1.0)
+        )
+        self.action_space_range = jnp.float32(
+            env_config.get("action", {}).get("space_range", self.action_clip_range)
+        )
 
         xml_path = (self.robot_config["directory_path"] / "data" / "plane.xml").as_posix()
         xml_handle = mjcf.from_path(xml_path)
@@ -237,6 +244,16 @@ class FcpDribblingEnv:
         self.ball_reset_rel_y_range = jnp.array(
             env_config["ball"]["reset_rel_y_range"], dtype=jnp.float32
         )
+        self.ball_reset_between_feet = bool(
+            env_config["ball"].get("reset_between_feet", False)
+        )
+        self.ball_reset_between_feet_x_clearance_range = jnp.array(
+            env_config["ball"].get("reset_between_feet_x_clearance_range", [0.0, 0.0]),
+            dtype=jnp.float32,
+        )
+        self.ball_reset_prepare_walk_steps = int(
+            env_config["ball"].get("reset_prepare_walk_steps", 0)
+        )
         self.ball_reset_use_foot_clearance = bool(
             env_config["ball"]["reset_use_foot_clearance"]
         )
@@ -300,8 +317,8 @@ class FcpDribblingEnv:
         self.control_function = get_control_function(env_config["walk"]["type"], self)
 
         self.single_action_space = BoxSpace(
-            low=-jnp.ones(self.ACTION_DIM, dtype=jnp.float32),
-            high=jnp.ones(self.ACTION_DIM, dtype=jnp.float32),
+            low=-self.action_space_range * jnp.ones(self.ACTION_DIM, dtype=jnp.float32),
+            high=self.action_space_range * jnp.ones(self.ACTION_DIM, dtype=jnp.float32),
             shape=(self.ACTION_DIM,),
             dtype=jnp.float32,
             center=jnp.zeros(self.ACTION_DIM, dtype=jnp.float32),
@@ -370,8 +387,11 @@ class FcpDribblingEnv:
             home_qpos = self.initial_mj_model.key_qpos[key_id].copy()
         else:
             home_qpos = self.initial_mj_model.qpos0.copy()
+        # The reset path overwrites the ball after preparing the walking stance.
+        # Keep the temporary home ball away from the feet so reset settling does
+        # not begin from a penetrated ball/foot contact.
         home_qpos[self.ball_qposadr : self.ball_qposadr + 7] = [
-            0.28,
+            2.0,
             0.0,
             float(self.ball_radius),
             1.0,
@@ -447,6 +467,11 @@ class FcpDribblingEnv:
             "env_info/ball_rel_observation_z": jnp.float32(0.0),
             "env_info/ball_clearance_foot_front": jnp.float32(0.0),
             "env_info/ball_speed": jnp.float32(0.0),
+            "env_info/ball_qvel_speed": jnp.float32(0.0),
+            "env_info/ball_foot_contact": jnp.float32(0.0),
+            "env_info/ball_foot_min_dist": jnp.float32(0.0),
+            "env_info/left_foot_floor_contact": jnp.float32(0.0),
+            "env_info/right_foot_floor_contact": jnp.float32(0.0),
             "env_info/dribble_raw_reward": jnp.float32(0.0),
             "env_info/desired_abs_orientation": jnp.float32(0.0),
             "env_info/root_height": jnp.float32(0.0),
@@ -503,13 +528,18 @@ class FcpDribblingEnv:
         data = mjx.forward(state.mjx_model, data)
         data = self._settle_data(state.mjx_model, data)
 
+        walk_core_state = self.control_function.init_state()
+        if self.ball_reset_prepare_walk_steps > 0:
+            data, walk_core_state = self._prepare_ball_reset_stance(
+                state.mjx_model, data, walk_core_state
+            )
+
         qpos, qvel = self._sample_ball_reset(
             data, state.internal_state["in_eval_mode"], ball_key
         )
-        data = data.replace(qpos=qpos, qvel=qvel, ctrl=self.initial_ctrl)
+        data = data.replace(qpos=qpos, qvel=qvel)
         data = mjx.forward(state.mjx_model, data)
 
-        walk_core_state = self.control_function.init_state()
         ball_sensing = self._ball_sensing_values(
             data, jnp.float32(0.0), reset_timer=jnp.bool_(True)
         )
@@ -595,7 +625,12 @@ class FcpDribblingEnv:
         key, target_key = jax.random.split(state.key, 2)
         state = state.replace(key=key)
 
-        chosen_action = jnp.clip(action[: self.ACTION_DIM], -1.0, 1.0)
+        raw_action = action[: self.ACTION_DIM]
+        chosen_action = jnp.where(
+            self.action_clip,
+            jnp.clip(raw_action, -self.action_clip_range, self.action_clip_range),
+            raw_action,
+        )
         previous_action = state.internal_state["last_action"]
         data, walk_core_state, _ = self.control_function.process_action(
             state.mjx_model,
@@ -692,6 +727,9 @@ class FcpDribblingEnv:
         ball_clearance_foot_front = (
             ball_rel_waist[0] - self.ball_radius - self.nominal_foot_front_x_rel_waist
         )
+        ball_foot_contact, ball_foot_min_dist = self._ball_foot_contact_values(data)
+        ball_qvel_xy = data.qvel[self.ball_qveladr : self.ball_qveladr + 2]
+        feet_floor_contacts = self.feet_floor_contact(data)
 
         transition_info = {
             "rollout/episode_return": jnp.where(
@@ -725,6 +763,17 @@ class FcpDribblingEnv:
                 jnp.float32
             ),
             "env_info/ball_speed": ball_speed.astype(jnp.float32),
+            "env_info/ball_qvel_speed": jnp.linalg.norm(ball_qvel_xy).astype(
+                jnp.float32
+            ),
+            "env_info/ball_foot_contact": ball_foot_contact.astype(jnp.float32),
+            "env_info/ball_foot_min_dist": ball_foot_min_dist.astype(jnp.float32),
+            "env_info/left_foot_floor_contact": feet_floor_contacts[0].astype(
+                jnp.float32
+            ),
+            "env_info/right_foot_floor_contact": feet_floor_contacts[1].astype(
+                jnp.float32
+            ),
             "env_info/dribble_raw_reward": dribble_raw_reward.astype(jnp.float32),
             "env_info/desired_abs_orientation": desired_abs_orientation.astype(
                 jnp.float32
@@ -823,8 +872,33 @@ class FcpDribblingEnv:
         qvel = jnp.zeros(self.initial_mj_model.nv, dtype=jnp.float32)
         return qpos, qvel
 
+    def _prepare_ball_reset_stance(self, mjx_model, data, walk_core_state):
+        data, walk_core_state, _ = self.control_function.process_action(
+            mjx_model,
+            data,
+            walk_core_state,
+            jnp.zeros(self.ACTION_DIM, dtype=jnp.float32),
+            jnp.array([1.0, 0.0], dtype=jnp.float32),
+            reset=jnp.bool_(True),
+        )
+        ctrl = data.ctrl
+        qpos = data.qpos.at[self.actuator_joint_mask_qpos].set(ctrl)
+        qvel = jnp.zeros(self.initial_mj_model.nv, dtype=jnp.float32)
+        data = data.replace(qpos=qpos, qvel=qvel, ctrl=ctrl)
+        data = mjx.forward(mjx_model, data)
+
+        def settle_fn(settle_data, _):
+            return self._apply_fixed_ctrl(mjx_model, settle_data, ctrl), None
+
+        data, _ = jax.lax.scan(
+            settle_fn, data, xs=None, length=self.ball_reset_prepare_walk_steps
+        )
+        return data, walk_core_state
+
     def _sample_ball_reset(self, data, in_eval_mode, key):
-        x_key, y_key, clearance_key, velocity_key = jax.random.split(key, 4)
+        x_key, y_key, clearance_key, between_clearance_key, velocity_key = (
+            jax.random.split(key, 5)
+        )
         qpos = data.qpos
         qvel = data.qvel
         ball_rel_x = jax.random.uniform(
@@ -842,13 +916,28 @@ class FcpDribblingEnv:
             jnp.mean(self.ball_reset_foot_clearance_range),
             ball_clearance,
         )
+        between_feet_x_clearance = jax.random.uniform(
+            between_clearance_key,
+            minval=self.ball_reset_between_feet_x_clearance_range[0],
+            maxval=self.ball_reset_between_feet_x_clearance_range[1],
+        )
+        between_feet_x_clearance = jnp.where(
+            in_eval_mode,
+            jnp.mean(self.ball_reset_between_feet_x_clearance_range),
+            between_feet_x_clearance,
+        )
         ball_rel_x_from_clearance = (
             self.nominal_foot_front_x_rel_waist + self.ball_radius + ball_clearance
+        )
+        ball_rel_x_between_feet = (
+            self.nominal_foot_front_x_rel_waist + between_feet_x_clearance
         )
         ball_rel_x_fallback = jnp.where(
             in_eval_mode, jnp.mean(self.ball_reset_rel_x_range), ball_rel_x
         )
-        if self.ball_reset_use_foot_clearance:
+        if self.ball_reset_between_feet:
+            ball_rel_x = ball_rel_x_between_feet
+        elif self.ball_reset_use_foot_clearance:
             ball_rel_x = ball_rel_x_from_clearance
         else:
             ball_rel_x = ball_rel_x_fallback
@@ -1183,6 +1272,23 @@ class FcpDribblingEnv:
         matched = mask[jnp.arange(mask.shape[0]), indices]
         dists = jnp.where(matched, data._impl.contact.dist[indices], 1e4)
         return indices, dists < 0.0
+
+    def _ball_foot_contact_values(self, data):
+        contact_geom = jnp.asarray(data._impl.contact.geom)
+        contact_dist = jnp.asarray(data._impl.contact.dist)
+        ball_first = contact_geom[:, 0] == self.ball_geom_id
+        ball_second = contact_geom[:, 1] == self.ball_geom_id
+        foot_first = jnp.any(
+            contact_geom[:, 0:1] == self.foot_geom_indices[None, :], axis=1
+        )
+        foot_second = jnp.any(
+            contact_geom[:, 1:2] == self.foot_geom_indices[None, :], axis=1
+        )
+        ball_foot_pair = (ball_first & foot_second) | (ball_second & foot_first)
+        masked_dist = jnp.where(ball_foot_pair, contact_dist, jnp.float32(1e4))
+        min_dist = jnp.min(masked_dist)
+        contact = jnp.any(ball_foot_pair & (contact_dist < 0.0))
+        return contact, min_dist.astype(jnp.float32)
 
     def feet_floor_contact(self, data):
         _, contacts = self._feet_floor_contact_indices(data)

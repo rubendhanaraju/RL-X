@@ -1,0 +1,99 @@
+program: experiments/experiment.py
+name: &sweep_name fcp-dribbling-t1-between-feet
+entity: &sweep_entity rubendhanaraju-university-of-porto
+project: &sweep_project rlx-fcp-dribbling
+notes: &sweep_notes "T1 FCP dribbling sweep for NAO-style between-feet ball control."
+method: grid
+
+metric:
+  name: eval/episode_return
+  goal: maximize
+
+parameters:
+  environment.walk.feet_y_dev_scale:
+    values: [1.55, 1.65, 1.75]
+  environment.ball.reset_between_feet_x_clearance_range:
+    values:
+      - [0.0, 0.02]
+      - [0.0, 0.035]
+      - [0.01, 0.045]
+  environment.walk.foot_yaw_bias_deg:
+    values: [10.0, 12.0, 15.0]
+
+command:
+  - conda
+  - run
+  - -n
+  - rlx
+  - python
+  - -c
+  - |
+    import json
+    import os
+    import sys
+
+    program = sys.argv[1]
+    args_json_file = sys.argv[2]
+    sweep_name = sys.argv[3]
+    sweep_entity = sys.argv[4]
+    sweep_project = sys.argv[5]
+    sweep_notes = sys.argv[6]
+    fixed_args = sys.argv[7:]
+
+    with open(args_json_file) as f:
+        sweep_args = json.load(f)
+
+    def fmt(value):
+        if isinstance(value, float):
+            return f"{value:g}"
+        if isinstance(value, list):
+            return "-".join(fmt(v) for v in value)
+        return str(value)
+
+    def cli_value(value):
+        if isinstance(value, list):
+            return "(" + ", ".join(cli_value(item) for item in value) + ")"
+        if isinstance(value, dict):
+            return json.dumps(value)
+        return str(value)
+
+    run_name = (
+        f"stance{fmt(sweep_args['environment.walk.feet_y_dev_scale'])}"
+        f"-x{fmt(sweep_args['environment.ball.reset_between_feet_x_clearance_range'])}"
+        f"-yaw{fmt(sweep_args['environment.walk.foot_yaw_bias_deg'])}"
+    )
+    sweep_cli_args = [
+        f"--{key}={cli_value(value)}" for key, value in sweep_args.items()
+    ]
+    sweep_runner_args = [
+        f"--runner.wandb_entity={sweep_entity}",
+        f"--runner.project_name={sweep_project}",
+        f"--runner.exp_name={sweep_name}",
+        f"--runner.notes={sweep_notes}",
+    ]
+    command = [
+        sys.executable,
+        program,
+        f"--runner.run_name={run_name}",
+        *sweep_runner_args,
+        *fixed_args,
+        *sweep_cli_args,
+    ]
+    os.execv(sys.executable, command)
+  - ${program}
+  - ${args_json_file}
+  - *sweep_name
+  - *sweep_entity
+  - *sweep_project
+  - *sweep_notes
+  - --algorithm.name=ppo.flax_full_jit
+  - --environment.name=custom_mujoco.robocup_soccer.fcp_dribbling.mjx
+  - --environment.render=False
+  - --environment.ball.reset_between_feet=True
+  - --environment.ball.reset_use_foot_clearance=False
+  - --environment.ball.reset_rel_y_range=(-0.01,0.01)
+  - --environment.ball.reset_prepare_walk_steps=20
+  - --runner.track_console=False
+  - --runner.track_wandb=True
+  - --runner.save_model=True
+  - --algorithm.evaluation_and_save_frequency=17301504

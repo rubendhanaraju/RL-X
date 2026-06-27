@@ -19,11 +19,37 @@ class NaoWalkControl:
             if "z_extension" in walk_config
             else jnp.array(env.t1.defaults.z_extension, dtype=jnp.float32)
         )
-        self.step_config = env.t1.defaults.step_config
+        feet_y_dev_scale = jnp.array(
+            walk_config.get("feet_y_dev_scale", 1.0), dtype=jnp.float32
+        )
+        self.step_config = env.t1.defaults.step_config._replace(
+            feet_y_dev=env.t1.defaults.step_config.feet_y_dev * feet_y_dev_scale
+        )
         self.walk_config = WalkCoreConfig(
             left_foot_home_waist=env.t1.defaults.left_foot_home_waist,
             right_foot_home_waist=env.t1.defaults.right_foot_home_waist,
             action_scale=jnp.array(walk_config["action_scale"], dtype=jnp.float32),
+            action_smoothing_new_weight=jnp.array(
+                walk_config.get("action_smoothing_new_weight", 0.2),
+                dtype=jnp.float32,
+            ),
+            foot_x_bias=jnp.array(
+                walk_config.get("foot_x_bias", 0.0), dtype=jnp.float32
+            ),
+            foot_position_scales=jnp.array(
+                walk_config.get("foot_position_scales", [0.02, 0.02, 0.01]),
+                dtype=jnp.float32,
+            ),
+            foot_rotation_scales_deg=jnp.array(
+                walk_config.get("foot_rotation_scales_deg", [3.0, 3.0, 5.0]),
+                dtype=jnp.float32,
+            ),
+            foot_yaw_bias_deg=jnp.array(
+                walk_config.get("foot_yaw_bias_deg", 7.0), dtype=jnp.float32
+            ),
+            min_abs_foot_y=jnp.array(
+                walk_config.get("min_abs_foot_y", 0.01), dtype=jnp.float32
+            ),
         )
         self.ik_config = IKSolverConfig(
             iterations=int(walk_config["ik_iterations"]),
@@ -39,7 +65,15 @@ class NaoWalkControl:
             float(self.z_extension),
         )
 
-    def process_action(self, mjx_model, data, walk_core_state, action, internal_target):
+    def process_action(
+        self,
+        mjx_model,
+        data,
+        walk_core_state,
+        action,
+        internal_target,
+        reset=jnp.bool_(False),
+    ):
         internal_dist = jnp.linalg.norm(internal_target)
         action_mult = jnp.where(
             internal_dist > 0.2,
@@ -52,7 +86,7 @@ class NaoWalkControl:
             self.env.t1.ids,
             walk_core_state,
             action * action_mult,
-            jnp.bool_(False),
+            reset,
             self.ts_per_step,
             self.z_span,
             self.z_extension,

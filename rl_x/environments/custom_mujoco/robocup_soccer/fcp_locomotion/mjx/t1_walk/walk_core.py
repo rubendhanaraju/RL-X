@@ -29,6 +29,14 @@ class WalkCoreConfig(NamedTuple):
     left_foot_home_waist: jnp.ndarray
     right_foot_home_waist: jnp.ndarray
     action_scale: jnp.ndarray = jnp.array(0.7, dtype=jnp.float32)
+    action_smoothing_new_weight: jnp.ndarray = jnp.array(0.2, dtype=jnp.float32)
+    foot_x_bias: jnp.ndarray = jnp.array(0.0, dtype=jnp.float32)
+    foot_position_scales: jnp.ndarray = jnp.array([0.02, 0.02, 0.01], dtype=jnp.float32)
+    foot_rotation_scales_deg: jnp.ndarray = jnp.array(
+        [3.0, 3.0, 5.0], dtype=jnp.float32
+    )
+    foot_yaw_bias_deg: jnp.ndarray = jnp.array(7.0, dtype=jnp.float32)
+    min_abs_foot_y: jnp.ndarray = jnp.array(0.01, dtype=jnp.float32)
 
 
 def init_walk_core_state(ts_per_step: int, z_span: float, z_extension: float) -> WalkCoreState:
@@ -53,28 +61,38 @@ def build_walk_targets(
 
     left_pos = jnp.array(
         [
-            walk_config.left_foot_home_waist[0] + a[0] * 0.02,
-            jnp.maximum(0.01, a[1] * 0.02 + left_y),
-            a[2] * 0.01 + left_z,
+            walk_config.left_foot_home_waist[0]
+            + walk_config.foot_x_bias
+            + a[0] * walk_config.foot_position_scales[0],
+            jnp.maximum(
+                walk_config.min_abs_foot_y,
+                a[1] * walk_config.foot_position_scales[1] + left_y,
+            ),
+            a[2] * walk_config.foot_position_scales[2] + left_z,
         ],
         dtype=jnp.float32,
     )
     right_pos = jnp.array(
         [
-            walk_config.right_foot_home_waist[0] + a[3] * 0.02,
-            jnp.minimum(-0.01, a[4] * 0.02 + right_y),
-            a[5] * 0.01 + right_z,
+            walk_config.right_foot_home_waist[0]
+            + walk_config.foot_x_bias
+            + a[3] * walk_config.foot_position_scales[0],
+            jnp.minimum(
+                -walk_config.min_abs_foot_y,
+                a[4] * walk_config.foot_position_scales[1] + right_y,
+            ),
+            a[5] * walk_config.foot_position_scales[2] + right_z,
         ],
         dtype=jnp.float32,
     )
 
     deg = jnp.pi / 180.0
-    left_rpy = a[6:9] * jnp.array([3.0, 3.0, 5.0], dtype=jnp.float32) * deg
-    right_rpy = a[9:12] * jnp.array([3.0, 3.0, 5.0], dtype=jnp.float32) * deg
+    left_rpy = a[6:9] * walk_config.foot_rotation_scales_deg * deg
+    right_rpy = a[9:12] * walk_config.foot_rotation_scales_deg * deg
 
-    # Keep the same anti-twist prior as NAO Walk_RL3, but in radians.
-    left_rpy = left_rpy.at[2].set(jnp.maximum(0.0, left_rpy[2] + 7.0 * deg))
-    right_rpy = right_rpy.at[2].set(jnp.minimum(0.0, right_rpy[2] - 7.0 * deg))
+    yaw_bias = walk_config.foot_yaw_bias_deg * deg
+    left_rpy = left_rpy.at[2].set(jnp.maximum(0.0, left_rpy[2] + yaw_bias))
+    right_rpy = right_rpy.at[2].set(jnp.minimum(0.0, right_rpy[2] - yaw_bias))
 
     return WalkTargets(left_pos, left_rpy, right_pos, right_rpy)
 
@@ -142,8 +160,8 @@ def walk_core_step(
         step_config,
     )
 
-    # Same exponential action memory as Walk_RL3.
-    action_memory = 0.8 * state.action_memory + 0.2 * action
+    smoothing = walk_config.action_smoothing_new_weight
+    action_memory = (1.0 - smoothing) * state.action_memory + smoothing * action
     targets = build_walk_targets(
         action_memory,
         step_targets.left_y,
