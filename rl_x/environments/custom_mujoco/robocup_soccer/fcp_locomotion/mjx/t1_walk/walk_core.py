@@ -37,6 +37,21 @@ class WalkCoreConfig(NamedTuple):
     )
     foot_yaw_bias_deg: jnp.ndarray = jnp.array(7.0, dtype=jnp.float32)
     min_abs_foot_y: jnp.ndarray = jnp.array(0.01, dtype=jnp.float32)
+    arm_base: jnp.ndarray = jnp.array(
+        [
+            0.0,
+            -1.4,
+            0.0,
+            -0.4,
+            0.0,
+            1.4,
+            0.0,
+            0.4,
+        ],
+        dtype=jnp.float32,
+    )
+    arm_swing_scale: jnp.ndarray = jnp.array(0.10, dtype=jnp.float32)
+    arm_action_scale: jnp.ndarray = jnp.array(0.08, dtype=jnp.float32)
 
 
 def init_walk_core_state(ts_per_step: int, z_span: float, z_extension: float) -> WalkCoreState:
@@ -97,36 +112,32 @@ def build_walk_targets(
     return WalkTargets(left_pos, left_rpy, right_pos, right_rpy)
 
 
-def t1_default_arm_ctrl(action_memory: jnp.ndarray, step_state: StepGeneratorState) -> jnp.ndarray:
+def t1_default_arm_ctrl(
+    action_memory: jnp.ndarray,
+    step_state: StepGeneratorState,
+    walk_config: WalkCoreConfig,
+) -> jnp.ndarray:
     """Arm controls matching the NAO walk action role."""
 
-    arms = jnp.array(
-        [
-            0.0,
-            -1.4,
-            0.0,
-            -0.4,
-            0.0,
-            1.4,
-            0.0,
-            0.4,
-        ],
-        dtype=jnp.float32,
-    )
+    arms = walk_config.arm_base
     arm_swing = (
         jnp.sin(
             step_state.state_current_ts.astype(jnp.float32)
             / step_state.ts_per_step.astype(jnp.float32)
             * jnp.pi
         )
-        * 0.10
+        * walk_config.arm_swing_scale
     )
     inv = jnp.where(step_state.state_is_left_active, 1.0, -1.0)
 
-    arms = arms.at[0].add(action_memory[12] * 0.08 - arm_swing * inv)
-    arms = arms.at[4].add(action_memory[13] * 0.08 + arm_swing * inv)
-    arms = arms.at[1].add(action_memory[14] * 0.08)
-    arms = arms.at[5].add(action_memory[15] * 0.08)
+    arms = arms.at[0].add(
+        action_memory[12] * walk_config.arm_action_scale - arm_swing * inv
+    )
+    arms = arms.at[4].add(
+        action_memory[13] * walk_config.arm_action_scale + arm_swing * inv
+    )
+    arms = arms.at[1].add(action_memory[14] * walk_config.arm_action_scale)
+    arms = arms.at[5].add(action_memory[15] * walk_config.arm_action_scale)
     return arms
 
 
@@ -171,9 +182,14 @@ def walk_core_step(
         walk_config,
     )
 
+    ik_seed_data = data.replace(
+        qpos=data.qpos
+        .at[ids.left.qpos_ids].set(data.ctrl[ids.left_leg_ctrl_ids])
+        .at[ids.right.qpos_ids].set(data.ctrl[ids.right_leg_ctrl_ids])
+    )
     _ik_data, left_q, right_q = solve_two_leg_ik(
         model,
-        data,
+        ik_seed_data,
         ids,
         targets.left_pos_waist,
         targets.left_rpy_waist,
@@ -185,7 +201,9 @@ def walk_core_step(
     ctrl = data.ctrl
     ctrl = ctrl.at[ids.left_leg_ctrl_ids].set(left_q)
     ctrl = ctrl.at[ids.right_leg_ctrl_ids].set(right_q)
-    ctrl = ctrl.at[jnp.arange(2, 10)].set(t1_default_arm_ctrl(action_memory, step_state))
+    ctrl = ctrl.at[jnp.arange(2, 10)].set(
+        t1_default_arm_ctrl(action_memory, step_state, walk_config)
+    )
     data = data.replace(ctrl=ctrl)
 
     next_state = WalkCoreState(

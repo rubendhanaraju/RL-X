@@ -4,74 +4,78 @@ import jax.numpy as jnp
 class DefaultReward:
     def __init__(self, env):
         self.env = env
+        reward_config = env.env_config["reward"]
 
-        self.tracking_xy_velocity_command_coeff = env.env_config["reward"]["tracking_xy_velocity_command_coeff"] * env.dt
-        self.tracking_xy_temperature = env.env_config["reward"]["tracking_xy_temperature"]
-        self.tracking_yaw_velocity_command_coeff = env.env_config["reward"]["tracking_yaw_velocity_command_coeff"] * env.dt
-        self.tracking_yaw_temperature = env.env_config["reward"]["tracking_yaw_temperature"]
-        self.alive_clipped_coeff = env.env_config["reward"]["alive_clipped_coeff"] * env.dt
-        self.alive_unclipped_coeff = env.env_config["reward"]["alive_unclipped_coeff"] * env.dt
-        self.z_velocity_coeff = env.env_config["reward"]["z_velocity_coeff"] * env.dt
-        self.imu_acceleration_coeff = env.env_config["reward"]["imu_acceleration_coeff"] * env.dt
-        self.roll_pitch_vel_coeff = env.env_config["reward"]["roll_pitch_vel_coeff"] * env.dt
-        self.roll_pitch_pos_coeff = env.env_config["reward"]["roll_pitch_pos_coeff"] * env.dt
-        self.actuator_joint_nominal_diff_coeff = env.env_config["reward"]["actuator_joint_nominal_diff_coeff"] * env.dt
-        self.joint_position_limit_coeff = env.env_config["reward"]["joint_position_limit_coeff"] * env.dt
-        self.soft_joint_position_limit = env.env_config["reward"]["soft_joint_position_limit"]
-        self.actuator_joint_velocity_limit_coeff = env.env_config["reward"]["actuator_joint_velocity_limit_coeff"] * env.dt
-        self.soft_actuator_joint_velocity_limit = env.env_config["reward"]["soft_actuator_joint_velocity_limit"]
-        self.joint_velocity_coeff = env.env_config["reward"]["joint_velocity_coeff"] * env.dt
-        self.joint_acceleration_coeff = env.env_config["reward"]["joint_acceleration_coeff"] * env.dt
-        self.joint_torque_coeff = env.env_config["reward"]["joint_torque_coeff"] * env.dt
-        self.power_draw_penalty_coeff = env.env_config["reward"]["power_draw_penalty_coeff"] * env.dt
-        self.action_rate_coeff = env.env_config["reward"]["action_rate_coeff"] * env.dt
-        self.action_smoothness_coeff = env.env_config["reward"]["action_smoothness_coeff"] * env.dt
-        self.collision_coeff = env.env_config["reward"]["collision_coeff"] * env.dt
-        self.base_height_coeff = env.env_config["reward"]["base_height_coeff"] * env.dt
-        self.foot_air_time_coeff = env.env_config["reward"]["foot_air_time_coeff"] * env.dt
-        self.foot_air_time_per_robot_size_m = env.env_config["reward"]["foot_air_time_per_robot_size_m"]
-        self.symmetry_air_coeff = env.env_config["reward"]["symmetry_air_coeff"] * env.dt
-        self.foot_slip_coeff = env.env_config["reward"]["foot_slip_coeff"] * env.dt
-        self.foot_z_velocity_coeff = env.env_config["reward"]["foot_z_velocity_coeff"] * env.dt
-        self.feet_flat_coeff = env.env_config["reward"]["feet_flat_coeff"] * env.dt
-        self.feet_phase_coeff = env.env_config["reward"]["feet_phase_coeff"] * env.dt
-        self.feet_phase_swing_height = env.env_config["reward"]["feet_phase_swing_height"]
-        self.feet_phase_tracking_sigma = env.env_config["reward"]["feet_phase_tracking_sigma"]
-        self.feet_height_on_flat_ground = env.env_config["reward"]["feet_height_on_flat_ground"]
-        self.feet_yaw_coeff = env.env_config["reward"]["feet_yaw_coeff"] * env.dt
-        self.ball_attractor_coeff = env.env_config["reward"]["ball_attractor_coeff"] * env.dt
+        self.tracking_xy_velocity_command_coeff = reward_config["tracking_xy_velocity_command_coeff"] * env.dt
+        self.tracking_xy_temperature = reward_config["tracking_xy_temperature"]
+        self.tracking_yaw_velocity_command_coeff = reward_config["tracking_yaw_velocity_command_coeff"] * env.dt
+        self.tracking_yaw_temperature = reward_config["tracking_yaw_temperature"]
+        self.alive_clipped_coeff = reward_config["alive_clipped_coeff"] * env.dt
+        self.alive_unclipped_coeff = reward_config["alive_unclipped_coeff"] * env.dt
+        self.z_velocity_coeff = reward_config["z_velocity_coeff"] * env.dt
+        self.imu_acceleration_coeff = reward_config["imu_acceleration_coeff"] * env.dt
+        self.roll_pitch_vel_coeff = reward_config["roll_pitch_vel_coeff"] * env.dt
+        self.roll_pitch_pos_coeff = reward_config["roll_pitch_pos_coeff"] * env.dt
+        self.actuator_joint_nominal_diff_coeff = reward_config["actuator_joint_nominal_diff_coeff"] * env.dt
+        self.joint_position_limit_coeff = reward_config["joint_position_limit_coeff"] * env.dt
+        self.soft_joint_position_limit = reward_config["soft_joint_position_limit"]
+        self.actuator_joint_velocity_limit_coeff = reward_config["actuator_joint_velocity_limit_coeff"] * env.dt
+        self.soft_actuator_joint_velocity_limit = reward_config["soft_actuator_joint_velocity_limit"]
+        self.joint_velocity_coeff = reward_config["joint_velocity_coeff"] * env.dt
+        self.joint_acceleration_coeff = reward_config["joint_acceleration_coeff"] * env.dt
+        self.joint_torque_coeff = reward_config["joint_torque_coeff"] * env.dt
+        self.power_draw_penalty_coeff = reward_config["power_draw_penalty_coeff"] * env.dt
+        self.action_rate_coeff = reward_config["action_rate_coeff"] * env.dt
+        self.action_smoothness_coeff = reward_config["action_smoothness_coeff"] * env.dt
+        self.collision_coeff = reward_config["collision_coeff"] * env.dt
+        self.base_height_coeff = reward_config["base_height_coeff"] * env.dt
+        self.foot_air_time_coeff = reward_config["foot_air_time_coeff"] * env.dt
+        self.foot_air_time_per_robot_size_m = reward_config["foot_air_time_per_robot_size_m"]
+        self.symmetry_air_coeff = reward_config["symmetry_air_coeff"] * env.dt
+        self.foot_slip_coeff = reward_config["foot_slip_coeff"] * env.dt
+        self.foot_z_velocity_coeff = reward_config["foot_z_velocity_coeff"] * env.dt
+        self.feet_flat_coeff = reward_config["feet_flat_coeff"] * env.dt
+        self.feet_phase_coeff = reward_config["feet_phase_coeff"] * env.dt
+        self.feet_phase_swing_height = reward_config["feet_phase_swing_height"]
+        self.feet_phase_tracking_sigma = reward_config["feet_phase_tracking_sigma"]
+        self.feet_height_on_flat_ground = reward_config["feet_height_on_flat_ground"]
+        self.feet_yaw_coeff = reward_config["feet_yaw_coeff"] * env.dt
+        self.ball_attractor_coeff = reward_config["ball_attractor_coeff"] * env.dt
         self.ball_attractor_target = jnp.array(
             [
-                env.env_config["reward"]["ball_attractor_target_x"],
-                env.env_config["reward"]["ball_attractor_target_y"],
+                reward_config["ball_attractor_target_x"],
+                reward_config["ball_attractor_target_y"],
             ],
             dtype=jnp.float32,
         )
         self.ball_attractor_scale = jnp.array(
             [
-                env.env_config["reward"]["ball_attractor_scale_x"],
-                env.env_config["reward"]["ball_attractor_scale_y"],
+                reward_config["ball_attractor_scale_x"],
+                reward_config["ball_attractor_scale_y"],
             ],
             dtype=jnp.float32,
         )
-        self.ball_visible_coeff = env.env_config["reward"]["ball_visible_coeff"] * env.dt
-        self.ball_possession_penalty_coeff = env.env_config["reward"]["ball_possession_penalty_coeff"] * env.dt
-        self.ball_velocity_command_coeff = env.env_config["reward"]["ball_velocity_command_coeff"] * env.dt
-        self.ball_velocity_command_temperature = env.env_config["reward"]["ball_velocity_command_temperature"]
-        self.ball_robot_velocity_match_coeff = env.env_config["reward"]["ball_robot_velocity_match_coeff"] * env.dt
-        self.ball_robot_velocity_match_temperature = env.env_config["reward"]["ball_robot_velocity_match_temperature"]
-        self.ball_possession_soft_min_x = env.env_config["reward"]["ball_possession_soft_min_x"]
-        self.ball_possession_soft_max_x = env.env_config["reward"]["ball_possession_soft_max_x"]
-        self.ball_possession_soft_max_abs_y = env.env_config["reward"]["ball_possession_soft_max_abs_y"]
+        self.ball_visible_coeff = reward_config["ball_visible_coeff"] * env.dt
+        self.use_ball_possession_penalty_reward = "ball_possession_penalty_coeff" in reward_config
+        self.ball_possession_penalty_coeff = reward_config.get("ball_possession_penalty_coeff", 0.0) * env.dt
+        self.use_ball_velocity_command_reward = "ball_velocity_command_coeff" in reward_config
+        self.ball_velocity_command_coeff = reward_config.get("ball_velocity_command_coeff", 0.0) * env.dt
+        self.ball_velocity_command_temperature = reward_config.get("ball_velocity_command_temperature", 1.0)
+        self.use_ball_robot_velocity_match_reward = "ball_robot_velocity_match_coeff" in reward_config
+        self.ball_robot_velocity_match_coeff = reward_config.get("ball_robot_velocity_match_coeff", 0.0) * env.dt
+        self.ball_robot_velocity_match_temperature = reward_config.get("ball_robot_velocity_match_temperature", 1.0)
+        self.ball_possession_soft_min_x = reward_config["ball_possession_soft_min_x"]
+        self.ball_possession_soft_max_x = reward_config["ball_possession_soft_max_x"]
+        self.ball_possession_soft_max_abs_y = reward_config["ball_possession_soft_max_abs_y"]
         self.ball_possession_scale = jnp.array(
             [
-                env.env_config["reward"]["ball_possession_scale_x"],
-                env.env_config["reward"]["ball_possession_scale_y"],
+                reward_config["ball_possession_scale_x"],
+                reward_config["ball_possession_scale_y"],
             ],
             dtype=jnp.float32,
         )
-        self.feet_ball_gap_coeff = env.env_config["reward"]["feet_ball_gap_coeff"] * env.dt
-        self.feet_ball_gap_scale = env.env_config["reward"]["feet_ball_gap_scale"]
+        self.feet_ball_gap_coeff = reward_config["feet_ball_gap_coeff"] * env.dt
+        self.feet_ball_gap_scale = reward_config["feet_ball_gap_scale"]
 
         self.feet_symmetry_pairs = env.feet_symmetry_pairs
 
@@ -282,25 +286,34 @@ class DefaultReward:
         ball_attractor_reward = ball_task_active * self.ball_attractor_coeff * jnp.exp(-ball_attractor_error_norm)
         ball_visible_reward = ball_task_active * self.ball_visible_coeff * jnp.asarray(internal_state["ball_visible"], dtype=jnp.float32)
         ball_distance_to_base = jnp.linalg.norm(ball_rel_base[:2])
-        ball_velocity_command_error = jnp.sum(jnp.square(ball_vel_base[:2] - internal_state["goal_velocities"][:2]))
-        ball_velocity_command_reward = ball_task_active * self.ball_velocity_command_coeff * jnp.exp(-ball_velocity_command_error / self.ball_velocity_command_temperature)
+        if self.use_ball_velocity_command_reward:
+            ball_velocity_command_error = jnp.sum(jnp.square(ball_vel_base[:2] - internal_state["goal_velocities"][:2]))
+            ball_velocity_command_reward = ball_task_active * self.ball_velocity_command_coeff * jnp.exp(-ball_velocity_command_error / self.ball_velocity_command_temperature)
+        else:
+            ball_velocity_command_error = jnp.asarray(0.0, dtype=jnp.float32)
+            ball_velocity_command_reward = jnp.asarray(0.0, dtype=jnp.float32)
         robot_xy_velocity = current_imu_linear_velocity[:2]
         robot_speed_xy = jnp.linalg.norm(robot_xy_velocity)
         goal_speed_xy = jnp.linalg.norm(internal_state["goal_velocities"][:2])
-        command_motion_gate = jnp.clip(
-            goal_speed_xy / jnp.maximum(0.5 * internal_state["max_command_velocity"], 1e-6),
-            0.0,
-            1.0,
-        )
-        robot_motion_gate = jnp.clip(robot_speed_xy / jnp.maximum(goal_speed_xy, 1e-6), 0.0, 1.0)
-        ball_robot_velocity_match_gate = command_motion_gate * robot_motion_gate
-        ball_robot_velocity_match_error = jnp.sum(jnp.square(ball_vel_base[:2] - robot_xy_velocity))
-        ball_robot_velocity_match_reward = (
-            ball_task_active
-            * self.ball_robot_velocity_match_coeff
-            * ball_robot_velocity_match_gate
-            * jnp.exp(-ball_robot_velocity_match_error / self.ball_robot_velocity_match_temperature)
-        )
+        if self.use_ball_robot_velocity_match_reward:
+            command_motion_gate = jnp.clip(
+                goal_speed_xy / jnp.maximum(0.5 * internal_state["max_command_velocity"], 1e-6),
+                0.0,
+                1.0,
+            )
+            robot_motion_gate = jnp.clip(robot_speed_xy / jnp.maximum(goal_speed_xy, 1e-6), 0.0, 1.0)
+            ball_robot_velocity_match_gate = command_motion_gate * robot_motion_gate
+            ball_robot_velocity_match_error = jnp.sum(jnp.square(ball_vel_base[:2] - robot_xy_velocity))
+            ball_robot_velocity_match_reward = (
+                ball_task_active
+                * self.ball_robot_velocity_match_coeff
+                * ball_robot_velocity_match_gate
+                * jnp.exp(-ball_robot_velocity_match_error / self.ball_robot_velocity_match_temperature)
+            )
+        else:
+            ball_robot_velocity_match_gate = jnp.asarray(0.0, dtype=jnp.float32)
+            ball_robot_velocity_match_error = jnp.asarray(0.0, dtype=jnp.float32)
+            ball_robot_velocity_match_reward = jnp.asarray(0.0, dtype=jnp.float32)
 
         ball_x_too_far_back = jnp.maximum(self.ball_possession_soft_min_x - ball_rel_base[0], 0.0)
         ball_x_too_far_front = jnp.maximum(ball_rel_base[0] - self.ball_possession_soft_max_x, 0.0)
@@ -310,7 +323,11 @@ class DefaultReward:
             ball_y_too_far_side / jnp.maximum(self.ball_possession_scale[1], 1e-6),
         ])
         ball_possession_violation_norm = jnp.sum(jnp.square(ball_possession_violation))
-        ball_possession_penalty_reward = ball_task_active * self.ball_possession_penalty_coeff * -ball_possession_violation_norm
+        ball_possession_penalty_reward = (
+            ball_task_active
+            * self.ball_possession_penalty_coeff
+            * -ball_possession_violation_norm
+        )
 
         # Total reward
         tracking_reward = tracking_xy_velocity_command_reward + tracking_yaw_velocity_command_reward + feet_phase_reward + ball_attractor_reward + ball_visible_reward + ball_velocity_command_reward + ball_robot_velocity_match_reward
@@ -353,9 +370,12 @@ class DefaultReward:
         info[f"reward/feet_yaw"] = feet_yaw_reward
         info[f"reward/ball_attractor"] = ball_attractor_reward
         info[f"reward/ball_visible"] = ball_visible_reward
-        info[f"reward/ball_velocity_command"] = ball_velocity_command_reward
-        info[f"reward/ball_robot_velocity_match"] = ball_robot_velocity_match_reward
-        info[f"reward/ball_possession_penalty"] = ball_possession_penalty_reward
+        if self.use_ball_velocity_command_reward:
+            info[f"reward/ball_velocity_command"] = ball_velocity_command_reward
+        if self.use_ball_robot_velocity_match_reward:
+            info[f"reward/ball_robot_velocity_match"] = ball_robot_velocity_match_reward
+        if self.use_ball_possession_penalty_reward:
+            info[f"reward/ball_possession_penalty"] = ball_possession_penalty_reward
         info[f"reward/feet_ball_gap"] = feet_ball_gap_reward
         info[f"reward/total"] = reward
         info[f"env_info/xy_vel_diff_abs"] = jnp.nan_to_num(jnp.mean(jnp.minimum(jnp.abs(xy_difference), 2*internal_state["max_command_velocity"])), nan=2*internal_state["max_command_velocity"], posinf=2*internal_state["max_command_velocity"], neginf=2*internal_state["max_command_velocity"])
@@ -368,9 +388,11 @@ class DefaultReward:
         info[f"env_info/ball_rel_base_y"] = ball_rel_base[1]
         info[f"env_info/ball_vel_base_x"] = ball_vel_base[0]
         info[f"env_info/ball_vel_base_y"] = ball_vel_base[1]
-        info[f"env_info/ball_velocity_command_error"] = ball_velocity_command_error
-        info[f"env_info/ball_robot_velocity_match_error"] = ball_robot_velocity_match_error
-        info[f"env_info/ball_robot_velocity_match_gate"] = ball_robot_velocity_match_gate
+        if self.use_ball_velocity_command_reward:
+            info[f"env_info/ball_velocity_command_error"] = ball_velocity_command_error
+        if self.use_ball_robot_velocity_match_reward:
+            info[f"env_info/ball_robot_velocity_match_error"] = ball_robot_velocity_match_error
+            info[f"env_info/ball_robot_velocity_match_gate"] = ball_robot_velocity_match_gate
         info[f"env_info/ball_distance_to_base"] = ball_distance_to_base
         info[f"env_info/ball_speed"] = jnp.linalg.norm(ball_vel_world[:2])
         info[f"env_info/ball_position_x"] = ball_pos_world[0]

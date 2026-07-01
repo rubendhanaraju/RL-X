@@ -23,6 +23,8 @@ def get_config(environment_name):
             "type": "nao_walk",
             "ts_per_step": 8,
             "swing_height": 0.02,
+            "z0": 0.2,
+            "gravity": -1.0,
             "action_scale": 0.7,
             "ik_iterations": 12,
             "ik_damping": 1e-3,

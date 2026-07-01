@@ -100,8 +100,9 @@ class WalkPolicyDribblingEnv:
         self.nominal_command_min_toward_ball_speed = float(
             env_config["teacher_policy"].get("nominal_command_min_toward_ball_speed", 0.25)
         )
+        nominal_command_noise_std = env_config["teacher_policy"].get("nominal_command_noise_std", [0.0, 0.0, 0.0])
         self.nominal_command_noise_std = jnp.array(
-            env_config["teacher_policy"].get("nominal_command_noise_std", [0.0, 0.0, 0.0]),
+            nominal_command_noise_std,
             dtype=jnp.float32,
         )
         self.teacher_imitation_schedule_enabled = bool(env_config["teacher_imitation_schedule"]["enabled"])
@@ -113,7 +114,10 @@ class WalkPolicyDribblingEnv:
         self.penalty_start_coeff = float(env_config["penalty_schedule"]["start_coeff"])
         self.penalty_end_coeff = float(env_config["penalty_schedule"]["end_coeff"])
         self.penalty_anneal_timesteps = float(env_config["penalty_schedule"]["anneal_timesteps"])
-        self.add_teacher_command_noise = self.runner_mode == "train"
+        self.add_teacher_command_noise = (
+            self.runner_mode == "train"
+            and any(abs(float(noise_std)) > 0.0 for noise_std in nominal_command_noise_std)
+        )
         self.ball_spawn_radius = float(env_config["ball"]["spawn_radius"])
         self.ball_spawn_half_angle = np.deg2rad(float(env_config["ball"]["spawn_half_angle_degrees"]))
         self.ball_spawn_in_vision = bool(env_config["ball"]["spawn_in_vision"])
@@ -135,6 +139,11 @@ class WalkPolicyDribblingEnv:
         self.max_rotation_dist = jnp.float32(env_config["target"]["max_rotation_dist"])
         self.train_initial_orientation_min = jnp.float32(env_config["target"].get("train_initial_orientation_min", -180.0))
         self.train_initial_orientation_max = jnp.float32(env_config["target"].get("train_initial_orientation_max", 180.0))
+        self.orientation_change_mode = env_config["target"].get("orientation_change_mode", "step_probability")
+        self.orientation_change_on_ball_displacement = self.orientation_change_mode == "ball_displacement"
+        self.orientation_change_ball_displacement = jnp.float32(
+            env_config["target"].get("orientation_change_ball_displacement", 0.5)
+        )
         self.orientation_change_probability = jnp.float32(env_config["target"]["orientation_change_probability"])
         self.return_to_base_on_radius = jnp.float32(env_config["target"]["return_to_base_on_radius"])
         self.return_to_base_off_radius = jnp.float32(env_config["target"]["return_to_base_off_radius"])
@@ -155,6 +164,43 @@ class WalkPolicyDribblingEnv:
         self.ball_stagnation_max_seconds = float(env_config["termination"].get("ball_stagnation_max_seconds", 2.0))
         self.ball_stagnation_min_displacement = float(env_config["termination"].get("ball_stagnation_min_displacement", 0.05))
         self.ball_stagnation_command_speed_threshold = float(env_config["termination"].get("ball_stagnation_command_speed_threshold", 0.15))
+        curriculum_config = env_config.get("dribble_curriculum", {})
+        self.dribble_curriculum_enabled = bool(curriculum_config.get("enabled", False))
+        self.dribble_curriculum_update_nr_levels = float(curriculum_config.get("nr_levels", 100))
+        self.dribble_curriculum_near_horizon_fraction = float(curriculum_config.get("near_horizon_fraction", 0.95))
+        self.dribble_curriculum_teacher_weights = jnp.array(
+            curriculum_config.get("teacher_imitation_weights", [self.teacher_imitation_start_weight]),
+            dtype=jnp.float32,
+        )
+        self.dribble_curriculum_fcp_coeffs = jnp.array(
+            curriculum_config.get("fcp_dribble_coeffs", [1.0]),
+            dtype=jnp.float32,
+        )
+        self.dribble_curriculum_possession_enabled = jnp.array(
+            curriculum_config.get("possession_enabled", [self.enable_possession_termination]),
+            dtype=bool,
+        )
+        self.dribble_curriculum_possession_min_x = jnp.array(
+            curriculum_config.get("possession_min_x", [self.possession_min_x]),
+            dtype=jnp.float32,
+        )
+        self.dribble_curriculum_possession_max_x = jnp.array(
+            curriculum_config.get("possession_max_x", [self.possession_max_x]),
+            dtype=jnp.float32,
+        )
+        self.dribble_curriculum_possession_max_abs_y = jnp.array(
+            curriculum_config.get("possession_max_abs_y", [self.possession_max_abs_y]),
+            dtype=jnp.float32,
+        )
+        self.dribble_curriculum_immediate_max_x = jnp.array(
+            curriculum_config.get("immediate_max_x", [self.immediate_possession_max_x]),
+            dtype=jnp.float32,
+        )
+        self.dribble_curriculum_immediate_max_abs_y = jnp.array(
+            curriculum_config.get("immediate_max_abs_y", [self.immediate_possession_max_abs_y]),
+            dtype=jnp.float32,
+        )
+        self.dribble_curriculum_nr_levels = int(self.dribble_curriculum_teacher_weights.shape[0])
 
         xml_path = (self.robot_config["directory_path"] / "data" / "plane.xml").as_posix()
         xml_handle = mjcf.from_path(xml_path)
@@ -638,6 +684,9 @@ class WalkPolicyDribblingEnv:
         )
         internal_state["virtual_orientation"] = self.wrap_to_180_deg(initial_orientation)
         internal_state["is_returning_to_base"] = jnp.asarray(False)
+        internal_state["orientation_reference_ball_position"] = self.ball_position_world(data)[:2]
+        internal_state["target_orientation_changed"] = jnp.asarray(False)
+        internal_state["target_orientation_ball_displacement"] = jnp.asarray(0.0, dtype=jnp.float32)
         self.update_target_orientation_values(data, internal_state, init=True)
 
 
@@ -655,11 +704,19 @@ class WalkPolicyDribblingEnv:
             ),
         )
         random_orientation = jax.random.uniform(random_orientation_key, minval=-180.0, maxval=180.0)
-        should_change = jax.random.uniform(random_gate_key) < self.orientation_change_probability
+        step_probability_change = jax.random.uniform(random_gate_key) < self.orientation_change_probability
+        ball_displacement = jnp.linalg.norm(ball_xy - internal_state["orientation_reference_ball_position"])
+        ball_displacement_change = ball_displacement >= self.orientation_change_ball_displacement
+        should_change = jnp.where(
+            self.orientation_change_on_ball_displacement,
+            ball_displacement_change,
+            step_probability_change,
+        )
+        should_sample_new_orientation = should_change & jnp.logical_not(is_returning_to_base)
         train_orientation = jnp.where(
             is_returning_to_base,
             self.vector_angle_deg(-ball_xy),
-            jnp.where(should_change, random_orientation, internal_state["virtual_orientation"]),
+            jnp.where(should_sample_new_orientation, random_orientation, internal_state["virtual_orientation"]),
         )
         eval_orientation = jnp.where(
             ball_xy[0] < self.eval_left_x,
@@ -674,6 +731,21 @@ class WalkPolicyDribblingEnv:
             jnp.where(internal_state["in_eval_mode"], eval_orientation, train_orientation)
         )
         internal_state["is_returning_to_base"] = is_returning_to_base
+        target_orientation_changed = (
+            jnp.logical_not(internal_state["in_eval_mode"])
+            & should_sample_new_orientation
+        )
+        reset_orientation_reference = target_orientation_changed | (
+            jnp.logical_not(internal_state["in_eval_mode"])
+            & is_returning_to_base
+        )
+        internal_state["orientation_reference_ball_position"] = jnp.where(
+            reset_orientation_reference,
+            ball_xy,
+            internal_state["orientation_reference_ball_position"],
+        )
+        internal_state["target_orientation_changed"] = target_orientation_changed
+        internal_state["target_orientation_ball_displacement"] = ball_displacement.astype(jnp.float32)
 
 
     def update_target_orientation_values(self, data, internal_state, init=False):
@@ -720,6 +792,8 @@ class WalkPolicyDribblingEnv:
         info["env_info/internal_target_vel"] = internal_state["internal_target_vel"]
         info["env_info/internal_abs_orientation"] = internal_state["internal_abs_orientation"]
         info["env_info/is_returning_to_base"] = internal_state["is_returning_to_base"].astype(jnp.float32)
+        info["env_info/target_orientation_changed"] = internal_state["target_orientation_changed"].astype(jnp.float32)
+        info["env_info/target_orientation_ball_displacement"] = internal_state["target_orientation_ball_displacement"]
 
 
     def fcp_dribble_observation(self, data, internal_state, init=False):
@@ -1052,6 +1126,145 @@ class WalkPolicyDribblingEnv:
             self.penalty_end_coeff,
         )
         internal_state["env_curriculum_levels_in_a_row"] = penalty_progress
+        self.apply_dribble_curriculum(internal_state)
+
+
+    def apply_dribble_curriculum(self, internal_state):
+        coeff = jnp.where(
+            internal_state["in_eval_mode"],
+            1.0,
+            internal_state["dribble_curriculum_coeff"],
+        )
+        internal_state["dribble_curriculum_coeff"] = coeff
+        level = jnp.clip(
+            jnp.floor(coeff * (self.dribble_curriculum_nr_levels - 1)).astype(jnp.int32),
+            0,
+            self.dribble_curriculum_nr_levels - 1,
+        )
+        internal_state["dribble_curriculum_level"] = level
+        auto_teacher_weight = self.dribble_curriculum_teacher_weights[level]
+        auto_fcp_coeff = self.dribble_curriculum_fcp_coeffs[level]
+        internal_state["teacher_imitation_weight"] = jnp.where(
+            self.dribble_curriculum_enabled,
+            auto_teacher_weight,
+            internal_state["teacher_imitation_weight"],
+        )
+        internal_state["dribble_curriculum_fcp_coeff"] = jnp.where(
+            self.dribble_curriculum_enabled,
+            auto_fcp_coeff,
+            internal_state["dribble_curriculum_fcp_coeff"],
+        )
+        internal_state["dribble_curriculum_possession_enabled"] = jnp.where(
+            self.dribble_curriculum_enabled,
+            self.dribble_curriculum_possession_enabled[level],
+            internal_state["dribble_curriculum_possession_enabled"],
+        )
+        internal_state["dribble_curriculum_possession_min_x"] = jnp.where(
+            self.dribble_curriculum_enabled,
+            self.dribble_curriculum_possession_min_x[level],
+            internal_state["dribble_curriculum_possession_min_x"],
+        )
+        internal_state["dribble_curriculum_possession_max_x"] = jnp.where(
+            self.dribble_curriculum_enabled,
+            self.dribble_curriculum_possession_max_x[level],
+            internal_state["dribble_curriculum_possession_max_x"],
+        )
+        internal_state["dribble_curriculum_possession_max_abs_y"] = jnp.where(
+            self.dribble_curriculum_enabled,
+            self.dribble_curriculum_possession_max_abs_y[level],
+            internal_state["dribble_curriculum_possession_max_abs_y"],
+        )
+        internal_state["dribble_curriculum_immediate_max_x"] = jnp.where(
+            self.dribble_curriculum_enabled,
+            self.dribble_curriculum_immediate_max_x[level],
+            internal_state["dribble_curriculum_immediate_max_x"],
+        )
+        internal_state["dribble_curriculum_immediate_max_abs_y"] = jnp.where(
+            self.dribble_curriculum_enabled,
+            self.dribble_curriculum_immediate_max_abs_y[level],
+            internal_state["dribble_curriculum_immediate_max_abs_y"],
+        )
+
+
+    def update_dribble_curriculum_after_episode(
+        self,
+        internal_state,
+        episode_step,
+        done,
+        height_termination,
+        ball_unseen_too_long,
+        qvel_limit_termination,
+    ):
+        near_horizon_steps = jnp.asarray(
+            int(round(self.dribble_curriculum_near_horizon_fraction * self.horizon)),
+            dtype=jnp.float32,
+        )
+        reached_near_horizon = jnp.asarray(episode_step, dtype=jnp.float32) >= near_horizon_steps
+        no_bad_terminal = ~(height_termination | ball_unseen_too_long | qvel_limit_termination)
+        success = done & reached_near_horizon & no_bad_terminal
+
+        previous_levels_in_a_row = internal_state["dribble_curriculum_levels_in_a_row"]
+        levels_in_a_row = jnp.where(
+            success,
+            jnp.where(previous_levels_in_a_row >= 0.0, previous_levels_in_a_row + 1.0, 1.0),
+            jnp.where(previous_levels_in_a_row < 0.0, previous_levels_in_a_row - 1.0, -1.0),
+        )
+        levels_in_a_row = jnp.where(done, levels_in_a_row, previous_levels_in_a_row)
+
+        next_coeff = jnp.clip(
+            internal_state["dribble_curriculum_coeff"]
+            + levels_in_a_row / jnp.maximum(jnp.asarray(self.dribble_curriculum_update_nr_levels), 1.0),
+            0.0,
+            1.0,
+        )
+        next_coeff = jnp.where(internal_state["in_eval_mode"], 1.0, next_coeff)
+        next_coeff = jnp.where(
+            jnp.asarray(self.dribble_curriculum_enabled) & done,
+            next_coeff,
+            internal_state["dribble_curriculum_coeff"],
+        )
+
+        previous_level = internal_state["dribble_curriculum_level"]
+        next_level = jnp.clip(
+            jnp.floor(next_coeff * (self.dribble_curriculum_nr_levels - 1)).astype(jnp.int32),
+            0,
+            self.dribble_curriculum_nr_levels - 1,
+        )
+        promoted = (
+            jnp.asarray(self.dribble_curriculum_enabled)
+            & done
+            & (next_level > previous_level)
+        )
+
+        internal_state["dribble_curriculum_coeff"] = next_coeff
+        internal_state["dribble_curriculum_levels_in_a_row"] = jnp.where(
+            jnp.asarray(self.dribble_curriculum_enabled) & done,
+            levels_in_a_row,
+            previous_levels_in_a_row,
+        )
+        internal_state["dribble_curriculum_success_streak"] = jnp.maximum(
+            internal_state["dribble_curriculum_levels_in_a_row"],
+            0.0,
+        )
+        internal_state["dribble_curriculum_last_episode_success"] = success.astype(jnp.float32)
+        internal_state["dribble_curriculum_promoted"] = promoted.astype(jnp.float32)
+        self.apply_dribble_curriculum(internal_state)
+
+
+    def update_dribble_curriculum_info(self, internal_state, info):
+        info["env_info/dribble_curriculum_coeff"] = internal_state["dribble_curriculum_coeff"]
+        info["env_info/dribble_curriculum_levels_in_a_row"] = internal_state["dribble_curriculum_levels_in_a_row"]
+        info["env_info/dribble_curriculum_level"] = internal_state["dribble_curriculum_level"].astype(jnp.float32)
+        info["env_info/dribble_curriculum_success_streak"] = internal_state["dribble_curriculum_success_streak"]
+        info["env_info/dribble_curriculum_last_episode_success"] = internal_state["dribble_curriculum_last_episode_success"]
+        info["env_info/dribble_curriculum_promoted"] = internal_state["dribble_curriculum_promoted"]
+        info["env_info/dribble_curriculum_fcp_coeff"] = internal_state["dribble_curriculum_fcp_coeff"]
+        info["env_info/dribble_curriculum_possession_enabled"] = internal_state["dribble_curriculum_possession_enabled"].astype(jnp.float32)
+        info["env_info/dribble_curriculum_possession_min_x"] = internal_state["dribble_curriculum_possession_min_x"]
+        info["env_info/dribble_curriculum_possession_max_x"] = internal_state["dribble_curriculum_possession_max_x"]
+        info["env_info/dribble_curriculum_possession_max_abs_y"] = internal_state["dribble_curriculum_possession_max_abs_y"]
+        info["env_info/dribble_curriculum_immediate_max_x"] = internal_state["dribble_curriculum_immediate_max_x"]
+        info["env_info/dribble_curriculum_immediate_max_abs_y"] = internal_state["dribble_curriculum_immediate_max_abs_y"]
 
 
     def update_teacher_imitation_info(self, internal_state, info):
@@ -1190,17 +1403,22 @@ class WalkPolicyDribblingEnv:
 
         completed_steps = episode_step + 1
         after_warmup = completed_steps >= self.possession_warmup_steps
+        possession_min_x = internal_state["dribble_curriculum_possession_min_x"]
+        possession_max_x = internal_state["dribble_curriculum_possession_max_x"]
+        possession_max_abs_y = internal_state["dribble_curriculum_possession_max_abs_y"]
+        immediate_max_x = internal_state["dribble_curriculum_immediate_max_x"]
+        immediate_max_abs_y = internal_state["dribble_curriculum_immediate_max_abs_y"]
         outside_tight_box = (
-            (ball_rel_x < self.possession_min_x)
-            | (ball_rel_x > self.possession_max_x)
-            | (jnp.abs(ball_rel_y) > self.possession_max_abs_y)
+            (ball_rel_x < possession_min_x)
+            | (ball_rel_x > possession_max_x)
+            | (jnp.abs(ball_rel_y) > possession_max_abs_y)
         )
         inside_possession_pocket = jnp.logical_not(outside_tight_box)
         ball_possession_armed = internal_state["ball_possession_armed"] | inside_possession_pocket
         tight_possession_lost = after_warmup & ball_possession_armed & outside_tight_box
         immediate_possession_lost = ball_possession_armed & (
-            (ball_rel_x > self.immediate_possession_max_x)
-            | (jnp.abs(ball_rel_y) > self.immediate_possession_max_abs_y)
+            (ball_rel_x > immediate_max_x)
+            | (jnp.abs(ball_rel_y) > immediate_max_abs_y)
         )
 
         return tight_possession_lost, immediate_possession_lost, ball_rel_x, ball_rel_y, inside_possession_pocket, ball_possession_armed
@@ -1466,6 +1684,19 @@ class WalkPolicyDribblingEnv:
             "teacher_imitation_level_delta": jnp.asarray(0.0, dtype=jnp.float32),
             "teacher_imitation_anneal_progress": jnp.asarray(0.0, dtype=jnp.float32),
             "penalty_anneal_progress": jnp.asarray(0.0, dtype=jnp.float32),
+            "dribble_curriculum_level": jnp.asarray(0, dtype=jnp.int32),
+            "dribble_curriculum_coeff": jnp.asarray(jnp.where(eval_mode, 1.0, 0.0), dtype=jnp.float32),
+            "dribble_curriculum_levels_in_a_row": jnp.asarray(0.0, dtype=jnp.float32),
+            "dribble_curriculum_success_streak": jnp.asarray(0.0, dtype=jnp.float32),
+            "dribble_curriculum_last_episode_success": jnp.asarray(0.0, dtype=jnp.float32),
+            "dribble_curriculum_promoted": jnp.asarray(0.0, dtype=jnp.float32),
+            "dribble_curriculum_fcp_coeff": jnp.asarray(1.0, dtype=jnp.float32),
+            "dribble_curriculum_possession_enabled": jnp.asarray(self.enable_possession_termination),
+            "dribble_curriculum_possession_min_x": jnp.asarray(self.possession_min_x, dtype=jnp.float32),
+            "dribble_curriculum_possession_max_x": jnp.asarray(self.possession_max_x, dtype=jnp.float32),
+            "dribble_curriculum_possession_max_abs_y": jnp.asarray(self.possession_max_abs_y, dtype=jnp.float32),
+            "dribble_curriculum_immediate_max_x": jnp.asarray(self.immediate_possession_max_x, dtype=jnp.float32),
+            "dribble_curriculum_immediate_max_abs_y": jnp.asarray(self.immediate_possession_max_abs_y, dtype=jnp.float32),
             "current_delta_command": jnp.array([0.0, 0.0, 0.0]),
             "last_delta_command": jnp.array([0.0, 0.0, 0.0]),
             "second_last_delta_command": jnp.array([0.0, 0.0, 0.0]),
@@ -1506,6 +1737,9 @@ class WalkPolicyDribblingEnv:
             "internal_rel_orientation": jnp.asarray(0.0, dtype=jnp.float32),
             "internal_target_vel": jnp.asarray(0.0, dtype=jnp.float32),
             "internal_abs_orientation": jnp.asarray(0.0, dtype=jnp.float32),
+            "orientation_reference_ball_position": jnp.zeros(2, dtype=jnp.float32),
+            "target_orientation_changed": jnp.asarray(False),
+            "target_orientation_ball_displacement": jnp.asarray(0.0, dtype=jnp.float32),
             "previous_ball_rel_observation": jnp.zeros(3, dtype=jnp.float32),
             "previous_ball_rel_velocity_obs": jnp.zeros(3, dtype=jnp.float32),
             "ball_motion_reference_position": jnp.zeros(2),
@@ -1533,6 +1767,7 @@ class WalkPolicyDribblingEnv:
         self.update_dribble_target_info(internal_state, info)
         self.update_teacher_command_noise_info(internal_state, info)
         self.update_teacher_imitation_info(internal_state, info)
+        self.update_dribble_curriculum_info(internal_state, info)
         info["env_info/ball_position_resampled"] = jnp.asarray(0.0, dtype=jnp.float32)
         info["env_info/reached_ball"] = jnp.asarray(0.0, dtype=jnp.float32)
         info["env_info/episode_reached_ball"] = jnp.asarray(0.0, dtype=jnp.float32)
@@ -1584,6 +1819,9 @@ class WalkPolicyDribblingEnv:
         new_state.internal_state["nominal_goal_velocities"] = jnp.zeros(3)
         new_state.internal_state["teacher_command_noise"] = jnp.zeros(3)
         new_state.internal_state["teacher_contact_blend"] = jnp.asarray(0.0, dtype=jnp.float32)
+        new_state.internal_state["dribble_curriculum_last_episode_success"] = jnp.asarray(0.0, dtype=jnp.float32)
+        new_state.internal_state["dribble_curriculum_promoted"] = jnp.asarray(0.0, dtype=jnp.float32)
+        self.apply_dribble_curriculum(new_state.internal_state)
         new_state.internal_state["current_delta_command"] = jnp.zeros(3)
         new_state.internal_state["last_delta_command"] = jnp.zeros(3)
         new_state.internal_state["second_last_delta_command"] = jnp.zeros(3)
@@ -1623,6 +1861,7 @@ class WalkPolicyDribblingEnv:
         self.update_teacher_policy_target(data, mjx_model, new_state.internal_state, jnp.zeros(self.nr_actuator_joints), teacher_noise_key)
         self.update_teacher_command_noise_info(new_state.internal_state, new_state.info)
         self.update_teacher_imitation_info(new_state.internal_state, new_state.info)
+        self.update_dribble_curriculum_info(new_state.internal_state, new_state.info)
         self.update_ball_possession_info(data, new_state.internal_state, new_state.info, 0)
         self.update_ball_motion_info(data, new_state.internal_state, new_state.info, True, 0)
         self.update_termination_info(data, new_state.internal_state, new_state.info, False, False, False, False, False, False, False, False)
@@ -1751,14 +1990,20 @@ class WalkPolicyDribblingEnv:
         self.update_dribble_target(data, state.internal_state, dribble_target_key)
         self.update_dribble_target_info(state.internal_state, state.info)
         ball_unseen_too_long = state.internal_state["ball_unseen_too_long"]
+        ball_visibility_termination = jnp.asarray(False)
         tight_possession_lost, immediate_possession_lost = self.update_ball_possession_info(
             data,
             state.internal_state,
             state.info,
             state.info_episode_store["episode_step"],
         )
-        tight_possession_lost = self.enable_possession_termination & tight_possession_lost
-        immediate_possession_lost = self.enable_possession_termination & immediate_possession_lost
+        possession_termination_enabled = jnp.where(
+            jnp.asarray(self.dribble_curriculum_enabled),
+            state.internal_state["dribble_curriculum_possession_enabled"],
+            jnp.asarray(self.enable_possession_termination),
+        )
+        tight_possession_lost = possession_termination_enabled & tight_possession_lost
+        immediate_possession_lost = possession_termination_enabled & immediate_possession_lost
         state.info["env_info/tight_possession_lost"] = tight_possession_lost.astype(jnp.float32)
         state.info["env_info/immediate_possession_lost"] = immediate_possession_lost.astype(jnp.float32)
         ball_stagnant_too_long = self.update_ball_motion_info(
@@ -1777,7 +2022,6 @@ class WalkPolicyDribblingEnv:
         qvel_limit_termination = jnp.any(jnp.abs(data.qvel[:3]) >= 100.0)
         terminated = (
             height_termination
-            | ball_unseen_too_long
             | tight_possession_lost
             | immediate_possession_lost
             | ball_stagnant_too_long
@@ -1790,7 +2034,7 @@ class WalkPolicyDribblingEnv:
             state.internal_state,
             state.info,
             height_termination,
-            ball_unseen_too_long,
+            ball_visibility_termination,
             tight_possession_lost,
             immediate_possession_lost,
             ball_stagnant_too_long,
@@ -1812,6 +2056,16 @@ class WalkPolicyDribblingEnv:
         state.info_episode_store["episode_step"] += 1
         state.info_episode_store["episode_return"] += reward
         state.info_episode_store["episode_total_xy_velocity_diff_abs"] += state.info["env_info/xy_vel_diff_abs"]
+        self.update_dribble_curriculum_after_episode(
+            state.internal_state,
+            state.info_episode_store["episode_step"],
+            done,
+            height_termination,
+            ball_visibility_termination,
+            qvel_limit_termination,
+        )
+        self.update_teacher_imitation_info(state.internal_state, state.info)
+        self.update_dribble_curriculum_info(state.internal_state, state.info)
         state.info["rollout/episode_return"] = jnp.where(done, state.info_episode_store["episode_return"], state.info["rollout/episode_return"])
         state.info["rollout/episode_length"] = jnp.where(done, state.info_episode_store["episode_step"], state.info["rollout/episode_length"])
         state.info["env_curriculum/coefficient"] = state.internal_state["env_curriculum_coeff"]
@@ -1834,6 +2088,8 @@ class WalkPolicyDribblingEnv:
             "env_info/ball_inside_possession_pocket",
             "env_info/ball_possession_armed",
             "env_info/ball_position_resampled",
+            "env_info/target_orientation_changed",
+            "env_info/target_orientation_ball_displacement",
             "env_info/close_ball_band_target_distance",
             "env_info/close_ball_band_error",
             "env_info/reached_ball",
@@ -1870,6 +2126,19 @@ class WalkPolicyDribblingEnv:
             "env_info/teacher_imitation_level_delta",
             "env_info/teacher_imitation_anneal_progress",
             "env_info/penalty_anneal_progress",
+            "env_info/dribble_curriculum_coeff",
+            "env_info/dribble_curriculum_levels_in_a_row",
+            "env_info/dribble_curriculum_level",
+            "env_info/dribble_curriculum_success_streak",
+            "env_info/dribble_curriculum_last_episode_success",
+            "env_info/dribble_curriculum_promoted",
+            "env_info/dribble_curriculum_fcp_coeff",
+            "env_info/dribble_curriculum_possession_enabled",
+            "env_info/dribble_curriculum_possession_min_x",
+            "env_info/dribble_curriculum_possession_max_x",
+            "env_info/dribble_curriculum_possession_max_abs_y",
+            "env_info/dribble_curriculum_immediate_max_x",
+            "env_info/dribble_curriculum_immediate_max_abs_y",
             "env_info/virtual_orientation",
             "env_info/internal_rel_orientation",
             "env_info/internal_target_vel",
@@ -1892,7 +2161,7 @@ class WalkPolicyDribblingEnv:
 
 
     def get_observation(self, data, mjx_model, internal_state, key, action, init=False):
-        observation_noise_key = key
+        observation_noise_key, ball_observation_noise_key = jax.random.split(key, 2)
         ball_pos_world = self.ball_position_world(data)
         ball_vel_world = self.ball_velocity_world(data)
         base_pos_world = self.base_position_world(data)
@@ -1901,6 +2170,23 @@ class WalkPolicyDribblingEnv:
             internal_state,
             init=init,
         )
+        ball_relative_position_noise = (
+            internal_state["env_curriculum_coeff"]
+            * self.ball_relative_position_noise
+            * jax.random.uniform(
+                ball_observation_noise_key,
+                shape=(3,),
+                minval=-1.0,
+                maxval=1.0,
+            )
+        )
+        ball_relative_position_noise = jnp.where(
+            internal_state["in_eval_mode"],
+            jnp.zeros(3, dtype=jnp.float32),
+            ball_relative_position_noise,
+        )
+        noisy_fcp_ball_rel_observation = fcp_ball_rel_observation + ball_relative_position_noise
+        noisy_fcp_ball_distance_obs = self.ball_observation_distance(noisy_fcp_ball_rel_observation) * 2.0
         current_imu_angular_velocity = data.sensordata[self.imu_angular_velocity_sensor_adr:self.imu_angular_velocity_sensor_adr + self.imu_angular_velocity_sensor_dim]
         base_yaw = internal_state["imu_orientation_euler"][2]
         base_yaw_rate = current_imu_angular_velocity[2]
@@ -1908,8 +2194,8 @@ class WalkPolicyDribblingEnv:
         observation = jnp.concatenate([
             self._get_robot_observation_prefix(data, mjx_model, internal_state, action),
             fcp_ball_rel_velocity_obs,
-            fcp_ball_rel_observation,
-            jnp.array([fcp_ball_distance_obs]),
+            noisy_fcp_ball_rel_observation,
+            jnp.array([noisy_fcp_ball_distance_obs]),
             jnp.array([internal_state["internal_rel_orientation"]]),
             jnp.array([internal_state["internal_target_vel"]]),
             ball_pos_world,
@@ -2024,7 +2310,6 @@ class WalkPolicyDribblingEnv:
             self.feet_time_in_air_obs_idx,
             self.imu_linear_vel_obs_idx,
             self.imu_angular_vel_obs_idx,
-            self.goal_velocities_obs_idx,
             self.gait_phase_obs_idx,
             self.gravity_vector_obs_idx,
             self.critic_exteroception_obs_idx,
@@ -2074,12 +2359,16 @@ class WalkPolicyDribblingEnv:
 
         self.critic_observation_indices = jnp.concatenate([
             self.base_critic_observation_indices,
-            self.fcp_ball_rel_velocity_obs_idx,
-            self.fcp_ball_rel_observation_obs_idx,
-            self.fcp_ball_distance_obs_idx,
             self.internal_rel_orientation_obs_idx,
             self.internal_target_vel_obs_idx,
+            self.ball_position_world_obs_idx,
+            self.ball_velocity_world_obs_idx,
+            self.base_position_world_obs_idx,
+            self.base_yaw_obs_idx,
+            self.base_yaw_rate_obs_idx,
             self.ball_visible_obs_idx,
+            self.teacher_action_obs_idx,
+            self.teacher_imitation_weight_obs_idx,
         ], dtype=int)
 
         return BoxSpace(low=-jnp.inf, high=jnp.inf, shape=(current_observation_idx,), dtype=jnp.float32)

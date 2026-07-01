@@ -21,7 +21,7 @@ class Critic(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = x[..., self.critic_observation_indices]
-        critic = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        critic = nn.Dense(768, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         critic = nn.LayerNorm()(critic)
         critic = nn.elu(critic)
         critic = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(critic)

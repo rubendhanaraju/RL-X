@@ -272,9 +272,9 @@ class DribbleMasterEnv(gym.Env):
         self.domain_randomization_action_delay_function.init()
         self.domain_randomization_seen_robot_function.init()
         self.domain_randomization_unseen_robot_function.init()
-        self.reward_function.reward_and_info(np.zeros(self.nr_actuator_joints))
         mujoco.mj_forward(self.internal_state["mj_model"], self.internal_state["data"])
         self.update_ball_sensing(reset_timer=True)
+        self.reward_function.reward_and_info(np.zeros(self.nr_actuator_joints))
 
         if self.should_render:
             self.viewer = MujocoViewer(self.initial_mj_model, self.dt)
@@ -366,6 +366,10 @@ class DribbleMasterEnv(gym.Env):
 
     def base_position_world(self):
         return self.internal_state["data"].qpos[:3]
+
+
+    def robot_com_position_world(self):
+        return self.internal_state["data"].subtree_com[self.trunk_body_id]
 
 
     def rotate_world_to_base_xy(self, vector_xy, base_yaw):
@@ -550,6 +554,7 @@ class DribbleMasterEnv(gym.Env):
         self.handle_domain_randomization(is_episode_start=False)
 
         self.terrain_function.pre_step()
+        self.update_ball_sensing(reset_timer=False)
 
         reward = self.reward_function.reward_and_info(chosen_action)
 
@@ -559,8 +564,7 @@ class DribbleMasterEnv(gym.Env):
             should_sample_commands = self.command_sampling_function.step()
         if should_sample_commands:
             self.command_function.get_next_command()
-        self.update_ball_sensing(reset_timer=False)
-        
+
         next_observation = self.get_observation(chosen_action)
         terminated = self.termination_function.should_terminate() | np.any(np.abs(self.internal_state["data"].qvel[:3]) == 100.0)
         truncated = self.internal_state["info_episode_store"]["episode_step"] >= (self.horizon - 1)

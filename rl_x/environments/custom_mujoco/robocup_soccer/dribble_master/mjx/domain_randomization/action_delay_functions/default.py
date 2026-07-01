@@ -6,7 +6,9 @@ class DefaultActionDelay:
     def __init__(self, env):
         self.env = env
 
-        self.max_nr_delay_steps = env.env_config["domain_randomization"]["action_delay"]["max_nr_delay_steps"]
+        configured_max_nr_delay_steps = env.env_config["domain_randomization"]["action_delay"]["max_nr_delay_steps"]
+        self.nr_delay_steps = int(round(0.020 * env.control_frequency_hz))
+        self.max_nr_delay_steps = max(configured_max_nr_delay_steps, self.nr_delay_steps)
         self.mixed_chance = env.env_config["domain_randomization"]["action_delay"]["mixed_chance"]
 
         self.current_mixed = False
@@ -28,16 +30,9 @@ class DefaultActionDelay:
 
 
     def delay_action(self, action, internal_state, key):
-        # current_nr_delay_steps = jnp.ceil(jnp.where(
-        #     internal_state["action_current_mixed"],
-        #     jax.random.randint(key, (1,), 0, self.max_nr_delay_steps+1)[0],
-        #     internal_state["action_current_nr_delay_steps"]
-        # ) * internal_state["env_curriculum_coeff"]).astype(jnp.int32)
-        current_nr_delay_steps = 1
-
         internal_state["action_history"] = jnp.roll(internal_state["action_history"], -1, axis=0)
         internal_state["action_history"] = internal_state["action_history"].at[-1].set(action)
 
-        chosen_action = internal_state["action_history"][-1-current_nr_delay_steps]
+        chosen_action = internal_state["action_history"][-1 - self.nr_delay_steps]
 
         return chosen_action

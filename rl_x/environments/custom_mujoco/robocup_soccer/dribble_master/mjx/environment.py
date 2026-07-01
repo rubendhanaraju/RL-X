@@ -335,6 +335,10 @@ class DribbleMasterEnv:
         return data.qpos[:3]
 
 
+    def robot_com_position_world(self, data):
+        return data.subtree_com[self.trunk_body_id]
+
+
     def rotate_world_to_base_xy(self, vector_xy, base_yaw):
         cos_yaw = jnp.cos(base_yaw)
         sin_yaw = jnp.sin(base_yaw)
@@ -518,8 +522,8 @@ class DribbleMasterEnv:
         self.domain_randomization_unseen_robot_function.init(internal_state)
 
         info = {}
-        self.reward_function.reward_and_info(data, mjx_model, internal_state, jnp.zeros(self.nr_actuator_joints), info)
         self.update_ball_sensing(data, internal_state, info, True)
+        self.reward_function.reward_and_info(data, mjx_model, internal_state, jnp.zeros(self.nr_actuator_joints), info)
         info["rollout/episode_return"] = reward
         info["rollout/episode_length"] = 0
         info["env_curriculum/coefficient"] = internal_state["env_curriculum_coeff"]
@@ -644,6 +648,7 @@ class DribbleMasterEnv:
         state = state.replace(data=data, mjx_model=mjx_model)
 
         self.terrain_function.pre_step(data, state.internal_state)
+        self.update_ball_sensing(data, state.internal_state, state.info, False)
 
         reward = self.reward_function.reward_and_info(data, mjx_model, state.internal_state, chosen_action, state.info)
 
@@ -652,7 +657,6 @@ class DribbleMasterEnv:
         else:
             should_sample_commands = self.command_sampling_function.step(command_sampling_key)
         self.command_function.get_next_command(state.internal_state, should_sample_commands, command_key)
-        self.update_ball_sensing(data, state.internal_state, state.info, False)
         
         next_observation = self.get_observation(data, mjx_model, state.internal_state, observation_key, chosen_action)
         terminated = self.termination_function.should_terminate(state.internal_state) | jnp.any(jnp.abs(data.qvel[:3]) == 100.0)

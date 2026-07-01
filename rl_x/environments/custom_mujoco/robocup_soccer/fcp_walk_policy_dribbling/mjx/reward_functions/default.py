@@ -329,7 +329,10 @@ class DefaultReward:
         yaw_to_ball, yaw_error_to_ball = self.reward_yaw_to_ball(base_yaw, base_pos_world[:2], ball_pos_world[:2])
         yaw_to_ball_reward = self.yaw_to_ball_coeff * yaw_to_ball
         yaw_alignment_reward = self.yaw_alignment_coeff * self.reward_yaw_alignment(base_yaw, base_pos_world[:2], ball_pos_world[:2], ball_velocity_command)
-        active_sensing_reward = jnp.asarray(0.0, dtype=jnp.float32)
+        active_sensing_reward = self.active_sensing_coeff * jnp.asarray(
+            internal_state["ball_visible"],
+            dtype=jnp.float32,
+        )
         command_speed = jnp.linalg.norm(ball_velocity_command)
         internal_abs_orientation_rad = jnp.radians(internal_state["internal_abs_orientation"])
         desired_dribble_direction = jnp.array(
@@ -356,9 +359,9 @@ class DefaultReward:
         ball_possession_penalty_norm = jnp.sum(jnp.square(ball_possession_error_normalized))
         ball_possession_reward = self.ball_possession_coeff * -ball_possession_penalty_norm
         fcp_dribble_possession_gate = (
-            (ball_rel_base_for_possession[0] >= self.env.possession_min_x)
-            & (ball_rel_base_for_possession[0] <= self.env.possession_max_x)
-            & (jnp.abs(ball_rel_base_for_possession[1]) <= self.env.possession_max_abs_y)
+            (ball_rel_base_for_possession[0] >= internal_state["dribble_curriculum_possession_min_x"])
+            & (ball_rel_base_for_possession[0] <= internal_state["dribble_curriculum_possession_max_x"])
+            & (jnp.abs(ball_rel_base_for_possession[1]) <= internal_state["dribble_curriculum_possession_max_abs_y"])
         ).astype(jnp.float32)
         fcp_dribble_possession_gate = jnp.where(
             self.fcp_dribble_gate_by_possession,
@@ -369,7 +372,11 @@ class DefaultReward:
             fcp_dribble_forward_velocity_clipped
             - fcp_dribble_lateral_penalty
         ) * fcp_dribble_possession_gate
-        fcp_dribble_reward = self.fcp_dribble_coeff * fcp_dribble_raw_reward
+        fcp_dribble_reward = (
+            self.fcp_dribble_coeff
+            * internal_state["dribble_curriculum_fcp_coeff"]
+            * fcp_dribble_raw_reward
+        )
         teacher_action_error = jnp.mean(jnp.square((action - internal_state["teacher_action"]) / self.env.bc_action_scale))
 
         # Hierarchical residual penalties

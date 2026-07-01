@@ -7,6 +7,7 @@ class DefaultReward:
         reward_config = env.reward_config
 
         self.chasing_ball_coeff = reward_config["chasing_ball_coeff"] * env.dt
+        self.chasing_ball_temperature = reward_config["chasing_ball_temperature"]
         projected_ball_velocity_coeff = reward_config.get("projected_ball_velocity_coeff", 0.0)
         ball_velocity_tracking_coeff = reward_config.get("ball_velocity_tracking_coeff", 0.0)
         self.projected_ball_velocity_coeff = (projected_ball_velocity_coeff if projected_ball_velocity_coeff != 0.0 else ball_velocity_tracking_coeff) * env.dt
@@ -42,6 +43,7 @@ class DefaultReward:
         self.feet_phase_tracking_sigma = env.env_config["reward"]["feet_phase_tracking_sigma"]
         self.feet_height_on_flat_ground = env.env_config["reward"]["feet_height_on_flat_ground"]
         self.feet_yaw_coeff = env.env_config["reward"]["feet_yaw_coeff"] * env.dt
+        self.active_sensing_coeff = reward_config["active_sensing_coeff"] * env.dt
         self.fcp_dribble_coeff = reward_config["fcp_dribble_coeff"] * env.dt
         self.fcp_dribble_lateral_coeff = reward_config["fcp_dribble_lateral_coeff"]
         self.fcp_dribble_forward_clip = reward_config["fcp_dribble_forward_clip"]
@@ -138,8 +140,11 @@ class DefaultReward:
         ball_velocity_command_xy = self.env.internal_state["ball_velocity_command"]
 
         # Ball chasing reward
-        ball_com_distance_squared = np.sum(np.square(ball_pos_world - com_pos_world))
-        chasing_ball_raw = np.exp(-2.0 * ball_com_distance_squared)
+        ball_distance_to_base = np.linalg.norm(ball_pos_world[:2] - base_pos_world[:2])
+        normalized_ball_distance = ball_distance_to_base / self.env.ball_observation_distance_scale
+        chasing_ball_raw = np.exp(
+            -np.square(normalized_ball_distance) / max(self.chasing_ball_temperature, 1e-6)
+        )
         chasing_ball_reward = self.chasing_ball_coeff * chasing_ball_raw
 
         # Projected ball velocity reward. This is active in stage 2.
@@ -153,6 +158,7 @@ class DefaultReward:
         # Yaw alignment reward
         yaw_alignment_raw = self.reward_yaw_alignment(base_yaw, base_pos_world[:2], ball_pos_world[:2], ball_velocity_command_xy)
         yaw_alignment_reward = self.yaw_alignment_coeff * yaw_alignment_raw
+        active_sensing_reward = self.active_sensing_coeff * np.float32(self.env.internal_state["ball_visible"])
         base_forward_world = np.array([np.cos(base_yaw), np.sin(base_yaw)], dtype=np.float32)
         desired_dribble_direction = np.where(
             desired_ball_speed > 1e-6,
@@ -179,9 +185,9 @@ class DefaultReward:
         ball_possession_penalty_norm = np.sum(np.square(ball_possession_error_normalized))
         ball_possession_reward = self.ball_possession_coeff * -ball_possession_penalty_norm
         fcp_dribble_possession_gate = float(
-            ball_rel_base_for_possession[0] >= self.env.possession_min_x
-            and ball_rel_base_for_possession[0] <= self.env.possession_max_x
-            and np.abs(ball_rel_base_for_possession[1]) <= self.env.possession_max_abs_y
+            ball_rel_base_for_possession[0] >= self.env.internal_state["dribble_curriculum_possession_min_x"]
+            and ball_rel_base_for_possession[0] <= self.env.internal_state["dribble_curriculum_possession_max_x"]
+            and np.abs(ball_rel_base_for_possession[1]) <= self.env.internal_state["dribble_curriculum_possession_max_abs_y"]
         )
         if not self.fcp_dribble_gate_by_possession:
             fcp_dribble_possession_gate = 1.0
@@ -189,7 +195,11 @@ class DefaultReward:
             fcp_dribble_forward_velocity_clipped
             - fcp_dribble_lateral_penalty
         ) * fcp_dribble_possession_gate
-        fcp_dribble_reward = self.fcp_dribble_coeff * fcp_dribble_raw_reward
+        fcp_dribble_reward = (
+            self.fcp_dribble_coeff
+            * self.env.internal_state["dribble_curriculum_fcp_coeff"]
+            * fcp_dribble_raw_reward
+        )
 
         # Robot velocities for locomotion stability penalties
         current_imu_linear_velocity = self.env.internal_state["data"].sensordata[self.env.imu_linear_velocity_sensor_adr:self.env.imu_linear_velocity_sensor_adr + self.env.imu_linear_velocity_sensor_dim]
@@ -327,7 +337,7 @@ class DefaultReward:
         feet_yaw_reward = curriculum_coeff * self.feet_yaw_coeff * -feet_yaw_amount
 
         # Total reward
-        tracking_reward = chasing_ball_reward + projected_ball_velocity_reward + yaw_alignment_reward + feet_phase_reward + fcp_dribble_reward
+        tracking_reward = chasing_ball_reward + projected_ball_velocity_reward + yaw_alignment_reward + active_sensing_reward + feet_phase_reward + fcp_dribble_reward
         reward_penalty = z_velocity_reward + imu_acceleration_reward + angular_velocity_reward + angular_position_reward + \
                          actuator_joint_nominal_diff_reward +  joint_position_limit_reward + joint_velocity_limit_reward + joint_velocity_reward + \
                          acceleration_reward + torque_reward + power_draw_penalty_reward + action_rate_reward + action_smoothness_reward + \
@@ -342,6 +352,7 @@ class DefaultReward:
         self.env.internal_state["info"][f"reward/ball_velocity_tracking"] = projected_ball_velocity_reward
         self.env.internal_state["info"][f"reward/projected_ball_velocity"] = projected_ball_velocity_reward
         self.env.internal_state["info"][f"reward/yaw_alignment"] = yaw_alignment_reward
+        self.env.internal_state["info"][f"reward/active_sensing"] = active_sensing_reward
         self.env.internal_state["info"][f"reward/fcp_dribble"] = fcp_dribble_reward
         self.env.internal_state["info"][f"reward/ball_possession"] = ball_possession_reward
         self.env.internal_state["info"][f"reward/alive_clipped"] = alive_clipped_reward

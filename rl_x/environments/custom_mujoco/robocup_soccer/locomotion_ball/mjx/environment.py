@@ -48,14 +48,30 @@ class LocomotionBallEnv:
         self.ball_relative_position_noise = float(
             env_config["domain_randomization"]["observation_noise"].get("ball_relative_position", 0.0)
         )
-        self.enable_ball_unseen_termination = bool(env_config["termination"]["enable_ball_unseen_termination"])
-        self.enable_possession_termination = bool(env_config["termination"]["enable_possession_termination"])
-        self.possession_warmup_steps = int(env_config["termination"]["possession_warmup_steps"])
-        self.possession_min_x = float(env_config["termination"]["possession_min_x"])
-        self.possession_max_x = float(env_config["termination"]["possession_max_x"])
-        self.possession_max_abs_y = float(env_config["termination"]["possession_max_abs_y"])
-        self.immediate_possession_max_x = float(env_config["termination"]["immediate_max_x"])
-        self.immediate_possession_max_abs_y = float(env_config["termination"]["immediate_max_abs_y"])
+        termination_config = env_config["termination"]
+        self.enable_ball_unseen_termination = bool(termination_config["enable_ball_unseen_termination"])
+        self.enable_possession_termination = bool(termination_config["enable_possession_termination"])
+        self.enable_tight_possession_termination = bool(
+            termination_config.get(
+                "enable_tight_possession_termination",
+                self.enable_possession_termination,
+            )
+        )
+        self.enable_immediate_possession_termination = bool(
+            termination_config.get(
+                "enable_immediate_possession_termination",
+                self.enable_possession_termination,
+            )
+        )
+        self.possession_warmup_steps = int(termination_config["possession_warmup_steps"])
+        self.possession_min_x = float(termination_config["possession_min_x"])
+        self.possession_max_x = float(termination_config["possession_max_x"])
+        self.possession_max_abs_y = float(termination_config["possession_max_abs_y"])
+        self.immediate_possession_min_x = float(
+            termination_config.get("immediate_min_x", -float("inf"))
+        )
+        self.immediate_possession_max_x = float(termination_config["immediate_max_x"])
+        self.immediate_possession_max_abs_y = float(termination_config["immediate_max_abs_y"])
 
         xml_path = (self.robot_config["directory_path"] / "data" / "plane.xml").as_posix()
         xml_handle = mjcf.from_path(xml_path)
@@ -484,18 +500,19 @@ class LocomotionBallEnv:
         ball_possession_armed = internal_state["ball_possession_armed"] | inside_possession_pocket
         ball_task_active = self.is_ball_task_active(internal_state)
         tight_possession_lost = (
-            jnp.asarray(self.enable_possession_termination)
+            jnp.asarray(self.enable_tight_possession_termination)
             & ball_task_active
             & after_warmup
             & ball_possession_armed
             & outside_tight_box
         )
         immediate_possession_lost = (
-            jnp.asarray(self.enable_possession_termination)
+            jnp.asarray(self.enable_immediate_possession_termination)
             & ball_task_active
             & ball_possession_armed
             & (
-                (ball_rel_x > self.immediate_possession_max_x)
+                (ball_rel_x < self.immediate_possession_min_x)
+                | (ball_rel_x > self.immediate_possession_max_x)
                 | (jnp.abs(ball_rel_y) > self.immediate_possession_max_abs_y)
             )
         )
@@ -1019,7 +1036,9 @@ class LocomotionBallEnv:
             "env_info/root_qvel_norm",
             "env_info/root_qvel_max_abs",
         )
-        terminal_info = {key: state.info[key] for key in terminal_info_keys}
+        terminal_info = {
+            key: state.info[key] for key in terminal_info_keys if key in state.info
+        }
 
         def when_done(_):
             start_state = self._reset(state)

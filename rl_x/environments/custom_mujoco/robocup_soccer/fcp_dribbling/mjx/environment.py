@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import mujoco
 from dm_control import mjcf
+from jax.scipy.spatial.transform import Rotation
 from mujoco import mjx
 
 from rl_x.environments.custom_mujoco.robocup_soccer.fcp_locomotion.mjx.box_space import (
@@ -15,6 +16,7 @@ from rl_x.environments.custom_mujoco.robocup_soccer.fcp_locomotion.mjx.control_f
 from rl_x.environments.custom_mujoco.robocup_soccer.fcp_locomotion.mjx.math_functions.rotation import (
     roll_pitch_from_mat_deg,
     rotate_xy_from_body_to_world,
+    rotate_xy_from_world_to_body,
     vector_angle_deg,
     wrap_to_180_deg,
     yaw_from_mat_deg,
@@ -24,11 +26,9 @@ from rl_x.environments.custom_mujoco.robocup_soccer.fcp_locomotion.mjx.state imp
     State,
 )
 from rl_x.environments.custom_mujoco.robocup_soccer.fcp_locomotion.mjx.t1_walk.constants import (
-    ARM_ACTUATORS,
     LEFT_FOOT_SITE,
     LEFT_LEG_ACTUATORS,
     LEFT_LEG_JOINT_NAMES,
-    LEG_ACTUATORS,
     RIGHT_FOOT_SITE,
     RIGHT_LEG_ACTUATORS,
     RIGHT_LEG_JOINT_NAMES,
@@ -49,7 +49,8 @@ from rl_x.environments.custom_mujoco.robocup_soccer.fcp_locomotion.mjx.viewer im
 class FcpDribblingEnv:
     """FCP-style residual dribbling task for Booster T1 in RL-X/MJX."""
 
-    OBSERVATION_DIM = 76
+    OBSERVATION_DIM = 63
+    POLICY_OBSERVATION_DIM = 63
     ACTION_DIM = 16
 
     def __init__(self, robot_config, runner_mode, render, env_config, nr_envs):
@@ -146,6 +147,9 @@ class FcpDribblingEnv:
         self.imu_site_id = mujoco.mj_name2id(
             self.initial_mj_model, mujoco.mjtObj.mjOBJ_SITE, "imu"
         )
+        self.nominal_imu_height = jnp.float32(
+            self.mjx_data.site_xpos[self.imu_site_id, 2]
+        )
         self.floor_geom_id = mujoco.mj_name2id(
             self.initial_mj_model, mujoco.mjtObj.mjOBJ_GEOM, "floor"
         )
@@ -199,18 +203,16 @@ class FcpDribblingEnv:
             robot_config["actuator_joint_max_velocities"], dtype=jnp.float32
         )
 
-        body_actuator_ids = list(ARM_ACTUATORS) + list(LEG_ACTUATORS)
-        self.fcp_body_qpos_ids = self.actuator_joint_mask_qpos[
-            jnp.array(body_actuator_ids, dtype=jnp.int32)
+        self.walk_rl3_arm_ctrl_ids = jnp.array([2, 6, 3, 7], dtype=jnp.int32)
+        self.walk_rl3_arm_qpos_ids = self.actuator_joint_mask_qpos[
+            self.walk_rl3_arm_ctrl_ids
         ]
-        self.fcp_body_qvel_ids = self.actuator_joint_mask_qvel[
-            jnp.array(body_actuator_ids, dtype=jnp.int32)
-        ]
-        self.walk_speed_ctrl_ids = jnp.array(
-            list(LEFT_LEG_ACTUATORS)
-            + list(RIGHT_LEG_ACTUATORS)
-            + [2, 6, 3, 7],
-            dtype=jnp.int32,
+        self.walk_speed_ctrl_ids = jnp.concatenate(
+            [
+                jnp.asarray(LEFT_LEG_ACTUATORS, dtype=jnp.int32),
+                jnp.asarray(RIGHT_LEG_ACTUATORS, dtype=jnp.int32),
+                self.walk_rl3_arm_ctrl_ids,
+            ]
         )
 
         imu_angular_velocity_sensor_id = self.initial_mj_model.sensor(
@@ -266,15 +268,24 @@ class FcpDribblingEnv:
         self.ball_observation_frame_offset = jnp.array(
             env_config["ball"]["observation_frame_offset"], dtype=jnp.float32
         )
-        self.ball_observation_distance_xy_only = bool(
-            env_config["ball"]["observation_distance_xy_only"]
-        )
-        self.ball_velocity_observation_scale = jnp.float32(
-            env_config["ball"]["velocity_observation_scale"]
+        self.foot_position_frame_offset = jnp.array(
+            env_config["observation"]["foot_position_frame_offset"],
+            dtype=jnp.float32,
         )
 
-        self.max_rotation_diff = jnp.float32(env_config["target"]["max_rotation_diff"])
-        self.max_rotation_dist = jnp.float32(env_config["target"]["max_rotation_dist"])
+        self.approach_distance = jnp.float32(env_config["target"]["approach_distance"])
+        self.walk_max_linear_dist = jnp.float32(
+            env_config["target"]["walk_max_linear_dist"]
+        )
+        self.walk_max_linear_diff = jnp.float32(
+            env_config["target"]["walk_max_linear_diff"]
+        )
+        self.walk_max_rotation_diff = jnp.float32(
+            env_config["target"]["walk_max_rotation_diff"]
+        )
+        self.walk_max_rotation_dist = jnp.float32(
+            env_config["target"]["walk_max_rotation_dist"]
+        )
         self.orientation_change_probability = jnp.float32(
             env_config["target"]["orientation_change_probability"]
         )
@@ -296,22 +307,40 @@ class FcpDribblingEnv:
             env_config["target"]["eval_right_orientation"]
         )
 
-        self.reward_alive_bonus = jnp.float32(env_config["reward"]["alive_bonus"])
+        self.reward_mode = str(env_config["reward"].get("mode", "walk"))
+        if self.reward_mode not in ("walk", "dribble"):
+            raise ValueError(
+                "Unsupported fcp_dribbling reward mode: "
+                f"{self.reward_mode!r}. Expected 'walk' or 'dribble'."
+            )
+        self.reward_walk_progress_dt = jnp.float32(
+            env_config["reward"]["walk_progress_dt"]
+        )
+        self.reward_walk_idle_distance = jnp.float32(
+            env_config["reward"]["walk_idle_distance"]
+        )
+        self.reward_walk_idle_action_scale = jnp.float32(
+            env_config["reward"]["walk_idle_action_scale"]
+        )
+        self.reward_walk_orientation_base = jnp.float32(
+            env_config["reward"]["walk_orientation_base"]
+        )
+        self.reward_dribble_speed_dt = jnp.float32(
+            env_config["reward"]["dribble_speed_dt"]
+        )
+        self.reward_dribble_alive_bonus = jnp.float32(
+            env_config["reward"]["dribble_alive_bonus"]
+        )
         self.reward_scale = jnp.float32(env_config["reward"]["scale"])
 
         termination_config = env_config["termination"]
-        self.min_imu_height = jnp.float32(termination_config["min_imu_height"])
-        self.ball_grace_steps = jnp.int32(termination_config["ball_grace_steps"])
-        self.ball_soft_x_min = jnp.float32(termination_config["ball_soft_x_min"])
-        self.ball_soft_x_max = jnp.float32(termination_config["ball_soft_x_max"])
-        self.ball_soft_abs_y_max = jnp.float32(
-            termination_config["ball_soft_abs_y_max"]
-        )
-        self.ball_hard_x_min = jnp.float32(termination_config["ball_hard_x_min"])
-        self.ball_hard_x_max = jnp.float32(termination_config["ball_hard_x_max"])
-        self.ball_hard_abs_y_max = jnp.float32(
-            termination_config["ball_hard_abs_y_max"]
-        )
+        if "min_imu_height" in termination_config:
+            self.min_imu_height = jnp.float32(termination_config["min_imu_height"])
+        else:
+            self.min_imu_height = (
+                jnp.float32(termination_config["height_percentage_threshold"])
+                * self.nominal_imu_height
+            )
         self.eval_max_steps = jnp.int32(termination_config["eval_max_steps"])
 
         self.control_function = get_control_function(env_config["walk"]["type"], self)
@@ -461,7 +490,6 @@ class FcpDribblingEnv:
             "env_info/ball_rel_waist_x": jnp.float32(0.0),
             "env_info/ball_rel_waist_y": jnp.float32(0.0),
             "env_info/ball_rel_waist_z": jnp.float32(0.0),
-            "env_info/ball_distance_observation": jnp.float32(0.0),
             "env_info/ball_rel_observation_x": jnp.float32(0.0),
             "env_info/ball_rel_observation_y": jnp.float32(0.0),
             "env_info/ball_rel_observation_z": jnp.float32(0.0),
@@ -473,18 +501,22 @@ class FcpDribblingEnv:
             "env_info/left_foot_floor_contact": jnp.float32(0.0),
             "env_info/right_foot_floor_contact": jnp.float32(0.0),
             "env_info/dribble_raw_reward": jnp.float32(0.0),
+            "env_info/walk_raw_reward": jnp.float32(0.0),
+            "env_info/walk_linear_distance": jnp.float32(0.0),
+            "env_info/walk_linear_distance_diff": jnp.float32(0.0),
+            "env_info/walk_idle_reward": jnp.float32(0.0),
+            "env_info/walk_orientation_multiplier": jnp.float32(0.0),
+            "env_info/internal_walk_target_x": jnp.float32(0.0),
+            "env_info/internal_walk_target_y": jnp.float32(0.0),
             "env_info/desired_abs_orientation": jnp.float32(0.0),
             "env_info/root_height": jnp.float32(0.0),
-            "env_info/termination_ball_out": jnp.float32(0.0),
-            "env_info/termination_ball_unseen": jnp.float32(0.0),
             "env_info/termination_clipped": jnp.float32(0.0),
             "env_info/termination_eval_timeout": jnp.float32(0.0),
             "env_info/termination_fallen": jnp.float32(0.0),
-            "env_info/termination_hard_ball_out": jnp.float32(0.0),
-            "env_info/termination_soft_ball_out": jnp.float32(0.0),
             "reward/total": jnp.float32(0.0),
             "reward/dribble": jnp.float32(0.0),
             "reward/alive": jnp.float32(0.0),
+            "reward/walk": jnp.float32(0.0),
         }
 
     @partial(jax.vmap, in_axes=(None, 0, None))
@@ -543,7 +575,6 @@ class FcpDribblingEnv:
         ball_sensing = self._ball_sensing_values(
             data, jnp.float32(0.0), reset_timer=jnp.bool_(True)
         )
-        ball_rel_observation = self.ball_position_observation_frame(data)
         ball_xy = self.ball_position_world(data)[:2]
 
         random_orientation = jax.random.uniform(
@@ -556,50 +587,55 @@ class FcpDribblingEnv:
         ).astype(jnp.float32)
         (
             internal_rel_orientation,
-            internal_target_vel,
             internal_abs_orientation,
-        ) = self._target_orientation_values(
+        ) = self._orientation_command_values(
             data,
             previous_internal_rel_orientation=jnp.float32(0.0),
             virtual_orientation=virtual_orientation,
             init=jnp.bool_(True),
-            ball_visible=ball_sensing["ball_visible"],
+        )
+        (
+            internal_walk_target,
+            internal_walk_target_vel,
+            internal_walk_abs_target,
+            internal_walk_linear_dist,
+        ) = self._walk_target_values(
+            data=data,
+            previous_internal_target=jnp.zeros(2, dtype=jnp.float32),
+            virtual_orientation=virtual_orientation,
+            init=jnp.bool_(True),
         )
 
         (
             current_observation,
             current_head_z,
             current_imu_linear_velocity,
-            observation_ball_rel,
-            ball_rel_velocity_obs,
         ) = (
-            self._build_fcp_observation(
+            self._build_walk_observation(
                 data=data,
                 init=jnp.bool_(True),
                 step_counter=jnp.int32(0),
                 walk_core_state=walk_core_state,
+                last_joint_target_speed=jnp.zeros(16, dtype=jnp.float32),
                 previous_head_z=data.xpos[self.head_body_id, 2],
                 previous_imu_linear_velocity=jnp.zeros(3, dtype=jnp.float32),
-                previous_ball_rel_observation=ball_rel_observation,
-                previous_ball_rel_velocity_obs=jnp.zeros(3, dtype=jnp.float32),
+                internal_walk_target=internal_walk_target,
+                internal_walk_target_vel=internal_walk_target_vel,
                 internal_rel_orientation=internal_rel_orientation,
-                internal_target_vel=internal_target_vel,
-                ball_visible=ball_sensing["ball_visible"],
             )
         )
         internal_state = {
             "in_eval_mode": state.internal_state["in_eval_mode"],
-            "last_action": jnp.zeros(self.ACTION_DIM, dtype=jnp.float32),
-            "second_last_action": jnp.zeros(self.ACTION_DIM, dtype=jnp.float32),
             "previous_head_z": current_head_z,
             "previous_imu_linear_velocity": current_imu_linear_velocity,
-            "previous_ball_rel_observation": observation_ball_rel,
-            "previous_ball_rel_velocity_obs": ball_rel_velocity_obs,
+            "last_joint_target_speed": jnp.zeros(16, dtype=jnp.float32),
             "last_ball_xy": ball_xy,
+            "internal_walk_target": internal_walk_target,
+            "internal_walk_abs_target": internal_walk_abs_target,
+            "internal_walk_linear_dist": internal_walk_linear_dist,
             "walk_core_state": walk_core_state,
             "virtual_orientation": virtual_orientation,
             "internal_rel_orientation": internal_rel_orientation,
-            "internal_target_vel": internal_target_vel,
             "internal_abs_orientation": internal_abs_orientation,
             "is_returning_to_base": jnp.bool_(False),
             **ball_sensing,
@@ -631,25 +667,47 @@ class FcpDribblingEnv:
             jnp.clip(raw_action, -self.action_clip_range, self.action_clip_range),
             raw_action,
         )
-        previous_action = state.internal_state["last_action"]
         data, walk_core_state, _ = self.control_function.process_action(
             state.mjx_model,
             state.data,
             state.internal_state["walk_core_state"],
             chosen_action,
-            jnp.array([1.0, 0.0], dtype=jnp.float32),
+            state.internal_state["internal_walk_target"],
+        )
+        last_joint_target_speed = jnp.clip(
+            (data.ctrl[self.walk_speed_ctrl_ids] - state.data.ctrl[self.walk_speed_ctrl_ids])
+            / self.dt,
+            -6.1395,
+            6.1395,
         )
         data = self._apply_control_targets(state.mjx_model, data)
 
         ball_xy = self.ball_position_world(data)[:2]
         ball_delta = ball_xy - state.internal_state["last_ball_xy"]
-        ball_speed = jnp.linalg.norm(ball_delta) / self.dt
-        ball_angle = vector_angle_deg(ball_delta)
         desired_abs_orientation = state.internal_state["internal_abs_orientation"]
-        dribble_raw_reward = ball_speed * jnp.cos(
-            (ball_angle - desired_abs_orientation) * jnp.pi / 180.0
+        dribble_raw_reward, ball_speed = self._dribble_reward_values(
+            ball_delta, desired_abs_orientation
         )
-        reward = (dribble_raw_reward + self.reward_alive_bonus) / self.reward_scale
+        (
+            walk_raw_reward,
+            walk_linear_distance,
+            walk_linear_distance_diff,
+            walk_idle_reward,
+            walk_orientation_multiplier,
+        ) = self._walk_reward_values(
+            data,
+            chosen_action,
+            state.internal_state["internal_walk_abs_target"],
+            state.internal_state["internal_walk_linear_dist"],
+            desired_abs_orientation,
+        )
+
+        if self.reward_mode == "walk":
+            reward = walk_raw_reward / self.reward_scale
+            alive_raw_reward = jnp.float32(0.0)
+        else:
+            alive_raw_reward = self.reward_dribble_alive_bonus
+            reward = (dribble_raw_reward + alive_raw_reward) / self.reward_scale
         reward = jnp.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
 
         ball_sensing = self._ball_sensing_values(
@@ -662,43 +720,45 @@ class FcpDribblingEnv:
         )
         (
             internal_rel_orientation,
-            internal_target_vel,
             internal_abs_orientation,
-        ) = self._target_orientation_values(
+        ) = self._orientation_command_values(
             data,
             previous_internal_rel_orientation=state.internal_state[
                 "internal_rel_orientation"
             ],
             virtual_orientation=virtual_state["virtual_orientation"],
             init=jnp.bool_(False),
-            ball_visible=ball_sensing["ball_visible"],
+        )
+        (
+            internal_walk_target,
+            internal_walk_target_vel,
+            internal_walk_abs_target,
+            internal_walk_linear_dist,
+        ) = self._walk_target_values(
+            data=data,
+            previous_internal_target=state.internal_state["internal_walk_target"],
+            virtual_orientation=virtual_state["virtual_orientation"],
+            init=jnp.bool_(False),
         )
 
         (
             current_observation,
             current_head_z,
             current_imu_linear_velocity,
-            observation_ball_rel,
-            ball_rel_velocity_obs,
         ) = (
-            self._build_fcp_observation(
+            self._build_walk_observation(
                 data=data,
                 init=jnp.bool_(False),
                 step_counter=walk_core_state.step_counter,
                 walk_core_state=walk_core_state,
+                last_joint_target_speed=last_joint_target_speed,
                 previous_head_z=state.internal_state["previous_head_z"],
                 previous_imu_linear_velocity=state.internal_state[
                     "previous_imu_linear_velocity"
                 ],
-                previous_ball_rel_observation=state.internal_state[
-                    "previous_ball_rel_observation"
-                ],
-                previous_ball_rel_velocity_obs=state.internal_state[
-                    "previous_ball_rel_velocity_obs"
-                ],
+                internal_walk_target=internal_walk_target,
+                internal_walk_target_vel=internal_walk_target_vel,
                 internal_rel_orientation=internal_rel_orientation,
-                internal_target_vel=internal_target_vel,
-                ball_visible=ball_sensing["ball_visible"],
             )
         )
 
@@ -707,13 +767,10 @@ class FcpDribblingEnv:
             data,
             walk_core_state.step_counter,
             state.internal_state["in_eval_mode"],
-            ball_sensing["ball_unseen_too_long"],
         )
         terminated = (
             termination_flags["fallen"]
             | termination_flags["clipped"]
-            | termination_flags["ball_unseen"]
-            | termination_flags["ball_out"]
             | termination_flags["eval_timeout"]
         )
         truncated = episode_step >= self.horizon
@@ -721,9 +778,6 @@ class FcpDribblingEnv:
         episode_return = state.info_episode_store["episode_return"] + reward
         ball_rel_waist = self.ball_position_waist(data)
         ball_rel_observation = self.ball_position_observation_frame(data)
-        ball_observation_distance = self.ball_observation_distance(
-            ball_rel_observation
-        )
         ball_clearance_foot_front = (
             ball_rel_waist[0] - self.ball_radius - self.nominal_foot_front_x_rel_waist
         )
@@ -747,9 +801,6 @@ class FcpDribblingEnv:
             "env_info/ball_rel_waist_x": ball_rel_waist[0].astype(jnp.float32),
             "env_info/ball_rel_waist_y": ball_rel_waist[1].astype(jnp.float32),
             "env_info/ball_rel_waist_z": ball_rel_waist[2].astype(jnp.float32),
-            "env_info/ball_distance_observation": ball_observation_distance.astype(
-                jnp.float32
-            ),
             "env_info/ball_rel_observation_x": ball_rel_observation[0].astype(
                 jnp.float32
             ),
@@ -775,18 +826,27 @@ class FcpDribblingEnv:
                 jnp.float32
             ),
             "env_info/dribble_raw_reward": dribble_raw_reward.astype(jnp.float32),
+            "env_info/walk_raw_reward": walk_raw_reward.astype(jnp.float32),
+            "env_info/walk_linear_distance": walk_linear_distance.astype(jnp.float32),
+            "env_info/walk_linear_distance_diff": walk_linear_distance_diff.astype(
+                jnp.float32
+            ),
+            "env_info/walk_idle_reward": walk_idle_reward.astype(jnp.float32),
+            "env_info/walk_orientation_multiplier": (
+                walk_orientation_multiplier.astype(jnp.float32)
+            ),
+            "env_info/internal_walk_target_x": internal_walk_target[0].astype(
+                jnp.float32
+            ),
+            "env_info/internal_walk_target_y": internal_walk_target[1].astype(
+                jnp.float32
+            ),
             "env_info/desired_abs_orientation": desired_abs_orientation.astype(
                 jnp.float32
             ),
             "env_info/root_height": data.site_xpos[self.imu_site_id, 2].astype(
                 jnp.float32
             ),
-            "env_info/termination_ball_out": termination_flags["ball_out"].astype(
-                jnp.float32
-            ),
-            "env_info/termination_ball_unseen": termination_flags[
-                "ball_unseen"
-            ].astype(jnp.float32),
             "env_info/termination_clipped": termination_flags["clipped"].astype(
                 jnp.float32
             ),
@@ -796,33 +856,29 @@ class FcpDribblingEnv:
             "env_info/termination_fallen": termination_flags["fallen"].astype(
                 jnp.float32
             ),
-            "env_info/termination_hard_ball_out": termination_flags[
-                "hard_ball_out"
-            ].astype(jnp.float32),
-            "env_info/termination_soft_ball_out": termination_flags[
-                "soft_ball_out"
-            ].astype(jnp.float32),
             "reward/total": reward.astype(jnp.float32),
             "reward/dribble": (dribble_raw_reward / self.reward_scale).astype(
                 jnp.float32
             ),
-            "reward/alive": (self.reward_alive_bonus / self.reward_scale).astype(
+            "reward/alive": (alive_raw_reward / self.reward_scale).astype(
+                jnp.float32
+            ),
+            "reward/walk": (walk_raw_reward / self.reward_scale).astype(
                 jnp.float32
             ),
         }
         next_internal_state = {
             "in_eval_mode": state.internal_state["in_eval_mode"],
-            "last_action": chosen_action,
-            "second_last_action": previous_action,
             "previous_head_z": current_head_z,
             "previous_imu_linear_velocity": current_imu_linear_velocity,
-            "previous_ball_rel_observation": observation_ball_rel,
-            "previous_ball_rel_velocity_obs": ball_rel_velocity_obs,
+            "last_joint_target_speed": last_joint_target_speed,
             "last_ball_xy": ball_xy,
+            "internal_walk_target": internal_walk_target,
+            "internal_walk_abs_target": internal_walk_abs_target,
+            "internal_walk_linear_dist": internal_walk_linear_dist,
             "walk_core_state": walk_core_state,
             "virtual_orientation": virtual_state["virtual_orientation"],
             "internal_rel_orientation": internal_rel_orientation,
-            "internal_target_vel": internal_target_vel,
             "internal_abs_orientation": internal_abs_orientation,
             "is_returning_to_base": virtual_state["is_returning_to_base"],
             **ball_sensing,
@@ -985,11 +1041,6 @@ class FcpDribblingEnv:
     def ball_position_observation_frame(self, data):
         return self.ball_position_waist(data) + self.ball_observation_frame_offset
 
-    def ball_observation_distance(self, ball_rel_observation):
-        if self.ball_observation_distance_xy_only:
-            return jnp.linalg.norm(ball_rel_observation[:2])
-        return jnp.linalg.norm(ball_rel_observation)
-
     def _nominal_foot_front_x_rel_waist(self):
         foot_geom_xpos = self.mjx_data.geom_xpos[self.foot_geom_indices]
         foot_geom_xmat = self.mjx_data.geom_xmat[self.foot_geom_indices].reshape(
@@ -1095,64 +1146,157 @@ class FcpDribblingEnv:
             "is_returning_to_base": is_returning_to_base,
         }
 
-    def _target_orientation_values(
+    def _orientation_command_values(
         self,
         data,
         previous_internal_rel_orientation,
         virtual_orientation,
         init,
-        ball_visible,
     ):
         torso_yaw = self.get_torso_yaw_deg(data)
+        previous_internal_rel_orientation = jnp.where(
+            init, jnp.float32(0.0), previous_internal_rel_orientation
+        )
         desired_rel_orientation = wrap_to_180_deg(virtual_orientation - torso_yaw)
         orientation_diff = jnp.clip(
             wrap_to_180_deg(
                 desired_rel_orientation - previous_internal_rel_orientation
             ),
-            -self.max_rotation_diff,
-            self.max_rotation_diff,
+            -self.walk_max_rotation_diff,
+            self.walk_max_rotation_diff,
         )
-        candidate_internal_rel_orientation = jnp.clip(
+        internal_rel_orientation = jnp.clip(
             wrap_to_180_deg(previous_internal_rel_orientation + orientation_diff),
-            -self.max_rotation_dist,
-            self.max_rotation_dist,
-        )
-        should_update = init | ball_visible
-        internal_rel_orientation = jnp.where(
-            should_update,
-            candidate_internal_rel_orientation,
-            previous_internal_rel_orientation,
-        )
-        internal_target_vel = jnp.where(
-            should_update,
-            internal_rel_orientation - previous_internal_rel_orientation,
-            jnp.float32(0.0),
+            -self.walk_max_rotation_dist,
+            self.walk_max_rotation_dist,
         )
         internal_abs_orientation = wrap_to_180_deg(internal_rel_orientation + torso_yaw)
         return (
             internal_rel_orientation.astype(jnp.float32),
-            internal_target_vel.astype(jnp.float32),
             internal_abs_orientation.astype(jnp.float32),
         )
 
-    def _build_fcp_observation(
+    def _walk_target_values(
+        self,
+        data,
+        previous_internal_target,
+        virtual_orientation,
+        init,
+    ):
+        torso_yaw_deg = self.get_torso_yaw_deg(data)
+        torso_yaw = torso_yaw_deg * jnp.pi / 180.0
+        previous_internal_target = jnp.where(
+            init, jnp.zeros(2, dtype=jnp.float32), previous_internal_target
+        )
+
+        orientation_rad = virtual_orientation * jnp.pi / 180.0
+        dribble_direction_world = jnp.array(
+            [jnp.cos(orientation_rad), jnp.sin(orientation_rad)], dtype=jnp.float32
+        )
+        ball_xy = self.ball_position_world(data)[:2]
+        approach_target_xy = ball_xy - dribble_direction_world * self.approach_distance
+
+        head_xy = data.xpos[self.head_body_id, :2]
+        walk_target_world = approach_target_xy - head_xy
+        walk_distance = jnp.linalg.norm(walk_target_world)
+        clipped_world_target = jnp.where(
+            walk_distance > self.walk_max_linear_dist,
+            walk_target_world
+            / jnp.maximum(walk_distance, jnp.float32(1e-8))
+            * self.walk_max_linear_dist,
+            walk_target_world,
+        )
+        rel_target = rotate_xy_from_world_to_body(clipped_world_target, torso_yaw)
+
+        internal_diff = rel_target - previous_internal_target
+        internal_diff_size = jnp.linalg.norm(internal_diff)
+        internal_target = jnp.where(
+            internal_diff_size > self.walk_max_linear_diff,
+            previous_internal_target
+            + internal_diff
+            / jnp.maximum(internal_diff_size, jnp.float32(1e-8))
+            * self.walk_max_linear_diff,
+            rel_target,
+        )
+        internal_target_velocity = internal_target - previous_internal_target
+        internal_abs_target = head_xy + rotate_xy_from_body_to_world(
+            internal_target, torso_yaw
+        )
+        return (
+            internal_target.astype(jnp.float32),
+            internal_target_velocity.astype(jnp.float32),
+            internal_abs_target.astype(jnp.float32),
+            jnp.linalg.norm(internal_target).astype(jnp.float32),
+        )
+
+    def _walk_reward_values(
+        self,
+        data,
+        action,
+        internal_abs_target,
+        internal_linear_dist,
+        internal_abs_orientation,
+    ):
+        head_xy = data.xpos[self.head_body_id, :2]
+        linear_distance = jnp.linalg.norm(internal_abs_target - head_xy)
+        linear_distance_diff = internal_linear_dist - linear_distance
+        progress_reward = linear_distance_diff / self.reward_walk_progress_dt
+
+        angular_distance = jnp.abs(
+            wrap_to_180_deg(internal_abs_orientation - self.get_torso_yaw_deg(data))
+        )
+        orientation_multiplier = self.reward_walk_orientation_base ** (-angular_distance)
+        progress_reward = jnp.where(
+            progress_reward > 0.0,
+            progress_reward * orientation_multiplier,
+            progress_reward,
+        )
+
+        idle_reward = (1.0 - linear_distance / self.reward_walk_idle_distance) * (
+            1.0
+            - jnp.tanh(jnp.sum(jnp.abs(action)) * self.reward_walk_idle_action_scale)
+        )
+        idle_reward = jnp.where(
+            linear_distance < self.reward_walk_idle_distance, idle_reward, 0.0
+        )
+        reward = progress_reward + idle_reward
+        reward = jnp.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+        return (
+            reward.astype(jnp.float32),
+            linear_distance.astype(jnp.float32),
+            linear_distance_diff.astype(jnp.float32),
+            idle_reward.astype(jnp.float32),
+            orientation_multiplier.astype(jnp.float32),
+        )
+
+    def _dribble_reward_values(self, ball_delta, desired_abs_orientation):
+        ball_speed = jnp.linalg.norm(ball_delta) / self.reward_dribble_speed_dt
+        ball_angle = vector_angle_deg(ball_delta)
+        reward = ball_speed * jnp.cos(
+            (ball_angle - desired_abs_orientation) * jnp.pi / 180.0
+        )
+        reward = jnp.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+        return reward.astype(jnp.float32), ball_speed.astype(jnp.float32)
+
+    def _build_walk_observation(
         self,
         data,
         init,
         step_counter,
         walk_core_state,
+        last_joint_target_speed,
         previous_head_z,
         previous_imu_linear_velocity,
-        previous_ball_rel_observation,
-        previous_ball_rel_velocity_obs,
+        internal_walk_target,
+        internal_walk_target_vel,
         internal_rel_orientation,
-        internal_target_vel,
-        ball_visible,
     ):
         obs = jnp.zeros(self.OBSERVATION_DIM, dtype=jnp.float32)
 
         head_z = data.xpos[self.head_body_id, 2]
-        head_z_vel = jnp.where(init, jnp.float32(0.0), (head_z - previous_head_z) / self.dt)
+        head_z_vel = jnp.where(
+            init, jnp.float32(0.0), (head_z - previous_head_z) / self.dt
+        )
         roll_pitch = roll_pitch_from_mat_deg(data.xmat[self.trunk_body_id])
         gyro_deg = (
             data.sensordata[
@@ -1173,7 +1317,7 @@ class FcpDribblingEnv:
             (current_imu_linear_velocity - previous_imu_linear_velocity) / self.dt,
         )
 
-        obs = obs.at[0].set(jnp.minimum(step_counter, 12 * 8) / 100.0)
+        obs = obs.at[0].set(jnp.minimum(step_counter, 15 * 8) / 100.0)
         obs = obs.at[1].set(head_z * 3.0)
         obs = obs.at[2].set(head_z_vel / 2.0)
         obs = obs.at[3].set(roll_pitch[0] / 15.0)
@@ -1185,65 +1329,79 @@ class FcpDribblingEnv:
         obs = obs.at[11:17].set(left_frp)
         obs = obs.at[17:23].set(right_frp)
 
-        body_joint_positions_deg = (
-            data.qpos[self.fcp_body_qpos_ids] * 180.0 / jnp.pi
+        left_foot_pos = self._site_pos_in_observation_frame(
+            data, self.t1.ids.waist_body_id, self.t1.ids.left.site_id
         )
-        body_joint_speeds = data.qvel[self.fcp_body_qvel_ids]
-        obs = obs.at[23:43].set(body_joint_positions_deg / 100.0)
-        obs = obs.at[43:63].set(body_joint_speeds / 6.1395)
+        right_foot_pos = self._site_pos_in_observation_frame(
+            data, self.t1.ids.waist_body_id, self.t1.ids.right.site_id
+        )
+        left_foot_rot = self._site_rpy_in_body_frame_deg(
+            data, self.trunk_body_id, self.t1.ids.left.site_id
+        )
+        right_foot_rot = self._site_rpy_in_body_frame_deg(
+            data, self.trunk_body_id, self.t1.ids.right.site_id
+        )
+
+        obs = obs.at[23:26].set(left_foot_pos * jnp.array([8.0, 8.0, 5.0]))
+        obs = obs.at[26:29].set(right_foot_pos * jnp.array([8.0, 8.0, 5.0]))
+        obs = obs.at[29:32].set(left_foot_rot / 20.0)
+        obs = obs.at[32:35].set(right_foot_rot / 20.0)
+
+        arm_positions_deg = data.qpos[self.walk_rl3_arm_qpos_ids] * 180.0 / jnp.pi
+        obs = obs.at[35:39].set(arm_positions_deg / 100.0)
+        obs = obs.at[39:55].set(last_joint_target_speed)
 
         step_state = walk_core_state.step_state
-        step_phase_sin = jnp.sin(
-            step_state.state_current_ts.astype(jnp.float32)
-            / step_state.ts_per_step.astype(jnp.float32)
-            * jnp.pi
-        )
-        obs = obs.at[63].set(jnp.where(init, 1.0, step_state.external_progress))
-        obs = obs.at[64].set(
-            jnp.where(init, 1.0, step_state.state_is_left_active.astype(jnp.float32))
-        )
-        obs = obs.at[65].set(
-            jnp.where(
-                init,
-                0.0,
+        normal_progress = jnp.array(
+            [
+                step_state.external_progress,
+                step_state.state_is_left_active.astype(jnp.float32),
                 jnp.logical_not(step_state.state_is_left_active).astype(jnp.float32),
-            )
+            ],
+            dtype=jnp.float32,
         )
-        obs = obs.at[66].set(jnp.where(init, 0.0, step_phase_sin))
+        init_progress = jnp.array([1.0, 1.0, 0.0], dtype=jnp.float32)
+        progress = jnp.where(init, init_progress, normal_progress)
+        obs = obs.at[55].set(progress[0])
+        obs = obs.at[56].set(progress[1])
+        obs = obs.at[57].set(progress[2])
 
-        measured_ball_rel_observation = self.ball_position_observation_frame(data)
-        use_current_ball = init | ball_visible
-        observation_ball_rel = jnp.where(
-            use_current_ball,
-            measured_ball_rel_observation,
-            previous_ball_rel_observation,
+        obs = obs.at[58].set(internal_walk_target[0] / self.walk_max_linear_dist)
+        obs = obs.at[59].set(internal_walk_target[1] / self.walk_max_linear_dist)
+        obs = obs.at[60].set(internal_rel_orientation / self.walk_max_rotation_dist)
+        obs = obs.at[61].set(
+            internal_walk_target_vel[0] / self.walk_max_linear_diff
         )
-        ball_rel_velocity_obs = jnp.where(
-            init,
-            jnp.zeros(3, dtype=jnp.float32),
-            jnp.where(
-                ball_visible,
-                (observation_ball_rel - previous_ball_rel_observation)
-                * self.ball_velocity_observation_scale,
-                previous_ball_rel_velocity_obs,
-            ),
+        # Walk_RL3 duplicates x target velocity here; keep the policy contract exact.
+        obs = obs.at[62].set(
+            internal_walk_target_vel[0] / self.walk_max_linear_diff
         )
-        obs = obs.at[67:70].set(ball_rel_velocity_obs)
-        obs = obs.at[70:73].set(observation_ball_rel)
-        obs = obs.at[73].set(
-            self.ball_observation_distance(observation_ball_rel) * 2.0
-        )
-        obs = obs.at[74].set(internal_rel_orientation / self.max_rotation_dist)
-        obs = obs.at[75].set(internal_target_vel / self.max_rotation_diff)
 
         obs = jnp.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
         return (
             obs.astype(jnp.float32),
             head_z.astype(jnp.float32),
             current_imu_linear_velocity.astype(jnp.float32),
-            observation_ball_rel,
-            ball_rel_velocity_obs.astype(jnp.float32),
         )
+
+    @staticmethod
+    def _site_pos_in_body_frame(data, body_id, site_id):
+        body_pos = data.xpos[body_id]
+        body_mat = data.xmat[body_id].reshape(3, 3)
+        return body_mat.T @ (data.site_xpos[site_id] - body_pos)
+
+    def _site_pos_in_observation_frame(self, data, body_id, site_id):
+        return (
+            self._site_pos_in_body_frame(data, body_id, site_id)
+            + self.foot_position_frame_offset
+        )
+
+    @staticmethod
+    def _site_rpy_in_body_frame_deg(data, body_id, site_id):
+        body_mat = data.xmat[body_id].reshape(3, 3)
+        site_mat = data.site_xmat[site_id].reshape(3, 3)
+        rel_mat = body_mat.T @ site_mat
+        return Rotation.from_matrix(rel_mat).as_euler("xyz") * 180.0 / jnp.pi
 
     def _feet_floor_contact_indices(self, data):
         contact_pairs = jnp.stack(
@@ -1345,43 +1503,15 @@ class FcpDribblingEnv:
         frp = jnp.where(contacts[:, None], frp, jnp.zeros_like(frp))
         return frp[0].astype(jnp.float32), frp[1].astype(jnp.float32)
 
-    def _termination_flags(self, data, step_counter, in_eval_mode, ball_unseen_too_long):
-        ball_rel = self.ball_position_waist(data)
-        soft_ball_out = (
-            (ball_rel[0] < self.ball_soft_x_min)
-            | (ball_rel[0] > self.ball_soft_x_max)
-            | (jnp.abs(ball_rel[1]) > self.ball_soft_abs_y_max)
-        )
-        hard_ball_out = (
-            (ball_rel[0] < self.ball_hard_x_min)
-            | (ball_rel[0] > self.ball_hard_x_max)
-            | (jnp.abs(ball_rel[1]) > self.ball_hard_abs_y_max)
-        )
-        ball_out = ((step_counter > self.ball_grace_steps) & soft_ball_out) | hard_ball_out
+    def _termination_flags(self, data, step_counter, in_eval_mode):
         fallen = data.site_xpos[self.imu_site_id, 2] < self.min_imu_height
         clipped = jnp.any(jnp.abs(data.qvel[:3]) >= 100.0)
         eval_timeout = (step_counter > self.eval_max_steps) & in_eval_mode
         return {
-            "ball_out": ball_out,
-            "ball_unseen": ball_unseen_too_long,
             "clipped": clipped,
             "eval_timeout": eval_timeout,
             "fallen": fallen,
-            "hard_ball_out": hard_ball_out,
-            "soft_ball_out": soft_ball_out,
         }
-
-    def _should_terminate(self, data, step_counter, in_eval_mode, ball_unseen_too_long):
-        flags = self._termination_flags(
-            data, step_counter, in_eval_mode, ball_unseen_too_long
-        )
-        return (
-            flags["fallen"]
-            | flags["clipped"]
-            | flags["ball_unseen"]
-            | flags["ball_out"]
-            | flags["eval_timeout"]
-        )
 
     def _settle_data(self, mjx_model, data):
         def settle_fn(settle_data, _):
@@ -1411,7 +1541,9 @@ class FcpDribblingEnv:
         return yaw_from_mat_deg(data.xmat[self.trunk_body_id])
 
     def get_observation_space(self):
-        self.policy_observation_indices = jnp.arange(self.OBSERVATION_DIM, dtype=int)
+        self.policy_observation_indices = jnp.arange(
+            self.POLICY_OBSERVATION_DIM, dtype=int
+        )
         self.critic_observation_indices = jnp.arange(self.OBSERVATION_DIM, dtype=int)
         return BoxSpace(
             low=-jnp.inf,

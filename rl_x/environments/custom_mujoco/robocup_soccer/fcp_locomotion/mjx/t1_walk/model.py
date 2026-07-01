@@ -147,11 +147,25 @@ def _walk_defaults(jnp, mj_model, mj_data, ids: T1KinematicIds, control_dt: floa
     feet_y_dev = float((left_home[1] - right_home[1]) * 0.5)
     z_extension = float(-0.5 * (left_home[2] + right_home[2]))
 
+    body_masses = mj_model.body_mass.astype(np.float64)
+    body_ids = np.flatnonzero(body_masses > 0.0)
+    total_mass = float(body_masses[body_ids].sum())
+    com_world = (
+        mj_data.xipos[body_ids] * body_masses[body_ids, None]
+    ).sum(axis=0) / total_mass
+    feet_mid_world = 0.5 * (
+        mj_data.site_xpos[left_site] + mj_data.site_xpos[right_site]
+    )
+    com_height = max(float(com_world[2] - feet_mid_world[2]), 1e-6)
+    gravity = float(np.linalg.norm(mj_model.opt.gravity)) or 9.81
+
     return T1WalkDefaults(
         step_config=StepGeneratorConfig(
             feet_y_dev=jnp.asarray(feet_y_dev, dtype=jnp.float32),
             sample_time=jnp.asarray(control_dt, dtype=jnp.float32),
             max_ankle_z=jnp.asarray(0.0, dtype=jnp.float32),
+            z0=jnp.asarray(com_height, dtype=jnp.float32),
+            gravity=jnp.asarray(gravity, dtype=jnp.float32),
         ),
         ts_per_step=8,
         z_span=0.02,

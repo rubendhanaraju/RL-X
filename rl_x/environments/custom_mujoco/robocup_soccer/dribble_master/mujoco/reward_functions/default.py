@@ -10,7 +10,7 @@ class DefaultReward:
         self.feet_orientation_coeff = reward_config["feet_orientation_coeff"] * env.dt
         self.feet_distance_coeff = reward_config["feet_distance_coeff"] * env.dt
         self.feet_clearance_coeff = reward_config["feet_clearance_coeff"] * env.dt
-        self.termination_coeff = reward_config["termination_coeff"] * env.dt
+        self.termination_coeff = reward_config["termination_coeff"]
         self.reference_joint_position_coeff = reward_config["reference_joint_position_coeff"] * env.dt
         self.symmetric_action_coeff = reward_config["symmetric_action_coeff"] * env.dt
         self.joint_torque_coeff = reward_config["joint_torque_coeff"] * env.dt
@@ -19,8 +19,6 @@ class DefaultReward:
         self.collision_coeff = reward_config["collision_coeff"] * env.dt
         self.active_sensing_coeff = reward_config["active_sensing_coeff"] * env.dt
         self.chasing_coeff = reward_config["chasing_coeff"] * env.dt
-        self.chasing_distance_scale = reward_config.get("chasing_distance_scale", env.ball_spawn_radius)
-        self.chasing_exponent = reward_config.get("chasing_exponent", 2.0)
         self.progress_to_ball_coeff = reward_config.get("progress_to_ball_coeff", 0.0)
         self.progress_to_ball_clip = reward_config.get("progress_to_ball_clip", 0.05)
         self.projected_ball_velocity_coeff = reward_config["projected_ball_velocity_coeff"] * env.dt
@@ -118,7 +116,7 @@ class DefaultReward:
         ball_pos_world = self.env.ball_position_world()
         ball_vel_world = self.env.ball_velocity_world()
         base_pos_world = self.env.base_position_world()
-        com_pos_world = base_pos_world
+        com_pos_world = self.env.robot_com_position_world()
         base_yaw = self.env.internal_state["imu_orientation_euler"][2]
         ball_velocity_command_xy = self.env.internal_state["ball_velocity_command"]
         ball_visible = np.float32(self.env.internal_state["ball_visible"])
@@ -138,7 +136,7 @@ class DefaultReward:
         foot_pos_w = self.env.internal_state["data"].geom_xpos[self.env.foot_geom_indices]
         foot_xy_distance_squared = np.sum(np.square(foot_pos_w[0, :2] - foot_pos_w[1, :2]))
         feet_distance_error = np.abs(foot_xy_distance_squared - self.env.nominal_feet_xy_distance_squared)
-        feet_distance_reward = self.feet_distance_coeff * np.exp(-feet_distance_error)
+        feet_distance_reward = self.feet_distance_coeff * feet_distance_error
 
         foot_z_rel = foot_pos_w[:, 2] - self.feet_height_on_flat_ground
         phase_for_reward = self.env.gait_manager_function.get_phase_for_reward()
@@ -184,8 +182,7 @@ class DefaultReward:
         active_sensing_reward = self.active_sensing_coeff * ball_visible
 
         ball_com_distance = np.linalg.norm(ball_pos_world[:2] - com_pos_world[:2])
-        normalized_ball_com_distance = ball_com_distance / max(self.chasing_distance_scale, 1e-6)
-        chasing_reward = self.chasing_coeff * np.exp(-self.chasing_exponent * np.square(normalized_ball_com_distance))
+        chasing_reward = self.chasing_coeff * np.exp(-2.0 * np.square(ball_com_distance))
         previous_ball_distance_to_base = self.env.internal_state["previous_ball_distance_to_base"]
         ball_distance_to_base = np.linalg.norm(ball_pos_world[:2] - base_pos_world[:2])
         ball_distance_progress = previous_ball_distance_to_base - ball_distance_to_base
@@ -193,11 +190,7 @@ class DefaultReward:
         upright_progress_gate = (1.0 - np.float32(below_height)) * np.exp(-np.abs(roll_pitch_squared))
         progress_to_ball_reward = self.progress_to_ball_coeff * clipped_ball_distance_progress * upright_progress_gate
 
-        desired_ball_speed = np.linalg.norm(ball_velocity_command_xy)
-        desired_ball_direction = ball_velocity_command_xy / np.maximum(desired_ball_speed, 1e-6)
-        projected_ball_velocity_xy = np.dot(ball_vel_world[:2], desired_ball_direction) * desired_ball_direction
-        ball_velocity_for_tracking = np.where(desired_ball_speed > 1e-6, projected_ball_velocity_xy, ball_vel_world[:2])
-        ball_velocity_tracking_error = np.sum(np.square(ball_velocity_for_tracking - ball_velocity_command_xy))
+        ball_velocity_tracking_error = np.sum(np.square(ball_vel_world[:2] - ball_velocity_command_xy))
         projected_ball_velocity_reward = self.projected_ball_velocity_coeff * np.exp(-ball_velocity_tracking_error / self.ball_velocity_tracking_temperature)
 
         yaw_alignment_raw = self.reward_yaw_alignment(base_yaw, base_pos_world[:2], ball_pos_world[:2], ball_velocity_command_xy)
@@ -246,8 +239,7 @@ class DefaultReward:
         self.env.internal_state["info"]["reward/total"] = reward
         self.env.internal_state["info"]["env_info/ball_distance_to_base"] = ball_distance_to_base
         self.env.internal_state["info"]["env_info/ball_distance_to_com"] = np.linalg.norm(ball_pos_world - com_pos_world)
-        self.env.internal_state["info"]["env_info/chasing_distance_scale"] = self.chasing_distance_scale
-        self.env.internal_state["info"]["env_info/chasing_exponent"] = self.chasing_exponent
+        self.env.internal_state["info"]["env_info/chasing_exponent"] = 2.0
         self.env.internal_state["info"]["env_info/ball_speed"] = np.linalg.norm(ball_vel_world[:2])
         self.env.internal_state["info"]["env_info/ball_velocity_tracking_error"] = np.sqrt(ball_velocity_tracking_error)
         self.env.internal_state["info"]["env_info/projected_ball_velocity_tracking_error"] = np.sqrt(ball_velocity_tracking_error)

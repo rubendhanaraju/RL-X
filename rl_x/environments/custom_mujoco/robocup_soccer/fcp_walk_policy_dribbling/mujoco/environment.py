@@ -67,6 +67,11 @@ class WalkPolicyDribblingEnv(gym.Env):
         )
         self.dribble_use_dynamic_direction = bool(env_config["teacher_policy"].get("dribble_use_dynamic_direction", True))
         self.dribble_goal_lookahead = float(env_config["teacher_policy"].get("dribble_goal_lookahead", 20.0))
+        self.train_initial_orientation_min = float(env_config["target"].get("train_initial_orientation_min", -180.0))
+        self.train_initial_orientation_max = float(env_config["target"].get("train_initial_orientation_max", 180.0))
+        self.orientation_change_mode = env_config["target"].get("orientation_change_mode", "step_probability")
+        self.orientation_change_on_ball_displacement = self.orientation_change_mode == "ball_displacement"
+        self.orientation_change_ball_displacement = float(env_config["target"].get("orientation_change_ball_displacement", 0.5))
         self.teacher_imitation_schedule_enabled = bool(env_config["teacher_imitation_schedule"]["enabled"])
         self.teacher_imitation_start_weight = float(env_config["teacher_imitation_schedule"]["start_weight"])
         self.teacher_imitation_end_weight = float(env_config["teacher_imitation_schedule"]["end_weight"])
@@ -256,6 +261,43 @@ class WalkPolicyDribblingEnv(gym.Env):
         self.dt = env_config["timestep"] * self.nr_substeps
         self.horizon = int(round(env_config["episode_length_in_seconds"] * self.control_frequency_hz))
         self.initial_unseen_grace_steps = int(round(float(env_config["sensing"]["initial_unseen_grace_seconds"]) * self.control_frequency_hz))
+        curriculum_config = env_config.get("dribble_curriculum", {})
+        self.dribble_curriculum_enabled = bool(curriculum_config.get("enabled", False))
+        self.dribble_curriculum_update_nr_levels = float(curriculum_config.get("nr_levels", 100))
+        self.dribble_curriculum_near_horizon_fraction = float(curriculum_config.get("near_horizon_fraction", 0.95))
+        self.dribble_curriculum_teacher_weights = np.array(
+            curriculum_config.get("teacher_imitation_weights", [self.teacher_imitation_start_weight]),
+            dtype=np.float32,
+        )
+        self.dribble_curriculum_fcp_coeffs = np.array(
+            curriculum_config.get("fcp_dribble_coeffs", [1.0]),
+            dtype=np.float32,
+        )
+        self.dribble_curriculum_possession_enabled = np.array(
+            curriculum_config.get("possession_enabled", [self.enable_possession_termination]),
+            dtype=bool,
+        )
+        self.dribble_curriculum_possession_min_x = np.array(
+            curriculum_config.get("possession_min_x", [self.possession_min_x]),
+            dtype=np.float32,
+        )
+        self.dribble_curriculum_possession_max_x = np.array(
+            curriculum_config.get("possession_max_x", [self.possession_max_x]),
+            dtype=np.float32,
+        )
+        self.dribble_curriculum_possession_max_abs_y = np.array(
+            curriculum_config.get("possession_max_abs_y", [self.possession_max_abs_y]),
+            dtype=np.float32,
+        )
+        self.dribble_curriculum_immediate_max_x = np.array(
+            curriculum_config.get("immediate_max_x", [self.immediate_possession_max_x]),
+            dtype=np.float32,
+        )
+        self.dribble_curriculum_immediate_max_abs_y = np.array(
+            curriculum_config.get("immediate_max_abs_y", [self.immediate_possession_max_abs_y]),
+            dtype=np.float32,
+        )
+        self.dribble_curriculum_nr_levels = int(self.dribble_curriculum_teacher_weights.shape[0])
 
         self.command_function = get_command_function(env_config["command"]["type"], self)
         self.command_sampling_function = get_sampling_function(env_config["command"]["sampling_type"], self)
@@ -313,6 +355,19 @@ class WalkPolicyDribblingEnv(gym.Env):
             "teacher_imitation_level_delta": 0.0,
             "teacher_imitation_anneal_progress": 1.0 if eval_mode else 0.0,
             "penalty_anneal_progress": 1.0 if eval_mode else 0.0,
+            "dribble_curriculum_level": 0,
+            "dribble_curriculum_coeff": 1.0 if eval_mode else 0.0,
+            "dribble_curriculum_levels_in_a_row": 0.0,
+            "dribble_curriculum_success_streak": 0.0,
+            "dribble_curriculum_last_episode_success": 0.0,
+            "dribble_curriculum_promoted": 0.0,
+            "dribble_curriculum_fcp_coeff": 1.0,
+            "dribble_curriculum_possession_enabled": self.enable_possession_termination,
+            "dribble_curriculum_possession_min_x": self.possession_min_x,
+            "dribble_curriculum_possession_max_x": self.possession_max_x,
+            "dribble_curriculum_possession_max_abs_y": self.possession_max_abs_y,
+            "dribble_curriculum_immediate_max_x": self.immediate_possession_max_x,
+            "dribble_curriculum_immediate_max_abs_y": self.immediate_possession_max_abs_y,
             "current_delta_command": np.zeros(3),
             "last_delta_command": np.zeros(3),
             "second_last_delta_command": np.zeros(3),
@@ -347,6 +402,9 @@ class WalkPolicyDribblingEnv(gym.Env):
             "ball_detection_elevation": 0.0,
             "ball_detection_local_pos": np.zeros(3),
             "ball_motion_reference_position": np.zeros(2),
+            "orientation_reference_ball_position": np.zeros(2),
+            "target_orientation_changed": np.float32(0.0),
+            "target_orientation_ball_displacement": np.float32(0.0),
             "time_since_ball_moved": 0.0,
             "ball_stagnant_too_long": False,
             "ball_possession_armed": False,
@@ -373,6 +431,7 @@ class WalkPolicyDribblingEnv(gym.Env):
         self.domain_randomization_action_delay_function.init()
         self.domain_randomization_seen_robot_function.init()
         self.domain_randomization_unseen_robot_function.init()
+        self.apply_dribble_curriculum()
         self.reward_function.reward_and_info(np.zeros(self.nr_actuator_joints))
         mujoco.mj_forward(self.internal_state["mj_model"], self.internal_state["data"])
         self.update_ball_sensing(reset_timer=True, episode_step=0)
@@ -511,11 +570,22 @@ class WalkPolicyDribblingEnv(gym.Env):
         mujoco.mj_forward(self.internal_state["mj_model"], data)
         return True
 
-    def sample_ball_velocity_command(self, should_sample_command):
+    def sample_ball_velocity_command(self, should_sample_command, initial=False):
         if not should_sample_command:
             return
         max_ball_velocity = self.internal_state["max_ball_velocity"]
-        command = self.np_rng.uniform(low=-max_ball_velocity, high=max_ball_velocity, size=(2,))
+        if self.dribble_use_dynamic_direction:
+            if initial:
+                angle_degrees = self.np_rng.uniform(
+                    self.train_initial_orientation_min,
+                    self.train_initial_orientation_max,
+                )
+            else:
+                angle_degrees = self.np_rng.uniform(-180.0, 180.0)
+            angle = np.deg2rad(angle_degrees)
+            command = max_ball_velocity * np.array([np.cos(angle), np.sin(angle)], dtype=np.float32)
+        else:
+            command = self.np_rng.uniform(low=-max_ball_velocity, high=max_ball_velocity, size=(2,))
         if np.linalg.norm(command) < self.env_config["ball_command"]["zero_clip_threshold"] * max_ball_velocity:
             command = np.zeros(2)
         if self.np_rng.random() < self.env_config["ball_command"]["all_zero_chance"]:
@@ -728,6 +798,88 @@ class WalkPolicyDribblingEnv(gym.Env):
         self.internal_state["penalty_anneal_progress"] = penalty_progress
         self.internal_state["env_curriculum_coeff"] = penalty_coeff if self.penalty_schedule_enabled else self.penalty_end_coeff
         self.internal_state["env_curriculum_levels_in_a_row"] = penalty_progress
+        self.apply_dribble_curriculum()
+
+    def apply_dribble_curriculum(self):
+        coeff = 1.0 if self.internal_state["in_eval_mode"] else self.internal_state["dribble_curriculum_coeff"]
+        self.internal_state["dribble_curriculum_coeff"] = coeff
+        level = int(np.clip(
+            np.floor(coeff * (self.dribble_curriculum_nr_levels - 1)),
+            0,
+            self.dribble_curriculum_nr_levels - 1,
+        ))
+        self.internal_state["dribble_curriculum_level"] = level
+
+        if self.dribble_curriculum_enabled:
+            self.internal_state["teacher_imitation_weight"] = self.dribble_curriculum_teacher_weights[level]
+            self.internal_state["dribble_curriculum_fcp_coeff"] = self.dribble_curriculum_fcp_coeffs[level]
+            self.internal_state["dribble_curriculum_possession_enabled"] = self.dribble_curriculum_possession_enabled[level]
+            self.internal_state["dribble_curriculum_possession_min_x"] = self.dribble_curriculum_possession_min_x[level]
+            self.internal_state["dribble_curriculum_possession_max_x"] = self.dribble_curriculum_possession_max_x[level]
+            self.internal_state["dribble_curriculum_possession_max_abs_y"] = self.dribble_curriculum_possession_max_abs_y[level]
+            self.internal_state["dribble_curriculum_immediate_max_x"] = self.dribble_curriculum_immediate_max_x[level]
+            self.internal_state["dribble_curriculum_immediate_max_abs_y"] = self.dribble_curriculum_immediate_max_abs_y[level]
+
+    def update_dribble_curriculum_after_episode(
+        self,
+        episode_step,
+        done,
+        height_termination,
+        ball_unseen_too_long,
+        qvel_limit_termination,
+    ):
+        near_horizon_steps = int(round(self.dribble_curriculum_near_horizon_fraction * self.horizon))
+        reached_near_horizon = episode_step >= near_horizon_steps
+        no_bad_terminal = not (height_termination or ball_unseen_too_long or qvel_limit_termination)
+        success = bool(done and reached_near_horizon and no_bad_terminal)
+
+        previous_levels_in_a_row = self.internal_state["dribble_curriculum_levels_in_a_row"]
+        if success:
+            levels_in_a_row = previous_levels_in_a_row + 1.0 if previous_levels_in_a_row >= 0.0 else 1.0
+        else:
+            levels_in_a_row = previous_levels_in_a_row - 1.0 if previous_levels_in_a_row < 0.0 else -1.0
+        if not done:
+            levels_in_a_row = previous_levels_in_a_row
+
+        previous_level = self.internal_state["dribble_curriculum_level"]
+        if self.dribble_curriculum_enabled and done:
+            next_coeff = np.clip(
+                self.internal_state["dribble_curriculum_coeff"]
+                + levels_in_a_row / max(self.dribble_curriculum_update_nr_levels, 1.0),
+                0.0,
+                1.0,
+            )
+            if self.internal_state["in_eval_mode"]:
+                next_coeff = 1.0
+            self.internal_state["dribble_curriculum_coeff"] = next_coeff
+            self.internal_state["dribble_curriculum_levels_in_a_row"] = levels_in_a_row
+
+        self.apply_dribble_curriculum()
+        self.internal_state["dribble_curriculum_success_streak"] = max(
+            self.internal_state["dribble_curriculum_levels_in_a_row"],
+            0.0,
+        )
+        self.internal_state["dribble_curriculum_last_episode_success"] = np.float32(success)
+        self.internal_state["dribble_curriculum_promoted"] = np.float32(
+            self.internal_state["dribble_curriculum_level"] > previous_level
+        )
+        self.update_dribble_curriculum_info()
+
+    def update_dribble_curriculum_info(self):
+        info = self.internal_state["info"]
+        info["env_info/dribble_curriculum_coeff"] = self.internal_state["dribble_curriculum_coeff"]
+        info["env_info/dribble_curriculum_levels_in_a_row"] = self.internal_state["dribble_curriculum_levels_in_a_row"]
+        info["env_info/dribble_curriculum_level"] = np.float32(self.internal_state["dribble_curriculum_level"])
+        info["env_info/dribble_curriculum_success_streak"] = self.internal_state["dribble_curriculum_success_streak"]
+        info["env_info/dribble_curriculum_last_episode_success"] = self.internal_state["dribble_curriculum_last_episode_success"]
+        info["env_info/dribble_curriculum_promoted"] = self.internal_state["dribble_curriculum_promoted"]
+        info["env_info/dribble_curriculum_fcp_coeff"] = self.internal_state["dribble_curriculum_fcp_coeff"]
+        info["env_info/dribble_curriculum_possession_enabled"] = np.float32(self.internal_state["dribble_curriculum_possession_enabled"])
+        info["env_info/dribble_curriculum_possession_min_x"] = self.internal_state["dribble_curriculum_possession_min_x"]
+        info["env_info/dribble_curriculum_possession_max_x"] = self.internal_state["dribble_curriculum_possession_max_x"]
+        info["env_info/dribble_curriculum_possession_max_abs_y"] = self.internal_state["dribble_curriculum_possession_max_abs_y"]
+        info["env_info/dribble_curriculum_immediate_max_x"] = self.internal_state["dribble_curriculum_immediate_max_x"]
+        info["env_info/dribble_curriculum_immediate_max_abs_y"] = self.internal_state["dribble_curriculum_immediate_max_abs_y"]
 
     def trunc2(self, value):
         return np.trunc(np.asarray(value) * 100.0) / 100.0
@@ -818,16 +970,16 @@ class WalkPolicyDribblingEnv(gym.Env):
         completed_steps = episode_step + 1
         after_warmup = completed_steps >= self.possession_warmup_steps
         outside_tight_box = (
-            ball_rel_x < self.possession_min_x
-            or ball_rel_x > self.possession_max_x
-            or np.abs(ball_rel_y) > self.possession_max_abs_y
+            ball_rel_x < self.internal_state["dribble_curriculum_possession_min_x"]
+            or ball_rel_x > self.internal_state["dribble_curriculum_possession_max_x"]
+            or np.abs(ball_rel_y) > self.internal_state["dribble_curriculum_possession_max_abs_y"]
         )
         inside_possession_pocket = not outside_tight_box
         ball_possession_armed = self.internal_state["ball_possession_armed"] or inside_possession_pocket
         tight_possession_lost = after_warmup and ball_possession_armed and outside_tight_box
         immediate_possession_lost = ball_possession_armed and (
-            ball_rel_x > self.immediate_possession_max_x
-            or np.abs(ball_rel_y) > self.immediate_possession_max_abs_y
+            ball_rel_x > self.internal_state["dribble_curriculum_immediate_max_x"]
+            or np.abs(ball_rel_y) > self.internal_state["dribble_curriculum_immediate_max_abs_y"]
         )
         return tight_possession_lost, immediate_possession_lost, ball_rel_x, ball_rel_y, inside_possession_pocket, ball_possession_armed
 
@@ -841,8 +993,13 @@ class WalkPolicyDribblingEnv(gym.Env):
             ball_possession_armed,
         ) = self.get_ball_possession_termination(episode_step)
         self.internal_state["ball_possession_armed"] = ball_possession_armed
-        tight_possession_lost = self.enable_possession_termination and tight_possession_lost
-        immediate_possession_lost = self.enable_possession_termination and immediate_possession_lost
+        possession_termination_enabled = (
+            self.internal_state["dribble_curriculum_possession_enabled"]
+            if self.dribble_curriculum_enabled
+            else self.enable_possession_termination
+        )
+        tight_possession_lost = possession_termination_enabled and tight_possession_lost
+        immediate_possession_lost = possession_termination_enabled and immediate_possession_lost
         info = self.internal_state["info"]
         info["env_info/ball_rel_base_x"] = ball_rel_x
         info["env_info/ball_rel_base_y"] = ball_rel_y
@@ -952,6 +1109,8 @@ class WalkPolicyDribblingEnv(gym.Env):
         info["env_info/teacher_command_noise_y"] = self.internal_state["teacher_command_noise"][1]
         info["env_info/teacher_command_noise_yaw"] = self.internal_state["teacher_command_noise"][2]
         info["env_info/teacher_command_noise_norm"] = np.linalg.norm(self.internal_state["teacher_command_noise"])
+        info["env_info/target_orientation_changed"] = self.internal_state["target_orientation_changed"]
+        info["env_info/target_orientation_ball_displacement"] = self.internal_state["target_orientation_ball_displacement"]
         info["env_info/teacher_contact_blend"] = self.internal_state["teacher_contact_blend"]
         info["env_info/dribble_walk_alpha"] = self.internal_state["dribble_walk_alpha"]
         info["env_info/dribble_walk_along"] = self.internal_state["dribble_walk_along"]
@@ -966,6 +1125,7 @@ class WalkPolicyDribblingEnv(gym.Env):
         info["env_info/teacher_imitation_level_delta"] = self.internal_state["teacher_imitation_level_delta"]
         info["env_info/teacher_imitation_anneal_progress"] = self.internal_state["teacher_imitation_anneal_progress"]
         info["env_info/penalty_anneal_progress"] = self.internal_state["penalty_anneal_progress"]
+        self.update_dribble_curriculum_info()
 
     def render(self):
         if self.uses_hfield and self.internal_state["info_episode_store"]["episode_step"] == 1:
@@ -1059,8 +1219,11 @@ class WalkPolicyDribblingEnv(gym.Env):
         self.reward_function.setup()
         self.domain_randomization_action_delay_function.setup()
         self.handle_domain_randomization(is_episode_start=True)
-        self.sample_ball_velocity_command(True)
+        self.sample_ball_velocity_command(True, initial=True)
         self.internal_state["ball_motion_reference_position"] = self.ball_position_world()[:2].copy()
+        self.internal_state["orientation_reference_ball_position"] = self.ball_position_world()[:2].copy()
+        self.internal_state["target_orientation_changed"] = np.float32(0.0)
+        self.internal_state["target_orientation_ball_displacement"] = np.float32(0.0)
         self.internal_state["time_since_ball_moved"] = 0.0
         self.internal_state["ball_stagnant_too_long"] = False
         self.internal_state["ball_possession_armed"] = False
@@ -1113,11 +1276,24 @@ class WalkPolicyDribblingEnv(gym.Env):
         reward = self.reward_function.reward_and_info(chosen_action)
 
         resampling_steps = int(round(float(self.env_config["ball_command"]["resampling_time_s"]) * self.control_frequency_hz))
-        should_sample_ball_command = (
+        time_based_resample = (
             self.ball_command_resample_within_episode
             and ((self.internal_state["info_episode_store"]["episode_step"] + 1) % resampling_steps) == 0
         )
+        target_orientation_ball_displacement = np.linalg.norm(
+            self.ball_position_world()[:2] - self.internal_state["orientation_reference_ball_position"]
+        )
+        displacement_based_resample = target_orientation_ball_displacement >= self.orientation_change_ball_displacement
+        should_sample_ball_command = (
+            displacement_based_resample
+            if self.orientation_change_on_ball_displacement
+            else time_based_resample
+        )
         self.sample_ball_velocity_command(should_sample_ball_command)
+        if should_sample_ball_command:
+            self.internal_state["orientation_reference_ball_position"] = self.ball_position_world()[:2].copy()
+        self.internal_state["target_orientation_changed"] = np.float32(should_sample_ball_command)
+        self.internal_state["target_orientation_ball_displacement"] = np.float32(target_orientation_ball_displacement)
         ball_position_resampled = self.maybe_resample_ball_position()
         self.update_ball_sensing(
             reset_timer=ball_position_resampled,
@@ -1152,10 +1328,10 @@ class WalkPolicyDribblingEnv(gym.Env):
         next_observation = self.get_observation(chosen_action)
         height_termination = self.termination_function.should_terminate()
         ball_unseen_too_long = self.internal_state["ball_unseen_too_long"]
+        ball_visibility_termination = False
         qvel_limit_termination = np.any(np.abs(self.internal_state["data"].qvel[:3]) >= 100.0)
         terminated = (
             height_termination
-            or ball_unseen_too_long
             or tight_possession_lost
             or immediate_possession_lost
             or ball_stagnant_too_long
@@ -1165,7 +1341,7 @@ class WalkPolicyDribblingEnv(gym.Env):
         done = terminated or truncated
         self.update_termination_info(
             height_termination,
-            ball_unseen_too_long,
+            ball_visibility_termination,
             tight_possession_lost,
             immediate_possession_lost,
             ball_stagnant_too_long,
@@ -1188,6 +1364,13 @@ class WalkPolicyDribblingEnv(gym.Env):
         self.internal_state["info_episode_store"]["episode_total_xy_velocity_diff_abs"] += self.internal_state["info"]["env_info/xy_vel_diff_abs"]
         self.internal_state["lifetime_steps"] += 1.0
         self.update_time_schedules()
+        self.update_dribble_curriculum_after_episode(
+            self.internal_state["info_episode_store"]["episode_step"],
+            done,
+            height_termination,
+            ball_visibility_termination,
+            qvel_limit_termination,
+        )
         self.internal_state["info"]["rollout/episode_return"] = np.where(done, self.internal_state["info_episode_store"]["episode_return"], self.internal_state["info"]["rollout/episode_return"])
         self.internal_state["info"]["rollout/episode_length"] = np.where(done, self.internal_state["info_episode_store"]["episode_step"], self.internal_state["info"]["rollout/episode_length"])
         self.internal_state["info"]["env_curriculum/coefficient"] = self.internal_state["env_curriculum_coeff"]
@@ -1220,7 +1403,8 @@ class WalkPolicyDribblingEnv(gym.Env):
         ball_vel_world = self.ball_velocity_world()
         base_pos_world = self.base_position_world()
         relative_ball_position = self.relative_ball_position_base()
-        ball_relative_position_noise = self.internal_state["env_curriculum_coeff"] * self.np_rng.uniform(
+        ball_relative_position_noise_scale = 0.0 if self.internal_state["in_eval_mode"] else self.internal_state["env_curriculum_coeff"]
+        ball_relative_position_noise = ball_relative_position_noise_scale * self.np_rng.uniform(
             low=-self.ball_relative_position_noise,
             high=self.ball_relative_position_noise,
             size=(3,),
@@ -1379,7 +1563,6 @@ class WalkPolicyDribblingEnv(gym.Env):
             self.feet_time_in_air_obs_idx,
             self.imu_linear_vel_obs_idx,
             self.imu_angular_vel_obs_idx,
-            self.goal_velocities_obs_idx,
             self.gait_phase_obs_idx,
             self.gravity_vector_obs_idx,
             self.critic_exteroception_obs_idx,

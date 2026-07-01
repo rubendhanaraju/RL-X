@@ -22,8 +22,20 @@ class NaoWalkControl:
         feet_y_dev_scale = jnp.array(
             walk_config.get("feet_y_dev_scale", 1.0), dtype=jnp.float32
         )
+        z0_override = float(walk_config.get("z0", -1.0))
+        gravity_override = float(walk_config.get("gravity", -1.0))
         self.step_config = env.t1.defaults.step_config._replace(
-            feet_y_dev=env.t1.defaults.step_config.feet_y_dev * feet_y_dev_scale
+            feet_y_dev=env.t1.defaults.step_config.feet_y_dev * feet_y_dev_scale,
+            z0=(
+                jnp.array(z0_override, dtype=jnp.float32)
+                if z0_override > 0.0
+                else env.t1.defaults.step_config.z0
+            ),
+            gravity=(
+                jnp.array(gravity_override, dtype=jnp.float32)
+                if gravity_override > 0.0
+                else env.t1.defaults.step_config.gravity
+            ),
         )
         self.walk_config = WalkCoreConfig(
             left_foot_home_waist=env.t1.defaults.left_foot_home_waist,
@@ -49,6 +61,19 @@ class NaoWalkControl:
             ),
             min_abs_foot_y=jnp.array(
                 walk_config.get("min_abs_foot_y", 0.01), dtype=jnp.float32
+            ),
+            arm_base=jnp.array(
+                walk_config.get(
+                    "arm_base",
+                    [0.0, -1.4, 0.0, -0.4, 0.0, 1.4, 0.0, 0.4],
+                ),
+                dtype=jnp.float32,
+            ),
+            arm_swing_scale=jnp.array(
+                walk_config.get("arm_swing_scale", 0.10), dtype=jnp.float32
+            ),
+            arm_action_scale=jnp.array(
+                walk_config.get("arm_action_scale", 0.08), dtype=jnp.float32
             ),
         )
         self.ik_config = IKSolverConfig(
