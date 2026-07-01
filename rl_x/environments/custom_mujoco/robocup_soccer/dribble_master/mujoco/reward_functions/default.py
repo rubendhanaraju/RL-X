@@ -136,7 +136,7 @@ class DefaultReward:
         foot_pos_w = self.env.internal_state["data"].geom_xpos[self.env.foot_geom_indices]
         foot_xy_distance_squared = np.sum(np.square(foot_pos_w[0, :2] - foot_pos_w[1, :2]))
         feet_distance_error = np.abs(foot_xy_distance_squared - self.env.nominal_feet_xy_distance_squared)
-        feet_distance_reward = self.feet_distance_coeff * feet_distance_error
+        feet_distance_reward = -self.feet_distance_coeff * feet_distance_error
 
         foot_z_rel = foot_pos_w[:, 2] - self.feet_height_on_flat_ground
         phase_for_reward = self.env.gait_manager_function.get_phase_for_reward()
