@@ -24,8 +24,6 @@ class DefaultReward:
         self.projected_ball_velocity_coeff = reward_config["projected_ball_velocity_coeff"] * env.dt
         self.ball_velocity_tracking_temperature = reward_config["ball_velocity_tracking_temperature"]
         self.yaw_alignment_coeff = reward_config["yaw_alignment_coeff"] * env.dt
-        self.yaw_alignment_no_ball_coeff = reward_config["yaw_alignment_no_ball_coeff"] * env.dt
-        self.yaw_alignment_no_ball_max_yaw_rate = reward_config["yaw_alignment_no_ball_max_yaw_rate"]
         self.reference_joint_target_scale = reward_config["reference_joint_target_scale"]
         self.reference_joint_double_support_threshold = reward_config["reference_joint_double_support_threshold"]
         self.feet_phase_swing_height = reward_config["feet_phase_swing_height"]
@@ -195,15 +193,11 @@ class DefaultReward:
 
         yaw_alignment_raw = self.reward_yaw_alignment(base_yaw, base_pos_world[:2], ball_pos_world[:2], ball_velocity_command_xy)
         yaw_alignment_reward = self.yaw_alignment_coeff * yaw_alignment_raw * ball_visible
-
-        last_ball_yaw_error = np.arctan2(self.env.internal_state["ball_detection_local_pos"][1], self.env.internal_state["ball_detection_local_pos"][0])
-        desired_reacquire_yaw_rate = self.yaw_alignment_no_ball_max_yaw_rate * np.sign(last_ball_yaw_error)
-        yaw_alignment_no_ball_error = np.abs(base_yaw_rate - desired_reacquire_yaw_rate)
-        yaw_alignment_no_ball_reward = self.yaw_alignment_no_ball_coeff * yaw_alignment_no_ball_error * (1.0 - ball_visible)
+        yaw_alignment_no_ball_reward = 0.0
 
         reward = base_orientation_reward + feet_orientation_reward + feet_distance_reward + feet_clearance_reward + termination_reward + \
                  reference_joint_position_reward + symmetric_action_reward + joint_torque_reward + joint_speed_reward + action_smoothness_reward + \
-                 collision_reward + active_sensing_reward + chasing_reward + progress_to_ball_reward + projected_ball_velocity_reward + yaw_alignment_reward + yaw_alignment_no_ball_reward
+                 collision_reward + active_sensing_reward + chasing_reward + progress_to_ball_reward + projected_ball_velocity_reward + yaw_alignment_reward
         reward = np.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
 
         self.env.internal_state["info"]["reward/base_orientation"] = base_orientation_reward

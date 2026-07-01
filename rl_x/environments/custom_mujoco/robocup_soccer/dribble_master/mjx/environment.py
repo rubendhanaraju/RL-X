@@ -695,7 +695,7 @@ class DribbleMasterEnv:
         base_yaw = internal_state["imu_orientation_euler"][2]
         base_yaw_rate = current_imu_angular_velocity[2]
         body_orientation = jnp.array([base_yaw, internal_state["imu_orientation_euler"][0], internal_state["imu_orientation_euler"][1]])
-        perceived_ball_position = internal_state["ball_detection_local_pos"]
+        relative_ball_position = self.relative_ball_position_base(data, internal_state)
         ball_visible = jnp.array([jnp.asarray(internal_state["ball_visible"], dtype=jnp.float32)])
         clock_signal = self.gait_manager_function.get_phase_features(internal_state)[:2]
 
@@ -710,7 +710,7 @@ class DribbleMasterEnv:
             current_imu_angular_velocity,
             body_orientation,
             internal_state["ball_velocity_command"],
-            perceived_ball_position,
+            relative_ball_position,
             ball_visible,
             clock_signal,
             internal_state["imu_orientation_rotation_inverse"].apply(jnp.array([0.0, 0.0, -1.0])),

@@ -597,7 +597,7 @@ class DribbleMasterEnv(gym.Env):
         base_yaw = self.internal_state["imu_orientation_euler"][2]
         base_yaw_rate = current_imu_angular_velocity[2]
         body_orientation = np.array([base_yaw, self.internal_state["imu_orientation_euler"][0], self.internal_state["imu_orientation_euler"][1]])
-        perceived_ball_position = self.internal_state["ball_detection_local_pos"]
+        relative_ball_position = self.relative_ball_position_base()
         ball_visible = np.array([np.float32(self.internal_state["ball_visible"])])
         clock_signal = self.gait_manager_function.get_phase_features()[:2]
 
@@ -612,7 +612,7 @@ class DribbleMasterEnv(gym.Env):
             current_imu_angular_velocity,
             body_orientation,
             self.internal_state["ball_velocity_command"],
-            perceived_ball_position,
+            relative_ball_position,
             ball_visible,
             clock_signal,
             self.internal_state["imu_orientation_rotation_inverse"].apply(np.array([0.0, 0.0, -1.0])),
