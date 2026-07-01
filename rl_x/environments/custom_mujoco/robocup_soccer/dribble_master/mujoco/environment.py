@@ -251,7 +251,7 @@ class DribbleMasterEnv(gym.Env):
             "ball_detection_azimuth": 0.0,
             "ball_detection_elevation": 0.0,
             "ball_detection_local_pos": np.zeros(3),
-            "previous_ball_distance_to_base": 0.0,
+            "previous_ball_distance_to_com": 0.0,
             "nr_collisions_in_nominal": 0,
             "info": {
                 "rollout/episode_return": 0.0,
@@ -522,7 +522,7 @@ class DribbleMasterEnv(gym.Env):
         self.handle_domain_randomization(is_episode_start=True)
         self.command_function.get_next_command()
         self.update_ball_sensing(reset_timer=True)
-        self.internal_state["previous_ball_distance_to_base"] = np.linalg.norm(self.ball_position_world()[:2] - self.base_position_world()[:2])
+        self.internal_state["previous_ball_distance_to_com"] = np.linalg.norm(self.ball_position_world()[:2] - self.robot_com_position_world()[:2])
         self.internal_state["info"]["env_curriculum/coefficient"] = self.internal_state["env_curriculum_coeff"]
 
         next_observation = self.get_observation(np.zeros(self.nr_actuator_joints))

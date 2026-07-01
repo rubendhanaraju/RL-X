@@ -509,7 +509,7 @@ class DribbleMasterEnv:
             "ball_detection_azimuth": 0.0,
             "ball_detection_elevation": 0.0,
             "ball_detection_local_pos": jnp.zeros(3),
-            "previous_ball_distance_to_base": 0.0,
+            "previous_ball_distance_to_com": 0.0,
             "nr_collisions_in_nominal": 0,
         }
         self.gait_manager_function.init(internal_state)
@@ -587,7 +587,7 @@ class DribbleMasterEnv:
         data, mjx_model = self.handle_domain_randomization(new_state.internal_state, mjx_model, data, domain_randomization_key, is_episode_start=True)
         self.command_function.get_next_command(new_state.internal_state, True, command_reset_key)
         self.update_ball_sensing(data, new_state.internal_state, new_state.info, True)
-        new_state.internal_state["previous_ball_distance_to_base"] = jnp.linalg.norm(self.ball_position_world(data)[:2] - self.base_position_world(data)[:2])
+        new_state.internal_state["previous_ball_distance_to_com"] = jnp.linalg.norm(self.ball_position_world(data)[:2] - self.robot_com_position_world(data)[:2])
         new_state.info["env_curriculum/coefficient"] = new_state.internal_state["env_curriculum_coeff"]
 
         next_observation = self.get_observation(data, mjx_model, new_state.internal_state, observation_key, jnp.zeros(self.nr_actuator_joints))
