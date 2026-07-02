@@ -50,7 +50,7 @@ class RandomDRInitialState:
         data = mujoco.MjData(self.env.internal_state["mj_model"])
         data.qpos = qpos
         data.qvel = qvel
-        data.ctrl = np.zeros(self.env.nr_actuator_joints)
+        data.ctrl = self.env.zero_ctrl()
         mujoco.mj_forward(self.env.internal_state["mj_model"], data)
         feet_x_pos = data.geom_xpos[self.env.foot_geom_indices, 0]
         feet_y_pos = data.geom_xpos[self.env.foot_geom_indices, 1]

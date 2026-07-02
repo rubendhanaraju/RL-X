@@ -11,6 +11,10 @@ def get_config(environment_name):
         "copy_train_env_for_eval": True,
         "train_robot": "booster_t1",
         "control_type": "pd",
+        "simulator": {
+            "model_source": "rcssservermj",
+            "rcssservermj_root": "/home/ruben/Documents/GitHub/rcssservermj",
+        },
         "training_stage": "stage_1",
         "command": {
             "type": "random_ball_velocity",
@@ -52,7 +56,7 @@ def get_config(environment_name):
                     "chasing_coeff": 2.0,
                     "progress_to_ball_coeff": 20.0,  #before 10
                     "progress_to_ball_clip": 0.05,
-                    "projected_ball_velocity_coeff": 0.0,
+                    "projected_ball_velocity_coeff": 0.2,
                     "yaw_alignment_coeff": 0.2,
                     "yaw_alignment_no_ball_coeff": -0.2,
                 },
@@ -250,7 +254,7 @@ def get_config(environment_name):
         },
         "add_goal_arrow": False,
         "timestep": 0.005,
-        "episode_length_in_seconds": 20,
+        "episode_length_in_seconds": 30,
     }
 
     return config_dict.ConfigDict(config)

@@ -11,6 +11,11 @@ def get_config(environment_name):
         "copy_train_env_for_eval": True,
         "train_robot": "booster_t1",
         "control_type": "pd",
+        "simulator": {
+            "model_source": "rcssservermj",
+            "rcssservermj_root": "/home/ruben/Documents/GitHub/rcssservermj",
+            "disable_nonfoot_contacts": True,
+        },
         "training_stage": "stage_1",
         "command": {
             "type": "random_point_velocity",
@@ -187,7 +192,7 @@ def get_config(environment_name):
         },
         "termination": {
             "type": "below_height",
-            "height_percentage_threshold": 0.6,
+            "height_percentage_threshold": 0.7,
         },
         "terrain": {
             "type": "plane",

@@ -22,8 +22,14 @@ class DefaultDRJointDropout:
         modified_actuator_gainprm = self.env.internal_state["partial_actuator_gainprm_without_dropout"] * self.env.internal_state["joint_dropout_mask"]
         modified_actuator_biasprm = self.env.internal_state["partial_actuator_biasprm_without_dropout"] * self.env.internal_state["joint_dropout_mask"].reshape(-1, 1)
 
-        self.env.internal_state["mj_model"].actuator_gainprm[:, 0] = modified_actuator_gainprm
-        self.env.internal_state["mj_model"].actuator_biasprm[:, 1:3] = modified_actuator_biasprm
+        if self.env.use_rcssservermj_model:
+            self.env.internal_state["mj_model"].actuator_gainprm[self.env.server_position_actuator_ids, 0] = modified_actuator_gainprm
+            self.env.internal_state["mj_model"].actuator_biasprm[self.env.server_position_actuator_ids, 1] = modified_actuator_biasprm[:, 0]
+            self.env.internal_state["mj_model"].actuator_gainprm[self.env.server_velocity_actuator_ids, 0] = -modified_actuator_biasprm[:, 1]
+            self.env.internal_state["mj_model"].actuator_biasprm[self.env.server_velocity_actuator_ids, 2] = modified_actuator_biasprm[:, 1]
+        else:
+            self.env.internal_state["mj_model"].actuator_gainprm[:, 0] = modified_actuator_gainprm
+            self.env.internal_state["mj_model"].actuator_biasprm[:, 1:3] = modified_actuator_biasprm
 
         locked_actuator_joint_ranges_min = self.env.internal_state["actuator_joint_nominal_positions"] - 0.001
         locked_actuator_joint_ranges_max = self.env.internal_state["actuator_joint_nominal_positions"] + 0.001

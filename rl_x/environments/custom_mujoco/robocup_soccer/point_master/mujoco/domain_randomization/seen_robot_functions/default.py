@@ -61,8 +61,12 @@ class DefaultDRSeenRobotFunction:
         self.default_joint_armatures = self.env.initial_mj_model.dof_armature[6:]
         self.default_joint_stiffnesses = self.env.initial_mj_model.jnt_stiffness[1:]
         self.default_joint_frictionlosses = self.env.initial_mj_model.dof_frictionloss[6:]
-        self.default_p_gain = -self.env.initial_mj_model.actuator_biasprm[0, 1]
-        self.default_d_gain = -self.env.initial_mj_model.actuator_biasprm[0, 2]
+        if self.env.use_rcssservermj_model:
+            self.default_p_gain = -self.env.initial_mj_model.actuator_biasprm[self.env.server_position_actuator_ids[0], 1]
+            self.default_d_gain = -self.env.initial_mj_model.actuator_biasprm[self.env.server_velocity_actuator_ids[0], 2]
+        else:
+            self.default_p_gain = -self.env.initial_mj_model.actuator_biasprm[0, 1]
+            self.default_d_gain = -self.env.initial_mj_model.actuator_biasprm[0, 2]
         self.default_scaling_factor = env.robot_config["scaling_factor"]
 
 
@@ -80,8 +84,15 @@ class DefaultDRSeenRobotFunction:
         self.env.internal_state["seen_p_gain"] = self.default_p_gain
         self.env.internal_state["seen_d_gain"] = self.default_d_gain
         self.env.internal_state["scaling_factor"] = self.default_scaling_factor
-        self.env.internal_state["partial_actuator_gainprm_without_dropout"] = self.env.initial_mj_model.actuator_gainprm[:, 0]
-        self.env.internal_state["partial_actuator_biasprm_without_dropout"] = self.env.initial_mj_model.actuator_biasprm[:, 1:3]
+        if self.env.use_rcssservermj_model:
+            self.env.internal_state["partial_actuator_gainprm_without_dropout"] = self.env.initial_mj_model.actuator_gainprm[self.env.server_position_actuator_ids, 0]
+            self.env.internal_state["partial_actuator_biasprm_without_dropout"] = np.stack([
+                self.env.initial_mj_model.actuator_biasprm[self.env.server_position_actuator_ids, 1],
+                self.env.initial_mj_model.actuator_biasprm[self.env.server_velocity_actuator_ids, 2],
+            ], axis=-1)
+        else:
+            self.env.internal_state["partial_actuator_gainprm_without_dropout"] = self.env.initial_mj_model.actuator_gainprm[:, 0]
+            self.env.internal_state["partial_actuator_biasprm_without_dropout"] = self.env.initial_mj_model.actuator_biasprm[:, 1:3]
         self.env.internal_state["robot_nominal_qpos_height_over_ground"] = self.env.initial_qpos[2]
         self.env.internal_state["robot_nominal_imu_height_over_ground"] = self.env.initial_imu_height
 
@@ -239,9 +250,15 @@ class DefaultDRSeenRobotFunction:
         self.env.internal_state["mj_model"].dof_armature[6:] = dof_armature
         self.env.internal_state["mj_model"].jnt_stiffness[1:] = jnt_stiffness
         self.env.internal_state["mj_model"].dof_frictionloss[6:] = dof_frictionloss
-        self.env.internal_state["mj_model"].actuator_gainprm[:, 0] = p_gain
-        self.env.internal_state["mj_model"].actuator_biasprm[:, 1] = -p_gain
-        self.env.internal_state["mj_model"].actuator_biasprm[:, 2] = -d_gain
+        if self.env.use_rcssservermj_model:
+            self.env.internal_state["mj_model"].actuator_gainprm[self.env.server_position_actuator_ids, 0] = p_gain
+            self.env.internal_state["mj_model"].actuator_biasprm[self.env.server_position_actuator_ids, 1] = -p_gain
+            self.env.internal_state["mj_model"].actuator_gainprm[self.env.server_velocity_actuator_ids, 0] = d_gain
+            self.env.internal_state["mj_model"].actuator_biasprm[self.env.server_velocity_actuator_ids, 2] = -d_gain
+        else:
+            self.env.internal_state["mj_model"].actuator_gainprm[:, 0] = p_gain
+            self.env.internal_state["mj_model"].actuator_biasprm[:, 1] = -p_gain
+            self.env.internal_state["mj_model"].actuator_biasprm[:, 2] = -d_gain
 
         self.env.internal_state["seen_body_masses"] = seen_body_masses
         self.env.internal_state["seen_body_inertias"] = seen_inertias
@@ -257,8 +274,15 @@ class DefaultDRSeenRobotFunction:
         self.env.internal_state["seen_p_gain"] = seen_p_gain
         self.env.internal_state["seen_d_gain"] = seen_d_gain
         self.env.internal_state["scaling_factor"] = scaling_factor
-        self.env.internal_state["partial_actuator_gainprm_without_dropout"] = self.env.internal_state["mj_model"].actuator_gainprm[:, 0]
-        self.env.internal_state["partial_actuator_biasprm_without_dropout"] = self.env.internal_state["mj_model"].actuator_biasprm[:, 1:3]
+        if self.env.use_rcssservermj_model:
+            self.env.internal_state["partial_actuator_gainprm_without_dropout"] = self.env.internal_state["mj_model"].actuator_gainprm[self.env.server_position_actuator_ids, 0]
+            self.env.internal_state["partial_actuator_biasprm_without_dropout"] = np.stack([
+                self.env.internal_state["mj_model"].actuator_biasprm[self.env.server_position_actuator_ids, 1],
+                self.env.internal_state["mj_model"].actuator_biasprm[self.env.server_velocity_actuator_ids, 2],
+            ], axis=-1)
+        else:
+            self.env.internal_state["partial_actuator_gainprm_without_dropout"] = self.env.internal_state["mj_model"].actuator_gainprm[:, 0]
+            self.env.internal_state["partial_actuator_biasprm_without_dropout"] = self.env.internal_state["mj_model"].actuator_biasprm[:, 1:3]
 
         qpos = self.env.initial_qpos.copy()
         qpos[self.env.actuator_joint_mask_qpos] = self.env.internal_state["actuator_joint_nominal_positions"]
@@ -267,7 +291,7 @@ class DefaultDRSeenRobotFunction:
         data = mujoco.MjData(self.env.internal_state["mj_model"])
         data.qpos = qpos
         data.qvel = qvel
-        data.ctrl = np.zeros(self.env.nr_actuator_joints)
+        data.ctrl = self.env.zero_ctrl()
         mujoco.mj_forward(self.env.internal_state["mj_model"], data)
         min_feet_z_pos = np.min(data.geom_xpos[self.env.foot_geom_indices, 2])
         offset = self.env.internal_state["center_height"] - min_feet_z_pos

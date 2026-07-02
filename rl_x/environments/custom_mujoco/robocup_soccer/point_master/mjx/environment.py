@@ -30,6 +30,15 @@ from rl_x.environments.custom_mujoco.robocup_soccer.point_master.mjx.domain_rand
 from rl_x.environments.custom_mujoco.robocup_soccer.point_master.mjx.domain_randomization.joint_dropout_functions.handler import get_joint_dropout_function
 from rl_x.environments.custom_mujoco.robocup_soccer.point_master.mjx.exteroceptive_observation_functions.handler import get_exteroceptive_observation_function
 from rl_x.environments.custom_mujoco.robocup_soccer.point_master.mjx.terrain_functions.handler import get_terrain_function
+from rl_x.environments.custom_mujoco.robocup_soccer.rcssservermj_model import (
+    build_rcssservermj_xml,
+    home_qpos_from_model,
+    server_actuator_triplet_ids,
+    server_joint_names_from_position_actuators,
+    server_position_actuator_ids,
+    set_server_pd_gains,
+    uses_rcssservermj_model,
+)
 
 
 class PointMasterEnv:
@@ -50,38 +59,50 @@ class PointMasterEnv:
         self.update_env_curriculum = bool(self.stage_config["update_env_curriculum"])
         self.spawn_point_in_heading_cone = bool(self.stage_config["spawn_in_heading_cone"])
         self.point_spawn_half_angle = np.deg2rad(float(self.stage_config["spawn_half_angle_degrees"]))
+        self.use_rcssservermj_model = uses_rcssservermj_model(env_config)
+        self.root_body_name = "torso" if self.use_rcssservermj_model else "trunk"
+        self.imu_site_name = "torso" if self.use_rcssservermj_model else "imu"
+        self.floor_geom_name = "pitch" if self.use_rcssservermj_model else "floor"
+        self.imu_angular_velocity_sensor_name = "torso_gyro" if self.use_rcssservermj_model else "imu_angular_velocity"
+        self.imu_linear_velocity_sensor_name = "torso_linear_velocity" if self.use_rcssservermj_model else "imu_linear_velocity"
 
-        xml_path = (self.robot_config["directory_path"] / "data" / "plane.xml").as_posix()
-        xml_handle = mjcf.from_path(xml_path)
-        self._add_point_to_xml(xml_handle)
+        if self.use_rcssservermj_model:
+            xml_handle = build_rcssservermj_xml(env_config, object_type="point")
+        else:
+            xml_path = (self.robot_config["directory_path"] / "data" / "plane.xml").as_posix()
+            xml_handle = mjcf.from_path(xml_path)
+            self._add_point_to_xml(xml_handle)
 
         # Remove all unnecessary assets, materials, meshes and geoms during training
         # This removes all geoms besides feet and floor, if the contacts for other geoms should be enabled this needs to be changed
         # Also if you want to render the training, the lines can be commented out
-        for texture in xml_handle.asset.find_all("texture"):
-            texture.remove()
-        for material in xml_handle.asset.find_all("material"):
-            material.remove()
-        for mesh in xml_handle.asset.find_all("mesh"):
-            mesh.remove()
-        for geom in xml_handle.find_all("geom"):
-            is_foot_geom = geom.name and "foot" in geom.name
-            is_floor_geom = geom.name == "floor"
-            is_point_geom = geom.name == "point"
-            is_reward_collision_sphere_geom = geom.dclass and geom.dclass.dclass == "reward_collision_sphere"
-            if not is_foot_geom and not is_floor_geom and not is_point_geom and not is_reward_collision_sphere_geom:
-                geom.remove()
-            if is_floor_geom:
-                geom.material = ""
+        if not self.use_rcssservermj_model:
+            for texture in xml_handle.asset.find_all("texture"):
+                texture.remove()
+            for material in xml_handle.asset.find_all("material"):
+                material.remove()
+            for mesh in xml_handle.asset.find_all("mesh"):
+                mesh.remove()
+            for geom in xml_handle.find_all("geom"):
+                is_foot_geom = geom.name and "foot" in geom.name
+                is_floor_geom = geom.name == "floor"
+                is_point_geom = geom.name == "point"
+                is_reward_collision_sphere_geom = geom.dclass and geom.dclass.dclass == "reward_collision_sphere"
+                if not is_foot_geom and not is_floor_geom and not is_point_geom and not is_reward_collision_sphere_geom:
+                    geom.remove()
+                if is_floor_geom:
+                    geom.material = ""
 
         if "hfield" in env_config["terrain"]["type"]:
+            if self.use_rcssservermj_model:
+                raise ValueError("rcssservermj model source currently supports only plane terrain.")
             xml_handle.asset.insert("hfield", 0, name="empty_hfield", file="default_hfield_80.png", size="4 4 30.0 0.125")
             floor = xml_handle.find("geom", "floor")
             floor.type = "hfield"
             floor.hfield = "empty_hfield"
         
         if self.should_render and self.add_goal_arrow:
-            trunk = xml_handle.find("body", "trunk")
+            trunk = xml_handle.find("body", self.root_body_name)
             trunk.add("body", name="dir_arrow", pos="0 0 0.15")
             dir_vec = xml_handle.find("body", "dir_arrow")
             dir_vec.add("site", name="dir_arrow_point", type="sphere", size=".02", pos="-.1 0 0")
@@ -89,6 +110,22 @@ class PointMasterEnv:
         
         self.initial_mj_model = mujoco.MjModel.from_xml_string(xml=xml_handle.to_xml_string(), assets=xml_handle.get_assets())
         self.initial_mj_model.opt.timestep = env_config["timestep"]
+        if self.use_rcssservermj_model:
+            self.server_position_actuator_ids_np = server_position_actuator_ids(self.initial_mj_model)
+            (
+                server_torque_actuator_ids_np,
+                server_position_actuator_ids_np,
+                server_velocity_actuator_ids_np,
+            ) = server_actuator_triplet_ids(self.initial_mj_model, self.server_position_actuator_ids_np)
+            set_server_pd_gains(self.initial_mj_model, server_position_actuator_ids_np)
+            self.server_torque_actuator_ids = jnp.array(server_torque_actuator_ids_np)
+            self.server_position_actuator_ids = jnp.array(server_position_actuator_ids_np)
+            self.server_velocity_actuator_ids = jnp.array(server_velocity_actuator_ids_np)
+        else:
+            self.server_position_actuator_ids_np = np.array([], dtype=int)
+            self.server_torque_actuator_ids = jnp.array([], dtype=jnp.int32)
+            self.server_position_actuator_ids = jnp.array([], dtype=jnp.int32)
+            self.server_velocity_actuator_ids = jnp.array([], dtype=jnp.int32)
         self.point_body_id = mujoco.mj_name2id(self.initial_mj_model, mujoco.mjtObj.mjOBJ_BODY, "point")
         self.point_geom_id = mujoco.mj_name2id(self.initial_mj_model, mujoco.mjtObj.mjOBJ_GEOM, "point")
         self.point_joint_id = mujoco.mj_name2id(self.initial_mj_model, mujoco.mjtObj.mjOBJ_JOINT, "point-root")
@@ -98,7 +135,7 @@ class PointMasterEnv:
         self.point_spawn_radius = float(self.stage_config["point_spawn_radius"])
         self.point_spawn_radius_min = float(self.stage_config.get("point_spawn_radius_min", self.point_spawn_radius))
         self.curriculum_point_spawn_radius = bool(self.stage_config.get("curriculum_point_spawn_radius", False))
-        self.home_qpos = self.initial_mj_model.keyframe("home").qpos.copy()
+        self.home_qpos = home_qpos_from_model(self.initial_mj_model) if self.use_rcssservermj_model else self.initial_mj_model.keyframe("home").qpos.copy()
         self.home_qpos[self.point_qposadr:self.point_qposadr + 7] = np.array([self.point_spawn_radius, 0.0, self.point_radius, 1.0, 0.0, 0.0, 0.0])
         self.data = mujoco.MjData(self.initial_mj_model)
         self.initial_mjx_model = mjx.put_model(self.initial_mj_model)
@@ -109,13 +146,16 @@ class PointMasterEnv:
         self.c_data.qpos = self.home_qpos
         mujoco.mj_forward(self.c_model, self.c_data)
         
-        self.imu_site_id = mujoco.mj_name2id(self.initial_mj_model, mujoco.mjtObj.mjOBJ_SITE, "imu")
-        self.trunk_body_id = mujoco.mj_name2id(self.initial_mj_model, mujoco.mjtObj.mjOBJ_BODY, "trunk")
+        self.imu_site_id = mujoco.mj_name2id(self.initial_mj_model, mujoco.mjtObj.mjOBJ_SITE, self.imu_site_name)
+        self.trunk_body_id = mujoco.mj_name2id(self.initial_mj_model, mujoco.mjtObj.mjOBJ_BODY, self.root_body_name)
         self.actuator_joint_max_velocities = jnp.array(robot_config["actuator_joint_max_velocities"])
         self.initial_qpos = jnp.array(self.home_qpos)
         self.initial_imu_orientation_rotation_inverse = Rotation.from_matrix(self.c_data.site_xmat[self.imu_site_id].reshape(3, 3)).inv()
         self.initial_imu_height = self.c_data.site_xpos[self.imu_site_id, 2]
-        self.actuator_joint_names = [mujoco.mj_id2name(self.initial_mj_model, mujoco.mjtObj.mjOBJ_JOINT, actuator_trnid[0]) for actuator_trnid in self.initial_mj_model.actuator_trnid]
+        if self.use_rcssservermj_model:
+            self.actuator_joint_names = server_joint_names_from_position_actuators(self.initial_mj_model, self.server_position_actuator_ids_np)
+        else:
+            self.actuator_joint_names = [mujoco.mj_id2name(self.initial_mj_model, mujoco.mjtObj.mjOBJ_JOINT, actuator_trnid[0]) for actuator_trnid in self.initial_mj_model.actuator_trnid]
         self.actuator_joint_mask_joints = jnp.array([self.initial_mj_model.joint(joint_name).id for joint_name in self.actuator_joint_names])
         self.actuator_joint_mask_qpos = jnp.array([self.initial_mj_model.joint(joint_name).qposadr[0] for joint_name in self.actuator_joint_names])
         self.actuator_joint_mask_qvel = jnp.array([self.initial_mj_model.joint(joint_name).dofadr[0] for joint_name in self.actuator_joint_names])
@@ -147,10 +187,10 @@ class PointMasterEnv:
             if joint_name.startswith("Right_") and any(part in joint_name for part in ("Hip", "Knee", "Ankle"))
         ], dtype=jnp.int32)
 
-        imu_angular_velocity_sensor_id = self.initial_mj_model.sensor("imu_angular_velocity").id
+        imu_angular_velocity_sensor_id = self.initial_mj_model.sensor(self.imu_angular_velocity_sensor_name).id
         self.imu_angular_velocity_sensor_adr = self.initial_mj_model.sensor_adr[imu_angular_velocity_sensor_id]
         self.imu_angular_velocity_sensor_dim = self.initial_mj_model.sensor_dim[imu_angular_velocity_sensor_id]
-        imu_linear_velocity_sensor_id = self.initial_mj_model.sensor("imu_linear_velocity").id
+        imu_linear_velocity_sensor_id = self.initial_mj_model.sensor(self.imu_linear_velocity_sensor_name).id
         self.imu_linear_velocity_sensor_adr = self.initial_mj_model.sensor_adr[imu_linear_velocity_sensor_id]
         self.imu_linear_velocity_sensor_dim = self.initial_mj_model.sensor_dim[imu_linear_velocity_sensor_id]
 
@@ -183,9 +223,11 @@ class PointMasterEnv:
         self.body_ids_of_actuator_joints = jnp.array([self.initial_mj_model.joint(joint_name).bodyid[0] for joint_name in self.actuator_joint_names])
         self.actuator_joint_nr_direct_child_actuator_joints = body_to_children_count[self.body_ids_of_actuator_joints]
 
-        self.floor_geom_id = mujoco.mj_name2id(self.initial_mj_model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        self.floor_geom_id = mujoco.mj_name2id(self.initial_mj_model, mujoco.mjtObj.mjOBJ_GEOM, self.floor_geom_name)
 
-        self.reward_collision_sphere_geom_ids = jnp.array([geom.id for geom in [self.initial_mj_model.geom(geom_id) for geom_id in range(self.initial_mj_model.ngeom)] if geom.group[0] == 5])
+        self.reward_collision_sphere_geom_ids = jnp.array([geom.id for geom in [self.initial_mj_model.geom(geom_id) for geom_id in range(self.initial_mj_model.ngeom)] if geom.group[0] == 5], dtype=jnp.int32)
+        self.privileged_nonfoot_robot_geom_ids = jnp.array(self.get_nonfoot_robot_geom_ids_or_sentinel(), dtype=jnp.int32)
+        self.privileged_contact_obs_size = 1
 
         self.has_equality_constraints = len(self.initial_mj_model.eq_data) > 0
 
@@ -258,6 +300,53 @@ class PointMasterEnv:
         point.add("geom", name="point", type="sphere", size="0.05", mass="0.01", contype="0", conaffinity="0", rgba="0.1 0.8 1.0 1")
 
 
+    def zero_ctrl(self):
+        return jnp.zeros(self.initial_mjx_model.nu)
+
+
+    def target_joint_positions_to_ctrl(self, target_joint_positions):
+        if not self.use_rcssservermj_model:
+            return target_joint_positions
+
+        return self.zero_ctrl().at[self.server_position_actuator_ids].set(target_joint_positions)
+
+
+    def get_nonfoot_robot_geom_ids_or_sentinel(self):
+        excluded_geom_ids = set([int(self.floor_geom_id), int(self.point_geom_id)])
+        excluded_geom_ids.update(int(geom_id) for geom_id in np.asarray(self.foot_geom_indices))
+        geom_ids = [
+            geom_id for geom_id in range(self.initial_mj_model.ngeom)
+            if geom_id not in excluded_geom_ids
+            and self.initial_mj_model.geom_bodyid[geom_id] != 0
+            and (
+                self.initial_mj_model.geom_contype[geom_id] != 0
+                or self.initial_mj_model.geom_conaffinity[geom_id] != 0
+            )
+        ]
+        return np.asarray(geom_ids if geom_ids else [-1], dtype=np.int32)
+
+
+    def contact_between_geoms(self, data, geom_ids_a, geom_ids_b):
+        contact_geom = data._impl.contact.geom
+        geom1 = contact_geom[:, 0]
+        geom2 = contact_geom[:, 1]
+        active_contact = data._impl.contact.dist < 0.0
+        geom1_in_a = jnp.any(geom1[:, None] == geom_ids_a[None, :], axis=1)
+        geom2_in_b = jnp.any(geom2[:, None] == geom_ids_b[None, :], axis=1)
+        geom1_in_b = jnp.any(geom1[:, None] == geom_ids_b[None, :], axis=1)
+        geom2_in_a = jnp.any(geom2[:, None] == geom_ids_a[None, :], axis=1)
+        return jnp.any(active_contact & ((geom1_in_a & geom2_in_b) | (geom1_in_b & geom2_in_a))).astype(jnp.float32)
+
+
+    def privileged_contact_observation(self, data):
+        nonfoot_floor_contact = self.contact_between_geoms(
+            data,
+            self.privileged_nonfoot_robot_geom_ids,
+            jnp.array([self.floor_geom_id], dtype=jnp.int32),
+        )
+        return jnp.array([nonfoot_floor_contact])
+
+
     def root_yaw_from_qpos(self, qpos):
         w, x, y, z = qpos[3], qpos[4], qpos[5], qpos[6]
         return jnp.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
@@ -309,17 +398,49 @@ class PointMasterEnv:
         ])
 
 
-    def relative_point_position_base(self, data, internal_state):
+    def trunc2(self, value):
+        return jnp.trunc(jnp.asarray(value) * 100.0) / 100.0
+
+
+    def trunc3(self, value):
+        return jnp.trunc(jnp.asarray(value) * 1000.0) / 1000.0
+
+
+    def server_joint_position(self, value):
+        return jnp.deg2rad(self.trunc2(jnp.rad2deg(value)))
+
+
+    def server_joint_velocity(self, value):
+        return jnp.deg2rad(self.trunc2(jnp.rad2deg(value)))
+
+
+    def server_imu_angular_velocity(self, value):
+        return jnp.deg2rad(self.trunc2(jnp.rad2deg(value)))
+
+
+    def server_base_position_world(self, data):
+        return self.trunc3(self.base_position_world(data))
+
+
+    def server_base_rotation(self, data):
+        quat_wxyz = self.trunc3(data.qpos[3:7])
+        return Rotation.from_quat(jnp.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]]))
+
+
+    def relative_point_position_base(self, data, internal_state, base_pos=None, base_yaw=None):
         point_pos = self.point_position_world(data)
-        base_pos = self.base_position_world(data)
-        point_rel_base_xy = self.rotate_world_to_base_xy(point_pos[:2] - base_pos[:2], internal_state["imu_orientation_euler"][2])
+        base_pos = self.base_position_world(data) if base_pos is None else base_pos
+        base_yaw = internal_state["imu_orientation_euler"][2] if base_yaw is None else base_yaw
+        point_rel_base_xy = self.rotate_world_to_base_xy(point_pos[:2] - base_pos[:2], base_yaw)
         return jnp.concatenate([point_rel_base_xy, point_pos[2:3] - base_pos[2:3]])
 
 
     def update_point_sensing(self, data, internal_state, info, reset_timer):
-        info["env_info/point_xy_distance_to_com"] = jnp.linalg.norm(
-            self.point_position_world(data)[:2] - self.robot_com_position_world(data)[:2]
+        point_xy_distance_to_base = jnp.linalg.norm(
+            self.point_position_world(data)[:2] - self.base_position_world(data)[:2]
         )
+        info["env_info/point_xy_distance_to_base"] = point_xy_distance_to_base
+        info["env_info/point_xy_distance_to_com"] = point_xy_distance_to_base
 
     
     def render(self, state):
@@ -412,6 +533,7 @@ class PointMasterEnv:
             "joint_dropout_mask": jnp.ones(self.nr_actuator_joints, dtype=bool),
             "robot_dimensions_mean": self.robot_dimensions_mean,
             "max_point_velocity": self.command_function.max_point_velocity,
+            "previous_point_distance_to_base": 0.0,
             "previous_point_distance_to_com": 0.0,
             "nr_collisions_in_nominal": 0,
         }
@@ -475,7 +597,7 @@ class PointMasterEnv:
         data = self.mjx_data
         qpos, qvel = self.initial_state_function.setup(mjx_model, new_state.internal_state, initial_state_key)
         qpos, qvel = self.sample_point_reset(qpos, qvel, new_state.internal_state, point_reset_key)
-        data = data.replace(qpos=qpos, qvel=qvel, ctrl=jnp.zeros(self.nr_actuator_joints))
+        data = data.replace(qpos=qpos, qvel=qvel, ctrl=self.zero_ctrl())
         data = mjx.forward(mjx_model, data)
 
         new_state.internal_state["imu_orientation_rotation"] = Rotation.from_matrix(data.site_xmat[self.imu_site_id].reshape(3, 3))
@@ -489,7 +611,9 @@ class PointMasterEnv:
         data, mjx_model = self.handle_domain_randomization(new_state.internal_state, mjx_model, data, domain_randomization_key, is_episode_start=True)
         self.command_function.get_next_command(new_state.internal_state, True, command_reset_key)
         self.update_point_sensing(data, new_state.internal_state, new_state.info, True)
-        new_state.internal_state["previous_point_distance_to_com"] = jnp.linalg.norm(self.point_position_world(data)[:2] - self.robot_com_position_world(data)[:2])
+        previous_point_distance_to_base = jnp.linalg.norm(self.point_position_world(data)[:2] - self.base_position_world(data)[:2])
+        new_state.internal_state["previous_point_distance_to_base"] = previous_point_distance_to_base
+        new_state.internal_state["previous_point_distance_to_com"] = previous_point_distance_to_base
         new_state.info["env_curriculum/coefficient"] = new_state.internal_state["env_curriculum_coeff"]
 
         next_observation = self.get_observation(data, mjx_model, new_state.internal_state, observation_key, jnp.zeros(self.nr_actuator_joints))
@@ -531,7 +655,7 @@ class PointMasterEnv:
         target_joint_positions = self.control_function.process_action(delayed_action, state.internal_state)
 
         data, _ = jax.lax.scan(
-            f=lambda data, _: (mjx.step(state.mjx_model, data.replace(ctrl=target_joint_positions)), None),
+            f=lambda data, _: (mjx.step(state.mjx_model, data.replace(ctrl=self.target_joint_positions_to_ctrl(target_joint_positions))), None),
             init=state.data,
             xs=(),
             length=self.nr_substeps,
@@ -594,19 +718,23 @@ class PointMasterEnv:
 
 
     def get_observation(self, data, mjx_model, internal_state, key, action):
-        current_imu_angular_velocity = data.sensordata[self.imu_angular_velocity_sensor_adr:self.imu_angular_velocity_sensor_adr + self.imu_angular_velocity_sensor_dim]
+        current_imu_angular_velocity = self.server_imu_angular_velocity(
+            data.sensordata[self.imu_angular_velocity_sensor_adr:self.imu_angular_velocity_sensor_adr + self.imu_angular_velocity_sensor_dim]
+        )
         point_pos_world = self.point_position_world(data)
         point_vel_world = self.point_velocity_world(data)
-        base_pos_world = self.base_position_world(data)
-        base_yaw = internal_state["imu_orientation_euler"][2]
+        base_pos_world = self.server_base_position_world(data)
+        base_rotation = self.server_base_rotation(data)
+        base_euler = base_rotation.as_euler("xyz")
+        base_yaw = base_euler[2]
         base_yaw_rate = current_imu_angular_velocity[2]
-        body_orientation = jnp.array([base_yaw, internal_state["imu_orientation_euler"][0], internal_state["imu_orientation_euler"][1]])
-        relative_point_position = self.relative_point_position_base(data, internal_state)
+        body_orientation = jnp.array([base_yaw, base_euler[0], base_euler[1]])
+        relative_point_position = self.relative_point_position_base(data, internal_state, base_pos_world, base_yaw)
         clock_signal = self.gait_manager_function.get_phase_features(internal_state)[:2]
 
         observation = jnp.concatenate([
-            data.qpos[self.actuator_joint_mask_qpos],
-            data.qvel[self.actuator_joint_mask_qvel],
+            self.server_joint_position(data.qpos[self.actuator_joint_mask_qpos]),
+            self.server_joint_velocity(data.qvel[self.actuator_joint_mask_qvel]),
             action,
             self.terrain_function.check_feet_floor_contact(data),
             internal_state["feet_time_on_ground"],
@@ -617,9 +745,10 @@ class PointMasterEnv:
             internal_state["point_velocity_command"],
             relative_point_position,
             clock_signal,
-            internal_state["imu_orientation_rotation_inverse"].apply(jnp.array([0.0, 0.0, -1.0])),
+            base_rotation.inv().apply(jnp.array([0.0, 0.0, -1.0])),
             jnp.array([self.policy_exteroceptive_observation_function.get_exteroceptive_observation(data, mjx_model, internal_state)]).reshape(-1),
             jnp.array([self.critic_exteroceptive_observation_function.get_exteroceptive_observation(data, mjx_model, internal_state)]).reshape(-1),
+            self.privileged_contact_observation(data),
             point_pos_world,
             point_vel_world,
             base_pos_world,
@@ -645,6 +774,7 @@ class PointMasterEnv:
             observation = observation.at[self.policy_exteroception_obs_idx].set(jnp.clip((observation[self.policy_exteroception_obs_idx] / (10.0 / 2)) - 1.0, -1.0, 1.0))
         if len(self.critic_exteroception_obs_idx) > 0:
             observation = observation.at[self.critic_exteroception_obs_idx].set(jnp.clip((observation[self.critic_exteroception_obs_idx] / (10.0 / 2)) - 1.0, -1.0, 1.0))
+        observation = observation.at[self.privileged_contact_obs_idx].set((observation[self.privileged_contact_obs_idx] / 0.5) - 1.0)
         observation = observation.at[self.point_position_world_obs_idx].set(jnp.clip(observation[self.point_position_world_obs_idx] / self.point_spawn_radius, -1.0, 1.0))
         observation = observation.at[self.point_velocity_world_obs_idx].set(jnp.clip(observation[self.point_velocity_world_obs_idx] / internal_state["max_point_velocity"], -1.0, 1.0))
         observation = observation.at[self.base_position_world_obs_idx].set(jnp.clip(observation[self.base_position_world_obs_idx] / self.point_spawn_radius, -1.0, 1.0))
@@ -712,6 +842,8 @@ class PointMasterEnv:
         current_observation_idx += self.policy_exteroceptive_observation_function.nr_exteroceptive_observations
         self.critic_exteroception_obs_idx = jnp.array([current_observation_idx + i for i in range(self.critic_exteroceptive_observation_function.nr_exteroceptive_observations)])
         current_observation_idx += self.critic_exteroceptive_observation_function.nr_exteroceptive_observations
+        self.privileged_contact_obs_idx = jnp.array([current_observation_idx + i for i in range(self.privileged_contact_obs_size)])
+        current_observation_idx += self.privileged_contact_obs_size
         self.point_position_world_obs_idx = jnp.array([current_observation_idx + i for i in range(3)])
         current_observation_idx += 3
         self.point_velocity_world_obs_idx = jnp.array([current_observation_idx + i for i in range(3)])
@@ -750,6 +882,7 @@ class PointMasterEnv:
             self.clock_signal_obs_idx,
             self.gravity_vector_obs_idx,
             self.critic_exteroception_obs_idx,
+            self.privileged_contact_obs_idx,
             self.point_position_world_obs_idx,
             self.point_velocity_world_obs_idx,
             self.base_position_world_obs_idx,

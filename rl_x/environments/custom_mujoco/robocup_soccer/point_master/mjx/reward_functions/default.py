@@ -75,7 +75,9 @@ class DefaultReward:
         actuator_torques = jnp.abs(data.qfrc_actuator[self.env.actuator_joint_mask_qvel])
         internal_state["left_abs_torque_integral"] = internal_state["left_abs_torque_integral"] + jnp.sum(actuator_torques[self.env.left_leg_actuator_indices]) * self.env.dt
         internal_state["right_abs_torque_integral"] = internal_state["right_abs_torque_integral"] + jnp.sum(actuator_torques[self.env.right_leg_actuator_indices]) * self.env.dt
-        internal_state["previous_point_distance_to_com"] = jnp.linalg.norm(self.env.point_position_world(data)[:2] - self.env.robot_com_position_world(data)[:2])
+        previous_point_distance_to_base = jnp.linalg.norm(self.env.point_position_world(data)[:2] - self.env.base_position_world(data)[:2])
+        internal_state["previous_point_distance_to_base"] = previous_point_distance_to_base
+        internal_state["previous_point_distance_to_com"] = previous_point_distance_to_base
 
 
     def wrap_to_pi(self, angle):
@@ -116,7 +118,6 @@ class DefaultReward:
         point_pos_world = self.env.point_position_world(data)
         point_vel_world = self.env.point_velocity_world(data)
         base_pos_world = self.env.base_position_world(data)
-        com_pos_world = self.env.robot_com_position_world(data)
         base_yaw = internal_state["imu_orientation_euler"][2]
         point_velocity_command_xy = internal_state["point_velocity_command"]
 
@@ -178,13 +179,13 @@ class DefaultReward:
         bad_collisions = jnp.maximum(nr_collision_sphere_overlaps - internal_state["nr_collisions_in_nominal"], 0)
         collision_reward = internal_state["env_curriculum_coeff"] * self.collision_coeff * -bad_collisions
 
-        point_com_distance = jnp.linalg.norm(point_pos_world[:2] - com_pos_world[:2])
-        previous_point_distance_to_com = internal_state["previous_point_distance_to_com"]
-        point_distance_to_com = point_com_distance
-        point_reached_now = point_distance_to_com <= self.point_reached_radius
+        point_base_distance = jnp.linalg.norm(point_pos_world[:2] - base_pos_world[:2])
+        previous_point_distance_to_base = internal_state["previous_point_distance_to_base"]
+        point_distance_to_base = point_base_distance
+        point_reached_now = point_distance_to_base <= self.point_reached_radius
         point_reached = internal_state["point_reached"] | point_reached_now
         internal_state["point_reached"] = point_reached
-        point_distance_progress = previous_point_distance_to_com - point_distance_to_com
+        point_distance_progress = previous_point_distance_to_base - point_distance_to_base
         clipped_point_distance_progress = jnp.clip(point_distance_progress, -self.progress_to_point_clip, self.progress_to_point_clip)
         upright_progress_gate = (1.0 - below_height.astype(jnp.float32)) * jnp.exp(-jnp.abs(roll_pitch_squared))
         progress_to_point_reward = self.progress_to_point_coeff * clipped_point_distance_progress * upright_progress_gate
@@ -201,6 +202,7 @@ class DefaultReward:
         point_yaw_error = self.wrap_to_pi(point_yaw - base_yaw)
         command_yaw_error = self.wrap_to_pi(command_yaw - base_yaw)
         point_command_alignment_error = self.wrap_to_pi(point_yaw - command_yaw)
+        yaw_alignment_error = jnp.sqrt(jnp.square(point_yaw_error) + jnp.square(command_yaw_error))
 
         reward = base_orientation_reward + feet_orientation_reward + feet_distance_reward + feet_clearance_reward + termination_reward + \
                  reference_joint_position_reward + symmetric_action_reward + joint_torque_reward + joint_speed_reward + action_smoothness_reward + \
@@ -231,7 +233,8 @@ class DefaultReward:
         info["env_info/point_reached_radius"] = self.point_reached_radius
         info["env_info/point_distance_progress"] = point_distance_progress
         info["env_info/clipped_point_distance_progress"] = clipped_point_distance_progress
-        info["env_info/previous_point_distance_to_com"] = previous_point_distance_to_com
+        info["env_info/previous_point_distance_to_base"] = previous_point_distance_to_base
+        info["env_info/previous_point_distance_to_com"] = previous_point_distance_to_base
         info["env_info/upright_progress_gate"] = upright_progress_gate
         info["reward/yaw_alignment"] = yaw_alignment_reward
         info["env_info/point_command_speed"] = command_speed
@@ -241,9 +244,17 @@ class DefaultReward:
         info["env_info/point_command_yaw_error"] = command_yaw_error
         info["env_info/point_command_alignment_error"] = point_command_alignment_error
         info["env_info/point_command_alignment_cos"] = jnp.cos(point_command_alignment_error)
+        info["env_info/yaw_to_point_error"] = point_yaw_error
+        info["env_info/yaw_to_command_error"] = command_yaw_error
+        info["env_info/yaw_alignment_error"] = yaw_alignment_error
+        info["env_info/abs_yaw_to_point_error"] = jnp.abs(point_yaw_error)
+        info["env_info/abs_yaw_to_command_error"] = jnp.abs(command_yaw_error)
+        info["env_info/abs_yaw_alignment_error"] = jnp.abs(yaw_alignment_error)
         info["reward/total"] = reward
-        info["env_info/point_xy_distance_to_com"] = point_distance_to_com
-        info["env_info/point_distance_to_com"] = jnp.linalg.norm(point_pos_world - com_pos_world)
+        info["env_info/point_xy_distance_to_base"] = point_distance_to_base
+        info["env_info/point_distance_to_base"] = jnp.linalg.norm(point_pos_world - base_pos_world)
+        info["env_info/point_xy_distance_to_com"] = point_distance_to_base
+        info["env_info/point_distance_to_com"] = jnp.linalg.norm(point_pos_world - base_pos_world)
         info["env_info/point_speed"] = jnp.linalg.norm(point_vel_world[:2])
         info["env_info/base_yaw"] = base_yaw
         info["env_info/base_yaw_rate"] = base_yaw_rate

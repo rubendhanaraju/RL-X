@@ -77,7 +77,9 @@ class DefaultReward:
         actuator_torques = jnp.abs(data.qfrc_actuator[self.env.actuator_joint_mask_qvel])
         internal_state["left_abs_torque_integral"] = internal_state["left_abs_torque_integral"] + jnp.sum(actuator_torques[self.env.left_leg_actuator_indices]) * self.env.dt
         internal_state["right_abs_torque_integral"] = internal_state["right_abs_torque_integral"] + jnp.sum(actuator_torques[self.env.right_leg_actuator_indices]) * self.env.dt
-        internal_state["previous_ball_distance_to_com"] = jnp.linalg.norm(self.env.ball_position_world(data)[:2] - self.env.robot_com_position_world(data)[:2])
+        previous_ball_distance_to_base = jnp.linalg.norm(self.env.ball_position_world(data)[:2] - self.env.base_position_world(data)[:2])
+        internal_state["previous_ball_distance_to_base"] = previous_ball_distance_to_base
+        internal_state["previous_ball_distance_to_com"] = previous_ball_distance_to_base
 
 
     def wrap_to_pi(self, angle):
@@ -118,7 +120,6 @@ class DefaultReward:
         ball_pos_world = self.env.ball_position_world(data)
         ball_vel_world = self.env.ball_velocity_world(data)
         base_pos_world = self.env.base_position_world(data)
-        com_pos_world = self.env.robot_com_position_world(data)
         base_yaw = internal_state["imu_orientation_euler"][2]
         ball_velocity_command_xy = internal_state["ball_velocity_command"]
         ball_visible = jnp.asarray(internal_state["ball_visible"], dtype=jnp.float32)
@@ -183,11 +184,11 @@ class DefaultReward:
 
         active_sensing_reward = self.active_sensing_coeff * ball_visible
 
-        ball_com_distance = jnp.linalg.norm(ball_pos_world[:2] - com_pos_world[:2])
-        chasing_reward = self.chasing_coeff * jnp.exp(-2.0 * jnp.square(ball_com_distance))
-        previous_ball_distance_to_com = internal_state["previous_ball_distance_to_com"]
-        ball_distance_to_com = ball_com_distance
-        ball_distance_progress = previous_ball_distance_to_com - ball_distance_to_com
+        ball_base_distance = jnp.linalg.norm(ball_pos_world[:2] - base_pos_world[:2])
+        chasing_reward = self.chasing_coeff * jnp.exp(-2.0 * jnp.square(ball_base_distance))
+        previous_ball_distance_to_base = internal_state["previous_ball_distance_to_base"]
+        ball_distance_to_base = ball_base_distance
+        ball_distance_progress = previous_ball_distance_to_base - ball_distance_to_base
         clipped_ball_distance_progress = jnp.clip(ball_distance_progress, -self.progress_to_ball_clip, self.progress_to_ball_clip)
         upright_progress_gate = (1.0 - below_height.astype(jnp.float32)) * jnp.exp(-jnp.abs(roll_pitch_squared))
         progress_to_ball_reward = self.progress_to_ball_coeff * clipped_ball_distance_progress * upright_progress_gate
@@ -228,15 +229,18 @@ class DefaultReward:
         info["reward/progress_to_ball"] = progress_to_ball_reward
         info["env_info/ball_distance_progress"] = ball_distance_progress
         info["env_info/clipped_ball_distance_progress"] = clipped_ball_distance_progress
-        info["env_info/previous_ball_distance_to_com"] = previous_ball_distance_to_com
+        info["env_info/previous_ball_distance_to_base"] = previous_ball_distance_to_base
+        info["env_info/previous_ball_distance_to_com"] = previous_ball_distance_to_base
         info["env_info/upright_progress_gate"] = upright_progress_gate
         info["reward/projected_ball_velocity"] = projected_ball_velocity_reward
         info["reward/ball_velocity_tracking"] = projected_ball_velocity_reward
         info["reward/yaw_alignment"] = yaw_alignment_reward
         info["reward/yaw_alignment_no_ball"] = yaw_alignment_no_ball_reward
         info["reward/total"] = reward
-        info["env_info/ball_xy_distance_to_com"] = ball_distance_to_com
-        info["env_info/ball_distance_to_com"] = jnp.linalg.norm(ball_pos_world - com_pos_world)
+        info["env_info/ball_xy_distance_to_base"] = ball_distance_to_base
+        info["env_info/ball_distance_to_base"] = jnp.linalg.norm(ball_pos_world - base_pos_world)
+        info["env_info/ball_xy_distance_to_com"] = ball_distance_to_base
+        info["env_info/ball_distance_to_com"] = jnp.linalg.norm(ball_pos_world - base_pos_world)
         info["env_info/chasing_exponent"] = 2.0
         info["env_info/ball_speed"] = jnp.linalg.norm(ball_vel_world[:2])
         info["env_info/ball_velocity_tracking_error"] = jnp.sqrt(ball_velocity_tracking_error)
