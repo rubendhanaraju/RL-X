@@ -1,9 +1,14 @@
 import os
+import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import mujoco
 import numpy as np
 from dm_control import mjcf
+
+
+DEFAULT_RCSSSERVERMJ_ROOT = "/home/ruben/Documents/GitHub/RoboCup/rcssservermj"
 
 
 SERVER_T1_NOMINAL_JOINT_POSITIONS = {
@@ -37,8 +42,8 @@ def rcssservermj_root(env_config):
     simulator_config = env_config.get("simulator", {})
     root = simulator_config.get("rcssservermj_root")
     if root:
-        return Path(root)
-    return Path(os.environ.get("RCSSSERVERMJ_ROOT", "/home/ruben/Documents/GitHub/rcssservermj"))
+        return Path(root).expanduser()
+    return Path(os.environ.get("RCSSSERVERMJ_ROOT", DEFAULT_RCSSSERVERMJ_ROOT)).expanduser()
 
 
 def uses_rcssservermj_model(env_config):
@@ -47,36 +52,198 @@ def uses_rcssservermj_model(env_config):
 
 def build_rcssservermj_xml(env_config, *, object_type):
     root = rcssservermj_root(env_config)
+    world_source = env_config.get("simulator", {}).get("world_source", "server")
+    if world_source == "server":
+        xml_handle = build_server_soccer_world_xml(root, env_config, object_type=object_type)
+        disable_mjx_unsupported_world_contacts(xml_handle)
+        if env_config.get("simulator", {}).get("disable_nonfoot_contacts", False):
+            disable_nonfoot_robot_contacts(xml_handle)
+    elif world_source == "rlx":
+        xml_handle = build_rlx_training_world_xml(root, object_type=object_type)
+    else:
+        raise ValueError(f"Unsupported rcssservermj world_source: {world_source}")
+
+    add_training_sensors(xml_handle)
+    return xml_handle
+
+
+def disable_mjx_unsupported_world_contacts(xml_handle):
+    # MJX cannot compile some of the far-away server goal/outer-floor contact
+    # pairs (for example cylinder-box). These geoms are not part of the local
+    # dribbling/point-tracking training dynamics, so keep them visual only.
+    for geom in xml_handle.find_all("geom"):
+        name = geom.name or ""
+        if name.startswith("goal-") or name.endswith("-floor"):
+            geom.contype = "0"
+            geom.conaffinity = "0"
+
+
+def build_server_soccer_world_xml(root, env_config, *, object_type):
+    spec = build_server_soccer_world_spec(root, env_config, object_type=object_type)
+    xml = sanitize_mjspec_xml(spec.to_xml())
+    assets = server_assets(root)
+    return mjcf.from_xml_string(xml, assets=assets)
+
+
+def build_server_soccer_world_spec(root, env_config, *, object_type):
+    root = Path(root).expanduser().resolve()
+    ensure_rcssservermj_import(root)
+
+    from rcsssmj.games.soccer.game_phase import GamePhase
+    from rcsssmj.games.soccer.sim.soccer_referee import NoOpSoccerReferee
+    from rcsssmj.games.soccer.sim.soccer_sim import SoccerSimulation
+    from rcsssmj.games.soccer.soccer_fields import create_soccer_field
+    from rcsssmj.games.soccer.soccer_rules import SoccerRuleBooks, create_soccer_rule_book
+
+    simulator_config = env_config.get("simulator", {})
+    field_name = simulator_config.get("field", "fifa7vs7")
+    rules_name = simulator_config.get("rules", SoccerRuleBooks.SSIM.value)
+
+    simulation = SoccerSimulation(
+        field=create_soccer_field(field_name),
+        rules=create_soccer_rule_book(rules_name),
+        referee=NoOpSoccerReferee(),
+        initial_game_phase=GamePhase.FIRST_HALF,
+        enable_cheats=True,
+    )
+    spec = simulation._create_world()
+
+    # Keep the soccer world/options from the actual server, but put the robot
+    # free joint first because the RL-X env code stores the robot root at qpos[:7].
+    spec.delete(spec.body("ball"))
+
+    robot_spec = simulation.spec_provider.load_robot_spec("T1")
+    if robot_spec is None:
+        raise FileNotFoundError(f"Could not load rcssservermj T1 model from {root}")
+
+    frame = spec.worldbody.add_frame()
+    frame.attach_body(robot_spec.body("torso"), "", "")
+
+    if object_type == "none":
+        pass
+    elif object_type == "ball":
+        add_server_ball_to_spec(spec)
+    elif object_type == "point":
+        add_training_point_to_spec(spec)
+    else:
+        raise ValueError(f"Unsupported server-fidelity object type: {object_type}")
+
+    return spec
+
+
+def build_rlx_training_world_xml(root, *, object_type):
     robot_path = root / "src" / "rcsssmj" / "resources" / "robots" / "T1" / "robot.xml"
     if not robot_path.is_file():
         raise FileNotFoundError(f"Could not find rcssservermj T1 model: {robot_path}")
 
     xml_handle = mjcf.from_path(robot_path.as_posix())
-    add_server_training_world(xml_handle, object_type=object_type)
-    if env_config.get("simulator", {}).get("disable_nonfoot_contacts", True):
-        disable_nonfoot_robot_contacts(xml_handle)
-    add_training_sensors(xml_handle)
+    xml_handle.option.density = 1.2
+    xml_handle.option.viscosity = 2e-5
+    add_rlx_training_world(xml_handle, object_type=object_type)
+    disable_nonfoot_robot_contacts(xml_handle)
     return xml_handle
 
 
-def disable_nonfoot_robot_contacts(xml_handle):
-    for geom in xml_handle.find_all("geom"):
-        geom.contype = "0"
-        geom.conaffinity = "0"
+def ensure_rcssservermj_import(root):
+    src_path = (Path(root) / "src").resolve()
+    package_path = src_path / "rcsssmj"
+    if not package_path.is_dir():
+        raise FileNotFoundError(f"Could not find rcssservermj package: {package_path}")
 
-    add_contact_pair_if_missing(xml_handle, "pitch", "left_foot")
-    add_contact_pair_if_missing(xml_handle, "pitch", "right_foot")
-    if xml_handle.find("geom", "ball") is not None:
-        add_contact_pair_if_missing(xml_handle, "pitch", "ball")
-        add_contact_pair_if_missing(xml_handle, "left_foot", "ball")
-        add_contact_pair_if_missing(xml_handle, "right_foot", "ball")
+    src_path_str = src_path.as_posix()
+    if src_path_str not in sys.path:
+        sys.path.insert(0, src_path_str)
+
+    import rcsssmj
+
+    loaded_path = Path(rcsssmj.__file__).resolve()
+    try:
+        loaded_path.relative_to(src_path)
+    except ValueError as exc:
+        raise ImportError(
+            "rcsssmj was already imported from a different checkout: "
+            f"{loaded_path}. Restart the process or set simulator.rcssservermj_root "
+            f"to the loaded checkout."
+        ) from exc
 
 
-def add_contact_pair_if_missing(xml_handle, geom1, geom2):
-    xml_handle.contact.add("pair", geom1=geom1, geom2=geom2)
+def sanitize_mjspec_xml(xml):
+    root = ET.fromstring(xml)
+    flatten_empty_default_classes(root)
+    return ET.tostring(root, encoding="unicode")
 
 
-def add_server_training_world(xml_handle, *, object_type):
+def flatten_empty_default_classes(parent):
+    for child in list(parent):
+        flatten_empty_default_classes(child)
+
+    if parent.tag != "default":
+        return
+
+    for child in list(parent):
+        if child.tag == "default" and not child.attrib:
+            insert_at = list(parent).index(child)
+            parent.remove(child)
+            for grandchild in list(child):
+                child.remove(grandchild)
+                parent.insert(insert_at, grandchild)
+                insert_at += 1
+
+
+def server_assets(root):
+    root = Path(root)
+    asset_dirs = [
+        root / "src" / "rcsssmj" / "resources" / "environments" / "soccer" / "assets",
+        root / "src" / "rcsssmj" / "resources" / "robots" / "T1" / "meshes",
+    ]
+    assets = {}
+    for asset_dir in asset_dirs:
+        if not asset_dir.is_dir():
+            raise FileNotFoundError(f"Could not find rcssservermj asset directory: {asset_dir}")
+        for asset_path in asset_dir.iterdir():
+            if asset_path.is_file():
+                assets[asset_path.name] = asset_path.read_bytes()
+    return assets
+
+
+def add_server_ball_to_spec(spec):
+    ball = spec.worldbody.add_body()
+    ball.name = "ball"
+    ball.pos = (0.0, 0.0, 0.11)
+    ball.add_freejoint(name="ball-root")
+    site = ball.add_site()
+    site.name = "B-vismarker"
+    site.pos = (0.0, 0.0, 0.0)
+    geom = ball.add_geom()
+    geom.name = "ball"
+    geom.pos = (0.0, 0.0, 0.0)
+    geom.size = (0.11, 0.0, 0.0)
+    geom.mass = 0.41
+    geom.friction = (0.4, 0.01, 0.01)
+    geom.rgba = (1.0, 1.0, 1.0, 1.0)
+    geom.condim = 6
+    geom.priority = 1
+    geom.solref = (-5000.0, -20.0)
+    geom.type = mujoco.mjtGeom.mjGEOM_SPHERE
+    geom.material = "ball"
+
+
+def add_training_point_to_spec(spec):
+    point = spec.worldbody.add_body()
+    point.name = "point"
+    point.pos = (1.0, 0.0, 0.05)
+    point.add_freejoint(name="point-root")
+    geom = point.add_geom()
+    geom.name = "point"
+    geom.type = mujoco.mjtGeom.mjGEOM_SPHERE
+    geom.size = (0.05, 0.0, 0.0)
+    geom.mass = 0.01
+    geom.contype = 0
+    geom.conaffinity = 0
+    geom.rgba = (0.1, 0.8, 1.0, 1.0)
+
+
+def add_rlx_training_world(xml_handle, *, object_type):
     if xml_handle.find("geom", "pitch") is None:
         xml_handle.worldbody.add(
             "geom",
@@ -84,9 +251,13 @@ def add_server_training_world(xml_handle, *, object_type):
             pos="0 0 0",
             size="32 24 40",
             type="plane",
+            friction="1 0.01 0.005",
+            solimp="0.015 1 0.015 0.5 2",
         )
 
-    if object_type == "ball":
+    if object_type == "none":
+        pass
+    elif object_type == "ball":
         if xml_handle.find("body", "ball") is None:
             ball = xml_handle.worldbody.add("body", name="ball", pos="1.0 0.0 0.11")
             ball.add("freejoint", name="ball-root")
@@ -119,7 +290,60 @@ def add_server_training_world(xml_handle, *, object_type):
                 rgba="0.1 0.8 1.0 1",
             )
     else:
-        raise ValueError(f"Unsupported server-fidelity object type: {object_type}")
+        raise ValueError(f"Unsupported lightweight training object type: {object_type}")
+
+
+def disable_nonfoot_robot_contacts(xml_handle):
+    for geom in xml_handle.find_all("geom"):
+        geom.contype = "0"
+        geom.conaffinity = "0"
+
+    add_contact_pair_if_missing(xml_handle, "pitch", "left_foot", kind="floor_foot")
+    add_contact_pair_if_missing(xml_handle, "pitch", "right_foot", kind="floor_foot")
+    add_contact_pair_if_missing(xml_handle, "left_hand", "left_thigh", kind="self")
+    add_contact_pair_if_missing(xml_handle, "right_hand", "right_thigh", kind="self")
+    if xml_handle.find("geom", "ball") is not None:
+        add_contact_pair_if_missing(xml_handle, "pitch", "ball", kind="ball")
+        add_contact_pair_if_missing(xml_handle, "left_foot", "ball", kind="ball")
+        add_contact_pair_if_missing(xml_handle, "right_foot", "ball", kind="ball")
+
+
+def add_contact_pair_if_missing(xml_handle, geom1, geom2, *, kind):
+    # Explicit pairs do not inherit the same resolved params as automatic geom
+    # contacts. Set the server-resolved values so contact reduction changes only
+    # which contacts exist, not the physics of the contacts we keep.
+    if kind == "floor_foot":
+        xml_handle.contact.add(
+            "pair",
+            geom1=geom1,
+            geom2=geom2,
+            condim=3,
+            friction=(1.0, 1.0, 0.01, 0.005, 0.005),
+            solref=(0.02, 1.0),
+            solimp=(0.015, 1.0, 0.015, 0.5, 2.0),
+        )
+    elif kind == "ball":
+        xml_handle.contact.add(
+            "pair",
+            geom1=geom1,
+            geom2=geom2,
+            condim=6,
+            friction=(0.4, 0.4, 0.01, 0.01, 0.01),
+            solref=(-5000.0, -20.0),
+            solimp=(0.9, 0.95, 0.001, 0.5, 2.0),
+        )
+    elif kind == "self":
+        xml_handle.contact.add(
+            "pair",
+            geom1=geom1,
+            geom2=geom2,
+            condim=3,
+            friction=(1.0, 1.0, 0.01, 0.005, 0.005),
+            solref=(0.02, 1.0),
+            solimp=(0.9, 0.95, 0.001, 0.5, 2.0),
+        )
+    else:
+        raise ValueError(f"Unknown reduced contact pair kind: {kind}")
 
 
 def add_training_sensors(xml_handle):

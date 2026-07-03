@@ -25,6 +25,15 @@ from rl_x.environments.custom_mujoco.robocup_soccer.locomotion.mujoco.domain_ran
 from rl_x.environments.custom_mujoco.robocup_soccer.locomotion.mujoco.domain_randomization.joint_dropout_functions.handler import get_joint_dropout_function
 from rl_x.environments.custom_mujoco.robocup_soccer.locomotion.mujoco.exteroceptive_observation_functions.handler import get_exteroceptive_observation_function
 from rl_x.environments.custom_mujoco.robocup_soccer.locomotion.mujoco.terrain_functions.handler import get_terrain_function
+from rl_x.environments.custom_mujoco.robocup_soccer.rcssservermj_model import (
+    build_rcssservermj_xml,
+    home_qpos_from_model,
+    server_actuator_triplet_ids,
+    server_joint_names_from_position_actuators,
+    server_position_actuator_ids,
+    set_server_pd_gains,
+    uses_rcssservermj_model,
+)
 
 
 class LocomotionEnv(gym.Env):
@@ -36,25 +45,36 @@ class LocomotionEnv(gym.Env):
         self.env_config = env_config
         self.add_goal_arrow = env_config["add_goal_arrow"]
         self.nr_envs = nr_envs
+        self.use_rcssservermj_model = uses_rcssservermj_model(env_config)
+        self.root_body_name = "torso" if self.use_rcssservermj_model else "trunk"
+        self.imu_site_name = "torso" if self.use_rcssservermj_model else "imu"
+        self.floor_geom_name = "pitch" if self.use_rcssservermj_model else "floor"
+        self.imu_angular_velocity_sensor_name = "torso_gyro" if self.use_rcssservermj_model else "imu_angular_velocity"
+        self.imu_linear_velocity_sensor_name = "torso_linear_velocity" if self.use_rcssservermj_model else "imu_linear_velocity"
 
         self.np_rng = np.random.default_rng(seed)
 
-        xml_path = (self.robot_config["directory_path"] / "data" / "plane.xml").as_posix()
-        xml_handle = mjcf.from_path(xml_path)
+        if self.use_rcssservermj_model:
+            xml_handle = build_rcssservermj_xml(env_config, object_type="none")
+        else:
+            xml_path = (self.robot_config["directory_path"] / "data" / "plane.xml").as_posix()
+            xml_handle = mjcf.from_path(xml_path)
 
-        # Set the MuJoCo solver iterations, the XML uses very low values by default for MJX
-        xml_handle.option.iterations = 100
-        xml_handle.option.ls_iterations = 50
-        xml_handle.option.flag.eulerdamp = "enable"
+            # Set the MuJoCo solver iterations, the XML uses very low values by default for MJX
+            xml_handle.option.iterations = 100
+            xml_handle.option.ls_iterations = 50
+            xml_handle.option.flag.eulerdamp = "enable"
 
         if "hfield" in env_config["terrain"]["type"]:
+            if self.use_rcssservermj_model:
+                raise ValueError("rcssservermj model source currently supports only plane terrain.")
             xml_handle.asset.insert("hfield", 0, name="empty_hfield", file="default_hfield_80.png", size="4 4 30.0 0.125")
             floor = xml_handle.find("geom", "floor")
             floor.type = "hfield"
             floor.hfield = "empty_hfield"
         
         if self.should_render and self.add_goal_arrow:
-            trunk = xml_handle.find("body", "trunk")
+            trunk = xml_handle.find("body", self.root_body_name)
             trunk.add("body", name="dir_arrow", pos="0 0 0.15")
             dir_vec = xml_handle.find("body", "dir_arrow")
             dir_vec.add("site", name="dir_arrow_ball", type="sphere", size=".02", pos="-.1 0 0")
@@ -62,29 +82,45 @@ class LocomotionEnv(gym.Env):
         
         self.initial_mj_model = mujoco.MjModel.from_xml_string(xml=xml_handle.to_xml_string(), assets=xml_handle.get_assets())
         self.initial_mj_model.opt.timestep = env_config["timestep"]
+        if self.use_rcssservermj_model:
+            self.server_position_actuator_ids = server_position_actuator_ids(self.initial_mj_model)
+            (
+                self.server_torque_actuator_ids,
+                self.server_position_actuator_ids,
+                self.server_velocity_actuator_ids,
+            ) = server_actuator_triplet_ids(self.initial_mj_model, self.server_position_actuator_ids)
+            set_server_pd_gains(self.initial_mj_model, self.server_position_actuator_ids)
+        else:
+            self.server_torque_actuator_ids = np.array([], dtype=int)
+            self.server_position_actuator_ids = np.array([], dtype=int)
+            self.server_velocity_actuator_ids = np.array([], dtype=int)
+        self.home_qpos = home_qpos_from_model(self.initial_mj_model) if self.use_rcssservermj_model else self.initial_mj_model.keyframe("home").qpos.copy()
         self.data = mujoco.MjData(self.initial_mj_model)
         self.c_model = deepcopy(self.initial_mj_model)
         self.c_data = mujoco.MjData(self.c_model)
-        self.c_data.qpos = self.initial_mj_model.keyframe("home").qpos
+        self.c_data.qpos = self.home_qpos
         mujoco.mj_forward(self.c_model, self.c_data)
         
-        self.imu_site_id = mujoco.mj_name2id(self.initial_mj_model, mujoco.mjtObj.mjOBJ_SITE, "imu")
-        self.trunk_body_id = mujoco.mj_name2id(self.initial_mj_model, mujoco.mjtObj.mjOBJ_BODY, "trunk")
+        self.imu_site_id = mujoco.mj_name2id(self.initial_mj_model, mujoco.mjtObj.mjOBJ_SITE, self.imu_site_name)
+        self.trunk_body_id = mujoco.mj_name2id(self.initial_mj_model, mujoco.mjtObj.mjOBJ_BODY, self.root_body_name)
         self.actuator_joint_max_velocities = np.array(robot_config["actuator_joint_max_velocities"])
-        self.initial_qpos = np.array(self.initial_mj_model.keyframe("home").qpos)
+        self.initial_qpos = np.array(self.home_qpos)
         self.initial_imu_orientation_rotation_inverse = Rotation.from_matrix(self.c_data.site_xmat[self.imu_site_id].reshape(3, 3)).inv()
         self.initial_imu_height = self.c_data.site_xpos[self.imu_site_id, 2]
-        self.actuator_joint_names = [mujoco.mj_id2name(self.initial_mj_model, mujoco.mjtObj.mjOBJ_JOINT, actuator_trnid[0]) for actuator_trnid in self.initial_mj_model.actuator_trnid]
+        if self.use_rcssservermj_model:
+            self.actuator_joint_names = server_joint_names_from_position_actuators(self.initial_mj_model, self.server_position_actuator_ids)
+        else:
+            self.actuator_joint_names = [mujoco.mj_id2name(self.initial_mj_model, mujoco.mjtObj.mjOBJ_JOINT, actuator_trnid[0]) for actuator_trnid in self.initial_mj_model.actuator_trnid]
         self.actuator_joint_mask_joints = np.array([self.initial_mj_model.joint(joint_name).id for joint_name in self.actuator_joint_names])
         self.actuator_joint_mask_qpos = np.array([self.initial_mj_model.joint(joint_name).qposadr[0] for joint_name in self.actuator_joint_names])
         self.actuator_joint_mask_qvel = np.array([self.initial_mj_model.joint(joint_name).dofadr[0] for joint_name in self.actuator_joint_names])
         self.nr_actuator_joints = len(self.actuator_joint_names)
         self.nr_joints = self.initial_mj_model.njnt
 
-        imu_angular_velocity_sensor_id = self.initial_mj_model.sensor("imu_angular_velocity").id
+        imu_angular_velocity_sensor_id = self.initial_mj_model.sensor(self.imu_angular_velocity_sensor_name).id
         self.imu_angular_velocity_sensor_adr = self.initial_mj_model.sensor_adr[imu_angular_velocity_sensor_id]
         self.imu_angular_velocity_sensor_dim = self.initial_mj_model.sensor_dim[imu_angular_velocity_sensor_id]
-        imu_linear_velocity_sensor_id = self.initial_mj_model.sensor("imu_linear_velocity").id
+        imu_linear_velocity_sensor_id = self.initial_mj_model.sensor(self.imu_linear_velocity_sensor_name).id
         self.imu_linear_velocity_sensor_adr = self.initial_mj_model.sensor_adr[imu_linear_velocity_sensor_id]
         self.imu_linear_velocity_sensor_dim = self.initial_mj_model.sensor_dim[imu_linear_velocity_sensor_id]
 
@@ -116,9 +152,9 @@ class LocomotionEnv(gym.Env):
         self.body_ids_of_actuator_joints = np.array([self.initial_mj_model.joint(joint_name).bodyid[0] for joint_name in self.actuator_joint_names])
         self.actuator_joint_nr_direct_child_actuator_joints = body_to_children_count[self.body_ids_of_actuator_joints]
 
-        self.floor_geom_id = mujoco.mj_name2id(self.initial_mj_model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        self.floor_geom_id = mujoco.mj_name2id(self.initial_mj_model, mujoco.mjtObj.mjOBJ_GEOM, self.floor_geom_name)
 
-        self.reward_collision_sphere_geom_ids = np.array([geom.id for geom in [self.initial_mj_model.geom(geom_id) for geom_id in range(self.initial_mj_model.ngeom)] if geom.group[0] == 5])
+        self.reward_collision_sphere_geom_ids = np.array([geom.id for geom in [self.initial_mj_model.geom(geom_id) for geom_id in range(self.initial_mj_model.ngeom)] if geom.group[0] == 5], dtype=int)
         
         self.reward_collision_sphere_geoms_and_feet_geoms_ids = np.concatenate((self.reward_collision_sphere_geom_ids, self.foot_geom_indices))
         self.dim_geom_ids = self.reward_collision_sphere_geoms_and_feet_geoms_ids - 1
@@ -127,6 +163,7 @@ class LocomotionEnv(gym.Env):
 
         self.robot_dimensions_mean = 0.5  # This can be calculated smartly...
 
+        self.env_curriculum_enabled = env_config["env_curriculum_enabled"]
         self.env_curriculum_nr_levels = env_config["env_curriculum_nr_levels"]
         self.env_curriculum_level_success_episode_return = env_config["env_curriculum_level_success_episode_return"]
 
@@ -170,7 +207,7 @@ class LocomotionEnv(gym.Env):
             "mj_model": deepcopy(self.initial_mj_model),
             "data": mujoco.MjData(self.initial_mj_model),
             "in_eval_mode": eval_mode,
-            "env_curriculum_coeff": np.where(eval_mode, 1.0, 0.0),
+            "env_curriculum_coeff": np.where(eval_mode or not self.env_curriculum_enabled, 1.0, 0.0),
             "env_curriculum_levels_in_a_row": 0.0,
             "actuator_joint_nominal_positions": self.initial_qpos[self.actuator_joint_mask_qpos],
             "actuator_joint_max_velocities": self.actuator_joint_max_velocities,
@@ -222,6 +259,95 @@ class LocomotionEnv(gym.Env):
                 self.joystick_present = True
         del self.c_model, self.c_data
 
+
+    def zero_ctrl(self):
+        return np.zeros(self.initial_mj_model.nu)
+
+
+    def target_joint_positions_to_ctrl(self, target_joint_positions):
+        if not self.use_rcssservermj_model:
+            return target_joint_positions
+
+        ctrl = self.zero_ctrl()
+        ctrl[self.server_position_actuator_ids] = target_joint_positions
+        return ctrl
+
+
+    def base_position_world(self):
+        return self.internal_state["data"].qpos[:3]
+
+
+    def trunc2(self, value):
+        return np.trunc(np.asarray(value) * 100.0) / 100.0
+
+
+    def trunc3(self, value):
+        return np.trunc(np.asarray(value) * 1000.0) / 1000.0
+
+
+    def server_joint_position(self, value):
+        return np.deg2rad(self.trunc2(np.rad2deg(value)))
+
+
+    def server_joint_velocity(self, value):
+        return np.deg2rad(self.trunc2(np.rad2deg(value)))
+
+
+    def server_imu_angular_velocity(self, value):
+        return np.deg2rad(self.trunc2(np.rad2deg(value)))
+
+
+    def server_base_position_world(self):
+        return self.trunc3(self.base_position_world())
+
+
+    def server_base_rotation(self):
+        quat_wxyz = self.trunc3(self.internal_state["data"].qpos[3:7])
+        return Rotation.from_quat(quat_wxyz[[1, 2, 3, 0]])
+
+
+    def true_base_rotation(self):
+        quat_wxyz = self.internal_state["data"].qpos[3:7]
+        return Rotation.from_quat(quat_wxyz[[1, 2, 3, 0]])
+
+
+    def get_joint_positions_fcp(self):
+        return self.server_joint_position(self.internal_state["data"].qpos[self.actuator_joint_mask_qpos])
+
+
+    def get_joint_velocities_fcp(self):
+        return self.server_joint_velocity(self.internal_state["data"].qvel[self.actuator_joint_mask_qvel])
+
+
+    def get_imu_angular_velocity_fcp(self):
+        return self.server_imu_angular_velocity(
+            self.internal_state["data"].sensordata[self.imu_angular_velocity_sensor_adr:self.imu_angular_velocity_sensor_adr + self.imu_angular_velocity_sensor_dim]
+        )
+
+
+    def get_base_position_fcp(self):
+        return self.server_base_position_world()
+
+
+    def get_base_rotation_fcp(self):
+        return self.server_base_rotation()
+
+
+    def get_joint_positions_true(self):
+        return self.internal_state["data"].qpos[self.actuator_joint_mask_qpos]
+
+
+    def get_joint_velocities_true(self):
+        return self.internal_state["data"].qvel[self.actuator_joint_mask_qvel]
+
+
+    def get_imu_angular_velocity_true(self):
+        return self.internal_state["data"].sensordata[self.imu_angular_velocity_sensor_adr:self.imu_angular_velocity_sensor_adr + self.imu_angular_velocity_sensor_dim]
+
+
+    def get_base_rotation_true(self):
+        return self.true_base_rotation()
+
     
     def render(self):
         if self.uses_hfield and self.internal_state["info_episode_store"]["episode_step"] == 1:
@@ -272,22 +398,26 @@ class LocomotionEnv(gym.Env):
         self.internal_state["data"] = mujoco.MjData(self.internal_state["mj_model"])
         self.internal_state["data"].qpos = qpos
         self.internal_state["data"].qvel = qvel
-        self.internal_state["data"].ctrl = np.zeros(self.nr_actuator_joints)
+        self.internal_state["data"].ctrl = self.zero_ctrl()
         mujoco.mj_forward(self.internal_state["mj_model"], self.internal_state["data"])
 
-        episode_success = self.internal_state["info_episode_store"]["episode_return"] >= 10.0
-        self.internal_state["env_curriculum_levels_in_a_row"] = np.where(episode_success,
-            np.where(self.internal_state["env_curriculum_levels_in_a_row"] >= 0,
-                self.internal_state["env_curriculum_levels_in_a_row"] + 1,
-                1
-            ),
-            np.where(self.internal_state["env_curriculum_levels_in_a_row"] < 0,
-                self.internal_state["env_curriculum_levels_in_a_row"] - 1,
-                -1
+        if self.env_curriculum_enabled:
+            episode_success = self.internal_state["info_episode_store"]["episode_return"] >= self.env_curriculum_level_success_episode_return
+            self.internal_state["env_curriculum_levels_in_a_row"] = np.where(episode_success,
+                np.where(self.internal_state["env_curriculum_levels_in_a_row"] >= 0,
+                    self.internal_state["env_curriculum_levels_in_a_row"] + 1,
+                    1
+                ),
+                np.where(self.internal_state["env_curriculum_levels_in_a_row"] < 0,
+                    self.internal_state["env_curriculum_levels_in_a_row"] - 1,
+                    -1
+                )
             )
-        )
-        self.internal_state["env_curriculum_coeff"] =  np.clip(self.internal_state["env_curriculum_coeff"] + self.internal_state["env_curriculum_levels_in_a_row"] / self.env_curriculum_nr_levels, 0.0, 1.0)
-        self.internal_state["env_curriculum_coeff"] = np.where(self.internal_state["in_eval_mode"], 1.0, self.internal_state["env_curriculum_coeff"])
+            self.internal_state["env_curriculum_coeff"] =  np.clip(self.internal_state["env_curriculum_coeff"] + self.internal_state["env_curriculum_levels_in_a_row"] / self.env_curriculum_nr_levels, 0.0, 1.0)
+            self.internal_state["env_curriculum_coeff"] = np.where(self.internal_state["in_eval_mode"], 1.0, self.internal_state["env_curriculum_coeff"])
+        else:
+            self.internal_state["env_curriculum_levels_in_a_row"] = 0.0
+            self.internal_state["env_curriculum_coeff"] = 1.0
         
         self.internal_state["imu_orientation_rotation"] = Rotation.from_matrix(self.internal_state["data"].site_xmat[self.imu_site_id].reshape(3, 3))
         self.internal_state["imu_orientation_rotation_inverse"] = self.internal_state["imu_orientation_rotation"].inv()
@@ -315,11 +445,8 @@ class LocomotionEnv(gym.Env):
 
         target_joint_positions = self.control_function.process_action(delayed_action)
 
-        self.internal_state["data"].ctrl = target_joint_positions
+        self.internal_state["data"].ctrl = self.target_joint_positions_to_ctrl(target_joint_positions)
         mujoco.mj_step(self.internal_state["mj_model"], self.internal_state["data"], self.nr_substeps)
-        max_qvel = 100 * np.ones(self.initial_mj_model.nv)
-        max_qvel[self.actuator_joint_mask_qvel] = self.internal_state["actuator_joint_max_velocities"]
-        self.internal_state["data"].qvel = np.clip(self.internal_state["data"].qvel, -max_qvel, max_qvel)
 
         self.internal_state["imu_orientation_rotation"] = Rotation.from_matrix(self.internal_state["data"].site_xmat[self.imu_site_id].reshape(3, 3))
         self.internal_state["imu_orientation_rotation_inverse"] = self.internal_state["imu_orientation_rotation"].inv()
@@ -336,7 +463,7 @@ class LocomotionEnv(gym.Env):
             self.command_function.get_next_command()
         
         next_observation = self.get_observation(chosen_action)
-        terminated = self.termination_function.should_terminate() | np.any(np.abs(self.internal_state["data"].qvel[:3]) == 100.0)
+        terminated = self.termination_function.should_terminate()
         truncated = self.internal_state["info_episode_store"]["episode_step"] >= (self.horizon - 1)
         done = terminated | truncated
 
@@ -360,20 +487,29 @@ class LocomotionEnv(gym.Env):
 
 
     def get_observation(self, action):
+        current_imu_angular_velocity = self.get_imu_angular_velocity_fcp()
+        base_rotation = self.get_base_rotation_fcp()
+        critic_imu_angular_velocity = self.get_imu_angular_velocity_true()
+        critic_base_rotation = self.get_base_rotation_true()
+
         observation = np.concatenate([
-            self.internal_state["data"].qpos[self.actuator_joint_mask_qpos],
-            self.internal_state["data"].qvel[self.actuator_joint_mask_qvel],
+            self.get_joint_positions_fcp(),
+            self.get_joint_velocities_fcp(),
             action,
             self.terrain_function.check_feet_floor_contact(),
             self.internal_state["feet_time_on_ground"],
             self.internal_state["feet_time_in_air"],
             self.internal_state["data"].sensordata[self.imu_linear_velocity_sensor_adr:self.imu_linear_velocity_sensor_adr + self.imu_linear_velocity_sensor_dim],
-            self.internal_state["data"].sensordata[self.imu_angular_velocity_sensor_adr:self.imu_angular_velocity_sensor_adr + self.imu_angular_velocity_sensor_dim],
+            current_imu_angular_velocity,
             self.internal_state["goal_velocities"],
             self.gait_manager_function.get_phase_features(),
-            self.internal_state["imu_orientation_rotation_inverse"].apply(np.array([0.0, 0.0, -1.0])),
+            base_rotation.inv().apply(np.array([0.0, 0.0, -1.0])),
             np.array([self.policy_exteroceptive_observation_function.get_exteroceptive_observation()]).reshape(-1),
             np.array([self.critic_exteroceptive_observation_function.get_exteroceptive_observation()]).reshape(-1),
+            self.get_joint_positions_true(),
+            self.get_joint_velocities_true(),
+            critic_imu_angular_velocity,
+            critic_base_rotation.inv().apply(np.array([0.0, 0.0, -1.0])),
         ])
 
         # Add noise
@@ -392,6 +528,9 @@ class LocomotionEnv(gym.Env):
             observation[self.policy_exteroception_obs_idx] = np.clip((observation[self.policy_exteroception_obs_idx] / (10.0 / 2)) - 1.0, -1.0, 1.0)
         if len(self.critic_exteroception_obs_idx) > 0:
             observation[self.critic_exteroception_obs_idx] = np.clip((observation[self.critic_exteroception_obs_idx] / (10.0 / 2)) - 1.0, -1.0, 1.0)
+        observation[self.critic_joint_positions_true_obs_idx] = (observation[self.critic_joint_positions_true_obs_idx] - self.internal_state["actuator_joint_nominal_positions"]) / 3.14
+        observation[self.critic_joint_velocities_true_obs_idx] /= 100.0
+        observation[self.critic_imu_angular_vel_true_obs_idx] = np.clip(observation[self.critic_imu_angular_vel_true_obs_idx] / 50.0, -1.0, 1.0)
 
         observation = np.nan_to_num(observation, nan=0.0, posinf=0.0, neginf=0.0)
         observation = np.clip(observation, -10.0, 10.0)
@@ -448,6 +587,14 @@ class LocomotionEnv(gym.Env):
         current_observation_idx += self.policy_exteroceptive_observation_function.nr_exteroceptive_observations
         self.critic_exteroception_obs_idx = np.array([current_observation_idx + i for i in range(self.critic_exteroceptive_observation_function.nr_exteroceptive_observations)], dtype=int)
         current_observation_idx += self.critic_exteroceptive_observation_function.nr_exteroceptive_observations
+        self.critic_joint_positions_true_obs_idx = np.array([current_observation_idx + i for i in range(self.nr_actuator_joints)], dtype=int)
+        current_observation_idx += self.nr_actuator_joints
+        self.critic_joint_velocities_true_obs_idx = np.array([current_observation_idx + i for i in range(self.nr_actuator_joints)], dtype=int)
+        current_observation_idx += self.nr_actuator_joints
+        self.critic_imu_angular_vel_true_obs_idx = np.array([current_observation_idx + i for i in range(self.imu_angular_velocity_sensor_dim)], dtype=int)
+        current_observation_idx += self.imu_angular_velocity_sensor_dim
+        self.critic_gravity_vector_true_obs_idx = np.array([current_observation_idx + i for i in range(3)], dtype=int)
+        current_observation_idx += 3
 
         self.policy_observation_indices = np.concatenate([
             self.joint_positions_obs_idx,
@@ -461,17 +608,17 @@ class LocomotionEnv(gym.Env):
         ], dtype=int)
 
         self.critic_observation_indices = np.concatenate([
-            self.joint_positions_obs_idx,
-            self.joint_velocities_obs_idx,
+            self.critic_joint_positions_true_obs_idx,
+            self.critic_joint_velocities_true_obs_idx,
             self.joint_previous_actions_obs_idx,
             self.feet_ground_contact_obs_idx,
             self.feet_time_on_ground_obs_idx,
             self.feet_time_in_air_obs_idx,
             self.imu_linear_vel_obs_idx,
-            self.imu_angular_vel_obs_idx,
+            self.critic_imu_angular_vel_true_obs_idx,
             self.goal_velocities_obs_idx,
             self.gait_phase_obs_idx,
-            self.gravity_vector_obs_idx,
+            self.critic_gravity_vector_true_obs_idx,
             self.critic_exteroception_obs_idx,
         ], dtype=int)
 

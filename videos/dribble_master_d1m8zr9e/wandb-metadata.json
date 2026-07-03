@@ -1,0 +1,58 @@
+{
+  "os": "Linux-6.11.0-29-generic-x86_64-with-glibc2.39",
+  "python": "CPython 3.11.4",
+  "startedAt": "2026-07-01T08:13:52.776077Z",
+  "args": [
+    "--algorithm.total_timesteps=10019143680",
+    "--algorithm.gamma=0.994",
+    "--algorithm.gae_lambda=0.7",
+    "--algorithm.entropy_coef=0.002",
+    "--algorithm.max_grad_norm=3.0",
+    "--environment.training_stage=stage_1",
+    "--environment.seed=0",
+    "--runner.track_console=False",
+    "--runner.track_tb=False",
+    "--runner.track_wandb=True",
+    "--runner.save_model=True",
+    "--runner.wandb_entity=rubendhanaraju-university-of-porto",
+    "--runner.project_name=robocup_soccer_dribble_master",
+    "--runner.exp_name=stage1_chasing",
+    "--runner.run_name=seed0",
+    "--runner.notes=DribbleMaster stage 1: ball chasing, projected ball velocity off"
+  ],
+  "program": "/home/admin/code/RL-X/experiments/experiment.py",
+  "codePath": "experiments/experiment.py",
+  "codePathLocal": "experiments/experiment.py",
+  "git": {
+    "remote": "https://github.com/rubendhanaraju/RL-X",
+    "commit": "edeb952d0f94642627dd1d77a4500fccf4bc26d7"
+  },
+  "email": "up201706353@edu.fc.up.pt",
+  "root": "/home/admin/code/RL-X",
+  "host": "newton",
+  "executable": "/home/admin/anaconda3/envs/rlx/bin/python",
+  "cpu_count": 56,
+  "cpu_count_logical": 112,
+  "gpu": "Quadro RTX 8000",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "22712632975360",
+      "used": "2499456143360"
+    }
+  },
+  "memory": {
+    "total": "132398161920"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "Quadro RTX 8000",
+      "memoryTotal": "51539607552",
+      "cudaCores": 4608,
+      "architecture": "Turing",
+      "uuid": "GPU-9c9af901-4d68-9167-d3a7-27de8329e9c7"
+    }
+  ],
+  "cudaVersion": "12.8",
+  "writerId": "lhu51dl9y8af0svdbbghbnueqhcva876"
+}

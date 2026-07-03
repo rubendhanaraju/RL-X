@@ -59,8 +59,12 @@ class DefaultDRSeenRobotFunction:
         self.default_joint_armatures = self.env.initial_mjx_model.dof_armature[6:]
         self.default_joint_stiffnesses = self.env.initial_mjx_model.jnt_stiffness[1:]
         self.default_joint_frictionlosses = self.env.initial_mjx_model.dof_frictionloss[6:]
-        self.default_p_gain = -self.env.initial_mjx_model.actuator_biasprm[0, 1]
-        self.default_d_gain = -self.env.initial_mjx_model.actuator_biasprm[0, 2]
+        if self.env.use_rcssservermj_model:
+            self.default_p_gain = -self.env.initial_mjx_model.actuator_biasprm[self.env.server_position_actuator_ids[0], 1]
+            self.default_d_gain = -self.env.initial_mjx_model.actuator_biasprm[self.env.server_velocity_actuator_ids[0], 2]
+        else:
+            self.default_p_gain = -self.env.initial_mjx_model.actuator_biasprm[0, 1]
+            self.default_d_gain = -self.env.initial_mjx_model.actuator_biasprm[0, 2]
         self.default_scaling_factor = env.robot_config["scaling_factor"]
 
 
@@ -78,8 +82,15 @@ class DefaultDRSeenRobotFunction:
         internal_state["seen_p_gain"] = self.default_p_gain
         internal_state["seen_d_gain"] = self.default_d_gain
         internal_state["scaling_factor"] = self.default_scaling_factor
-        internal_state["partial_actuator_gainprm_without_dropout"] = self.env.initial_mjx_model.actuator_gainprm[:, 0]
-        internal_state["partial_actuator_biasprm_without_dropout"] = self.env.initial_mjx_model.actuator_biasprm[:, 1:3]
+        if self.env.use_rcssservermj_model:
+            internal_state["partial_actuator_gainprm_without_dropout"] = self.env.initial_mjx_model.actuator_gainprm[self.env.server_position_actuator_ids, 0]
+            internal_state["partial_actuator_biasprm_without_dropout"] = jnp.stack([
+                self.env.initial_mjx_model.actuator_biasprm[self.env.server_position_actuator_ids, 1],
+                self.env.initial_mjx_model.actuator_biasprm[self.env.server_velocity_actuator_ids, 2],
+            ], axis=-1)
+        else:
+            internal_state["partial_actuator_gainprm_without_dropout"] = self.env.initial_mjx_model.actuator_gainprm[:, 0]
+            internal_state["partial_actuator_biasprm_without_dropout"] = self.env.initial_mjx_model.actuator_biasprm[:, 1:3]
         internal_state["robot_nominal_qpos_height_over_ground"] = self.env.initial_qpos[2]
         internal_state["robot_nominal_imu_height_over_ground"] = self.env.initial_imu_height
         internal_state["nr_collisions_in_nominal"] = 0
@@ -119,7 +130,12 @@ class DefaultDRSeenRobotFunction:
         default_scaling_factor = self.default_scaling_factor * avg_body_size_factor
 
         coupled_masses = default_masses * (1 + env_curriculum_coeff * jax.random.uniform(keys[1], minval=-self.coupled_mass_inertia_factor, maxval=self.coupled_mass_inertia_factor, shape=self.default_masses.shape))
-        coupled_inertias = default_inertias * (jnp.reshape(coupled_masses / default_masses, (-1, 1)))
+        mass_ratio = jnp.where(
+            default_masses > 1e-8,
+            coupled_masses / jnp.maximum(default_masses, 1e-8),
+            1.0,
+        )
+        coupled_inertias = default_inertias * jnp.reshape(mass_ratio, (-1, 1))
         seen_body_masses = coupled_masses * (1 + env_curriculum_coeff * jax.random.uniform(keys[2], minval=-self.decoupled_mass_inertia_factor, maxval=self.decoupled_mass_inertia_factor, shape=coupled_masses.shape))
         seen_inertias = coupled_inertias * (1 + env_curriculum_coeff * jax.random.uniform(keys[3], minval=-self.decoupled_mass_inertia_factor, maxval=self.decoupled_mass_inertia_factor, shape=coupled_inertias.shape))
         masses = seen_body_masses * internal_state["mass_inertia_noise_factors"]
@@ -209,9 +225,15 @@ class DefaultDRSeenRobotFunction:
         seen_d_gain = default_d_gain * (1 + env_curriculum_coeff * jax.random.uniform(keys[27], minval=-self.d_gain_factor, maxval=self.d_gain_factor))
         d_gain = seen_d_gain * internal_state["d_gain_noise_factors"]
         scaling_factor = default_scaling_factor * (1 + env_curriculum_coeff * jax.random.uniform(keys[28], minval=-self.scaling_factor_factor, maxval=self.scaling_factor_factor))
-        actuators_gainprm = mjx_model.actuator_gainprm.at[:, 0].set(p_gain)
-        actuators_biasprm = mjx_model.actuator_biasprm.at[:, 1].set(-p_gain)
-        actuators_biasprm = actuators_biasprm.at[:, 2].set(-d_gain)
+        if self.env.use_rcssservermj_model:
+            actuators_gainprm = mjx_model.actuator_gainprm.at[self.env.server_position_actuator_ids, 0].set(p_gain)
+            actuators_gainprm = actuators_gainprm.at[self.env.server_velocity_actuator_ids, 0].set(d_gain)
+            actuators_biasprm = mjx_model.actuator_biasprm.at[self.env.server_position_actuator_ids, 1].set(-p_gain)
+            actuators_biasprm = actuators_biasprm.at[self.env.server_velocity_actuator_ids, 2].set(-d_gain)
+        else:
+            actuators_gainprm = mjx_model.actuator_gainprm.at[:, 0].set(p_gain)
+            actuators_biasprm = mjx_model.actuator_biasprm.at[:, 1].set(-p_gain)
+            actuators_biasprm = actuators_biasprm.at[:, 2].set(-d_gain)
 
         new_mjx_model = mjx_model.tree_replace(
             {
@@ -258,13 +280,22 @@ class DefaultDRSeenRobotFunction:
         internal_state["seen_p_gain"] = jnp.where(should_randomize, seen_p_gain, internal_state["seen_p_gain"])
         internal_state["seen_d_gain"] = jnp.where(should_randomize, seen_d_gain, internal_state["seen_d_gain"])
         internal_state["scaling_factor"] = jnp.where(should_randomize, scaling_factor, internal_state["scaling_factor"])
-        internal_state["partial_actuator_gainprm_without_dropout"] = jnp.where(should_randomize, mjx_model.actuator_gainprm[:, 0], internal_state["partial_actuator_gainprm_without_dropout"])
-        internal_state["partial_actuator_biasprm_without_dropout"] = jnp.where(should_randomize, mjx_model.actuator_biasprm[:, 1:3], internal_state["partial_actuator_biasprm_without_dropout"])
+        if self.env.use_rcssservermj_model:
+            partial_gainprm_without_dropout = mjx_model.actuator_gainprm[self.env.server_position_actuator_ids, 0]
+            partial_biasprm_without_dropout = jnp.stack([
+                mjx_model.actuator_biasprm[self.env.server_position_actuator_ids, 1],
+                mjx_model.actuator_biasprm[self.env.server_velocity_actuator_ids, 2],
+            ], axis=-1)
+        else:
+            partial_gainprm_without_dropout = mjx_model.actuator_gainprm[:, 0]
+            partial_biasprm_without_dropout = mjx_model.actuator_biasprm[:, 1:3]
+        internal_state["partial_actuator_gainprm_without_dropout"] = jnp.where(should_randomize, partial_gainprm_without_dropout, internal_state["partial_actuator_gainprm_without_dropout"])
+        internal_state["partial_actuator_biasprm_without_dropout"] = jnp.where(should_randomize, partial_biasprm_without_dropout, internal_state["partial_actuator_biasprm_without_dropout"])
 
         qpos = self.env.initial_qpos.at[self.env.actuator_joint_mask_qpos].set(actuator_joint_nominal_positions)
         qpos = qpos.at[2].set(qpos[2] + internal_state["center_height"])
         qvel = jnp.zeros(self.env.initial_mjx_model.nv)
-        data_tmp = self.env.mjx_data.replace(qpos=qpos, qvel=qvel, ctrl=jnp.zeros(self.env.nr_actuator_joints))
+        data_tmp = self.env.mjx_data.replace(qpos=qpos, qvel=qvel, ctrl=self.env.zero_ctrl())
         data_tmp, _ = jax.lax.scan(
             f=lambda data_, _: (mjx.forward(new_mjx_model, data_), None),
             init=data_tmp,

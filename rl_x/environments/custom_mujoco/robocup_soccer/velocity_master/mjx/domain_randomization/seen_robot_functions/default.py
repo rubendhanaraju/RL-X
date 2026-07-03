@@ -133,7 +133,12 @@ class DefaultDRSeenRobotFunction:
         default_scaling_factor = self.default_scaling_factor * avg_body_size_factor
 
         coupled_masses = default_masses * (1 + env_curriculum_coeff * jax.random.uniform(keys[1], minval=-self.coupled_mass_inertia_factor, maxval=self.coupled_mass_inertia_factor, shape=self.default_masses.shape))
-        coupled_inertias = default_inertias * (jnp.reshape(coupled_masses / default_masses, (-1, 1)))
+        mass_ratio = jnp.where(
+            default_masses > 1e-8,
+            coupled_masses / jnp.maximum(default_masses, 1e-8),
+            1.0,
+        )
+        coupled_inertias = default_inertias * jnp.reshape(mass_ratio, (-1, 1))
         seen_body_masses = coupled_masses * (1 + env_curriculum_coeff * jax.random.uniform(keys[2], minval=-self.decoupled_mass_inertia_factor, maxval=self.decoupled_mass_inertia_factor, shape=coupled_masses.shape))
         base_mass_idx = self.env.trunk_body_id - 1
         base_mass = jnp.maximum(

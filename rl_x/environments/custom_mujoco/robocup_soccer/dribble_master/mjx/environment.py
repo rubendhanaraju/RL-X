@@ -479,6 +479,53 @@ class DribbleMasterEnv:
         return Rotation.from_quat(jnp.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]]))
 
 
+    def true_base_rotation(self, data):
+        quat_wxyz = data.qpos[3:7]
+        return Rotation.from_quat(jnp.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]]))
+
+
+    def get_joint_positions_fcp(self, data):
+        return self.server_joint_position(data.qpos[self.actuator_joint_mask_qpos])
+
+
+    def get_joint_velocities_fcp(self, data):
+        return self.server_joint_velocity(data.qvel[self.actuator_joint_mask_qvel])
+
+
+    def get_imu_angular_velocity_fcp(self, data):
+        return self.server_imu_angular_velocity(
+            data.sensordata[self.imu_angular_velocity_sensor_adr:self.imu_angular_velocity_sensor_adr + self.imu_angular_velocity_sensor_dim]
+        )
+
+
+    def get_base_position_fcp(self, data):
+        return self.server_base_position_world(data)
+
+
+    def get_base_rotation_fcp(self, data):
+        return self.server_base_rotation(data)
+
+
+    def get_joint_positions_true(self, data):
+        return data.qpos[self.actuator_joint_mask_qpos]
+
+
+    def get_joint_velocities_true(self, data):
+        return data.qvel[self.actuator_joint_mask_qvel]
+
+
+    def get_imu_angular_velocity_true(self, data):
+        return data.sensordata[self.imu_angular_velocity_sensor_adr:self.imu_angular_velocity_sensor_adr + self.imu_angular_velocity_sensor_dim]
+
+
+    def get_base_position_true(self, data):
+        return self.base_position_world(data)
+
+
+    def get_base_rotation_true(self, data):
+        return self.true_base_rotation(data)
+
+
     def relative_ball_position_base(self, data, internal_state, base_pos=None, base_yaw=None):
         ball_pos = self.ball_position_world(data)
         base_pos = self.base_position_world(data) if base_pos is None else base_pos
@@ -767,9 +814,6 @@ class DribbleMasterEnv:
             length=self.nr_substeps,
             unroll=True
         )
-        max_qvel = 100 * jnp.ones(self.initial_mj_model.nv)
-        max_qvel = max_qvel.at[self.actuator_joint_mask_qvel].set(state.internal_state["actuator_joint_max_velocities"])
-        data = data.replace(qvel=jnp.clip(data.qvel, -max_qvel, max_qvel))
 
         state.internal_state["imu_orientation_rotation"] = Rotation.from_matrix(data.site_xmat[self.imu_site_id].reshape(3, 3))
         state.internal_state["imu_orientation_rotation_inverse"] = state.internal_state["imu_orientation_rotation"].inv()
@@ -790,7 +834,7 @@ class DribbleMasterEnv:
         self.command_function.get_next_command(state.internal_state, should_sample_commands, command_key)
         
         next_observation = self.get_observation(data, mjx_model, state.internal_state, observation_key, chosen_action)
-        terminated = self.termination_function.should_terminate(state.internal_state) | jnp.any(jnp.abs(data.qvel[:3]) == 100.0)
+        terminated = self.termination_function.should_terminate(state.internal_state)
         truncated = state.info_episode_store["episode_step"] >= (self.horizon - 1)
         done = terminated | truncated
 
@@ -819,13 +863,11 @@ class DribbleMasterEnv:
 
 
     def get_observation(self, data, mjx_model, internal_state, key, action):
-        current_imu_angular_velocity = self.server_imu_angular_velocity(
-            data.sensordata[self.imu_angular_velocity_sensor_adr:self.imu_angular_velocity_sensor_adr + self.imu_angular_velocity_sensor_dim]
-        )
         ball_pos_world = self.ball_position_world(data)
         ball_vel_world = self.ball_velocity_world(data)
-        base_pos_world = self.server_base_position_world(data)
-        base_rotation = self.server_base_rotation(data)
+        current_imu_angular_velocity = self.get_imu_angular_velocity_fcp(data)
+        base_pos_world = self.get_base_position_fcp(data)
+        base_rotation = self.get_base_rotation_fcp(data)
         base_euler = base_rotation.as_euler("xyz")
         base_yaw = base_euler[2]
         base_yaw_rate = current_imu_angular_velocity[2]
@@ -833,10 +875,18 @@ class DribbleMasterEnv:
         relative_ball_position = self.relative_ball_position_base(data, internal_state, base_pos_world, base_yaw)
         ball_visible = jnp.array([jnp.asarray(internal_state["ball_visible"], dtype=jnp.float32)])
         clock_signal = self.gait_manager_function.get_phase_features(internal_state)[:2]
+        critic_imu_angular_velocity = self.get_imu_angular_velocity_true(data)
+        critic_base_pos_world = self.get_base_position_true(data)
+        critic_base_rotation = self.get_base_rotation_true(data)
+        critic_base_euler = critic_base_rotation.as_euler("xyz")
+        critic_base_yaw = critic_base_euler[2]
+        critic_base_yaw_rate = critic_imu_angular_velocity[2]
+        critic_body_orientation = jnp.array([critic_base_yaw, critic_base_euler[0], critic_base_euler[1]])
+        critic_relative_ball_position = self.relative_ball_position_base(data, internal_state, critic_base_pos_world, critic_base_yaw)
 
         observation = jnp.concatenate([
-            self.server_joint_position(data.qpos[self.actuator_joint_mask_qpos]),
-            self.server_joint_velocity(data.qvel[self.actuator_joint_mask_qvel]),
+            self.get_joint_positions_fcp(data),
+            self.get_joint_velocities_fcp(data),
             action,
             self.terrain_function.check_feet_floor_contact(data),
             internal_state["feet_time_on_ground"],
@@ -856,6 +906,14 @@ class DribbleMasterEnv:
             ball_vel_world,
             base_pos_world,
             jnp.array([base_yaw, base_yaw_rate]),
+            self.get_joint_positions_true(data),
+            self.get_joint_velocities_true(data),
+            critic_imu_angular_velocity,
+            critic_body_orientation,
+            critic_relative_ball_position,
+            critic_base_rotation.inv().apply(jnp.array([0.0, 0.0, -1.0])),
+            critic_base_pos_world,
+            jnp.array([critic_base_yaw, critic_base_yaw_rate]),
         ])
 
         # Add noise
@@ -884,6 +942,14 @@ class DribbleMasterEnv:
         observation = observation.at[self.base_position_world_obs_idx].set(jnp.clip(observation[self.base_position_world_obs_idx] / self.ball_spawn_radius, -1.0, 1.0))
         observation = observation.at[self.base_yaw_obs_idx].set(observation[self.base_yaw_obs_idx] / jnp.pi)
         observation = observation.at[self.base_yaw_rate_obs_idx].set(jnp.clip(observation[self.base_yaw_rate_obs_idx] / 50.0, -1.0, 1.0))
+        observation = observation.at[self.critic_joint_positions_true_obs_idx].set((observation[self.critic_joint_positions_true_obs_idx] - internal_state["actuator_joint_nominal_positions"]) / 3.14)
+        observation = observation.at[self.critic_joint_velocities_true_obs_idx].set(observation[self.critic_joint_velocities_true_obs_idx] / 100.0)
+        observation = observation.at[self.critic_imu_angular_vel_true_obs_idx].set(jnp.clip(observation[self.critic_imu_angular_vel_true_obs_idx] / 50.0, -1.0, 1.0))
+        observation = observation.at[self.critic_body_orientation_true_obs_idx].set(observation[self.critic_body_orientation_true_obs_idx] / jnp.pi)
+        observation = observation.at[self.critic_relative_ball_position_true_obs_idx].set(jnp.clip(observation[self.critic_relative_ball_position_true_obs_idx] / self.ball_spawn_radius, -1.0, 1.0))
+        observation = observation.at[self.critic_base_position_world_true_obs_idx].set(jnp.clip(observation[self.critic_base_position_world_true_obs_idx] / self.ball_spawn_radius, -1.0, 1.0))
+        observation = observation.at[self.critic_base_yaw_true_obs_idx].set(observation[self.critic_base_yaw_true_obs_idx] / jnp.pi)
+        observation = observation.at[self.critic_base_yaw_rate_true_obs_idx].set(jnp.clip(observation[self.critic_base_yaw_rate_true_obs_idx] / 50.0, -1.0, 1.0))
 
         observation = jnp.nan_to_num(observation, nan=0.0, posinf=0.0, neginf=0.0)
         observation = jnp.clip(observation, -10.0, 10.0)
@@ -960,6 +1026,24 @@ class DribbleMasterEnv:
         current_observation_idx += 1
         self.base_yaw_rate_obs_idx = jnp.array([current_observation_idx])
         current_observation_idx += 1
+        self.critic_joint_positions_true_obs_idx = jnp.array([current_observation_idx + i for i in range(self.nr_actuator_joints)])
+        current_observation_idx += self.nr_actuator_joints
+        self.critic_joint_velocities_true_obs_idx = jnp.array([current_observation_idx + i for i in range(self.nr_actuator_joints)])
+        current_observation_idx += self.nr_actuator_joints
+        self.critic_imu_angular_vel_true_obs_idx = jnp.array([current_observation_idx + i for i in range(self.imu_angular_velocity_sensor_dim)])
+        current_observation_idx += self.imu_angular_velocity_sensor_dim
+        self.critic_body_orientation_true_obs_idx = jnp.array([current_observation_idx + i for i in range(3)])
+        current_observation_idx += 3
+        self.critic_relative_ball_position_true_obs_idx = jnp.array([current_observation_idx + i for i in range(3)])
+        current_observation_idx += 3
+        self.critic_gravity_vector_true_obs_idx = jnp.array([current_observation_idx + i for i in range(3)])
+        current_observation_idx += 3
+        self.critic_base_position_world_true_obs_idx = jnp.array([current_observation_idx + i for i in range(3)])
+        current_observation_idx += 3
+        self.critic_base_yaw_true_obs_idx = jnp.array([current_observation_idx])
+        current_observation_idx += 1
+        self.critic_base_yaw_rate_true_obs_idx = jnp.array([current_observation_idx])
+        current_observation_idx += 1
 
         self.policy_observation_indices = jnp.concatenate([
             self.joint_positions_obs_idx,
@@ -975,27 +1059,27 @@ class DribbleMasterEnv:
         ], dtype=int)
 
         self.critic_observation_indices = jnp.concatenate([
-            self.joint_positions_obs_idx,
-            self.joint_velocities_obs_idx,
+            self.critic_joint_positions_true_obs_idx,
+            self.critic_joint_velocities_true_obs_idx,
             self.joint_previous_actions_obs_idx,
             self.feet_ground_contact_obs_idx,
             self.feet_time_on_ground_obs_idx,
             self.feet_time_in_air_obs_idx,
             self.imu_linear_vel_obs_idx,
-            self.imu_angular_vel_obs_idx,
-            self.body_orientation_obs_idx,
+            self.critic_imu_angular_vel_true_obs_idx,
+            self.critic_body_orientation_true_obs_idx,
             self.ball_velocity_command_obs_idx,
-            self.relative_ball_position_obs_idx,
+            self.critic_relative_ball_position_true_obs_idx,
             self.ball_visible_obs_idx,
             self.clock_signal_obs_idx,
-            self.gravity_vector_obs_idx,
+            self.critic_gravity_vector_true_obs_idx,
             self.critic_exteroception_obs_idx,
             self.privileged_contact_obs_idx,
             self.ball_position_world_obs_idx,
             self.ball_velocity_world_obs_idx,
-            self.base_position_world_obs_idx,
-            self.base_yaw_obs_idx,
-            self.base_yaw_rate_obs_idx,
+            self.critic_base_position_world_true_obs_idx,
+            self.critic_base_yaw_true_obs_idx,
+            self.critic_base_yaw_rate_true_obs_idx,
         ], dtype=int)
 
         return BoxSpace(low=-jnp.inf, high=jnp.inf, shape=(current_observation_idx,), dtype=jnp.float32)

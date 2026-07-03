@@ -2,6 +2,7 @@ import argparse
 import json
 import shutil
 import tempfile
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,12 +12,13 @@ import jax.numpy as jnp
 import mujoco
 import numpy as np
 import orbax.checkpoint
-from dm_control import mjcf
 from flax.training import orbax_utils
 from orbax.checkpoint import args as orbax_args
 
-from rl_x.algorithms.ppo_gru.flax_full_jit.default_config import get_config as get_algorithm_config
-from rl_x.algorithms.ppo_gru.flax_full_jit.policy import get_policy
+from rl_x.algorithms.ppo.flax_full_jit.default_config import get_config as get_ppo_algorithm_config
+from rl_x.algorithms.ppo.flax_full_jit.ppo import PPO
+from rl_x.algorithms.ppo_gru.flax_full_jit.default_config import get_config as get_gru_algorithm_config
+from rl_x.algorithms.ppo_gru.flax_full_jit.policy import get_policy as get_gru_policy
 from rl_x.environments.custom_mujoco.robocup_soccer.locomotion.mjx.create_env import create_train_and_eval_env
 from rl_x.environments.custom_mujoco.robocup_soccer.locomotion.mjx.default_config import get_config as get_environment_config
 
@@ -37,11 +39,44 @@ def parse_args():
     parser.add_argument("--cmd-vx", type=float, default=0.5)
     parser.add_argument("--cmd-vy", type=float, default=0.0)
     parser.add_argument("--cmd-wz", type=float, default=0.0)
+    parser.add_argument("--clip-max-velocity", type=float, default=None)
+    parser.add_argument("--max-velocity-per-m-factor", type=float, default=None)
     parser.add_argument("--eval-mode", action="store_true", help="Reset with eval-mode curriculum coefficient 1.0.")
     return parser.parse_args()
 
 
-def load_policy_params(checkpoint_path, config, env, initial_observation):
+def get_checkpoint_algorithm_name(checkpoint_path):
+    checkpoint_path = Path(checkpoint_path).expanduser().resolve()
+    with zipfile.ZipFile(checkpoint_path.as_posix(), "r") as archive:
+        with archive.open("config_algorithm.json", "r") as handle:
+            algorithm_config = json.load(handle)
+    return algorithm_config.get("name", "ppo_gru.flax_full_jit")
+
+
+def load_ppo_policy(checkpoint_path, env_config, env):
+    algorithm_config = get_ppo_algorithm_config("ppo.flax_full_jit")
+    config = SimpleNamespace(
+        environment=env_config,
+        algorithm=algorithm_config,
+        runner=SimpleNamespace(
+            load_model=Path(checkpoint_path).expanduser().resolve().as_posix(),
+            save_model=False,
+            track_console=False,
+            track_tb=False,
+            track_wandb=False,
+        ),
+    )
+    return PPO.load(
+        config=config,
+        train_env=env,
+        eval_env=env,
+        run_path=Path("runs/render/locomotion_mjx").resolve().as_posix(),
+        writer=None,
+        explicitly_set_algorithm_params=[],
+    )
+
+
+def load_gru_policy_params(checkpoint_path, config, env, initial_observation):
     checkpoint_path = Path(checkpoint_path).expanduser().resolve()
     tmp_dir = tempfile.mkdtemp(prefix="rlx_locomotion_")
     try:
@@ -51,7 +86,7 @@ def load_policy_params(checkpoint_path, config, env, initial_observation):
             if key in config.algorithm:
                 config.algorithm[key] = value
 
-        policy, process_action = get_policy(config, env)
+        policy, process_action = get_gru_policy(config, env)
         dummy_obs = jnp.asarray(initial_observation, dtype=jnp.float32)
         dummy_carry = policy.initialize_carry(1)
         init_params = policy.init(
@@ -82,6 +117,10 @@ def make_env(args):
     env_config.seed = args.seed
     env_config.render = False
     env_config.device = args.device
+    if args.clip_max_velocity is not None:
+        env_config.command.clip_max_velocity = args.clip_max_velocity
+    if args.max_velocity_per_m_factor is not None:
+        env_config.command.max_velocity_per_m_factor = args.max_velocity_per_m_factor
 
     config = SimpleNamespace(
         environment=env_config,
@@ -92,14 +131,7 @@ def make_env(args):
 
 
 def build_visual_model(env):
-    xml_path = (env.robot_config["directory_path"] / "data" / "plane.xml").as_posix()
-    xml_handle = mjcf.from_path(xml_path)
-    visual_model = mujoco.MjModel.from_xml_string(
-        xml=xml_handle.to_xml_string(),
-        assets=xml_handle.get_assets(),
-    )
-    visual_model.opt.timestep = env.initial_mj_model.opt.timestep
-    return visual_model
+    return env.initial_mj_model
 
 
 def make_fixed_command_fn(env, command):
@@ -171,18 +203,40 @@ def main():
     state = env.reset(jax.random.split(reset_key, 1), args.eval_mode)
     state = apply_fixed_command(state)
 
-    algorithm_config = get_algorithm_config("ppo_gru.flax_full_jit")
-    config = SimpleNamespace(algorithm=algorithm_config, environment=env_config)
-    policy, process_action, policy_params = load_policy_params(
-        args.checkpoint,
-        config,
-        env,
-        state.next_observation,
-    )
-    policy_carry = policy.initialize_carry(1)
+    algorithm_name = get_checkpoint_algorithm_name(args.checkpoint)
+    if algorithm_name == "ppo.flax_full_jit":
+        ppo_model = load_ppo_policy(args.checkpoint, env_config, env)
+        policy = None
+        process_action = None
+        policy_params = None
+        policy_carry = None
+    elif algorithm_name == "ppo_gru.flax_full_jit":
+        algorithm_config = get_gru_algorithm_config("ppo_gru.flax_full_jit")
+        config = SimpleNamespace(algorithm=algorithm_config, environment=env_config)
+        policy, process_action, policy_params = load_gru_policy_params(
+            args.checkpoint,
+            config,
+            env,
+            state.next_observation,
+        )
+        policy_carry = policy.initialize_carry(1)
+        ppo_model = None
+    else:
+        raise ValueError(f"Unsupported checkpoint algorithm: {algorithm_name}")
 
     @jax.jit
-    def rollout_step(state, carry):
+    def rollout_step_ppo(state):
+        action_mean, _ = ppo_model.policy.apply(
+            ppo_model.policy_state.params,
+            state.next_observation,
+        )
+        action = ppo_model.get_processed_action(action_mean)
+        next_state = env.step(state, action)
+        next_state = apply_fixed_command(next_state)
+        return next_state
+
+    @jax.jit
+    def rollout_step_gru(state, carry):
         action_mean, _, next_carry = policy.apply(
             policy_params,
             state.next_observation,
@@ -211,15 +265,19 @@ def main():
     if not writer.isOpened():
         raise RuntimeError(f"Could not open video writer for {video_path}")
 
-    print(f"Writing locomotion video to {video_path}")
+    print(f"Writing {algorithm_name} locomotion video to {video_path}")
     try:
         for step in range(args.steps):
-            state, policy_carry = rollout_step(state, policy_carry)
+            if algorithm_name == "ppo.flax_full_jit":
+                state = rollout_step_ppo(state)
+            else:
+                state, policy_carry = rollout_step_gru(state, policy_carry)
             if bool(np.asarray(state.terminated[0] | state.truncated[0])):
                 key, reset_key = jax.random.split(key)
                 state = env.reset(jax.random.split(reset_key, 1), args.eval_mode)
                 state = apply_fixed_command(state)
-                policy_carry = policy.initialize_carry(1)
+                if algorithm_name == "ppo_gru.flax_full_jit":
+                    policy_carry = policy.initialize_carry(1)
 
             mj_data.qpos[:] = np.asarray(state.data.qpos[0])
             mj_data.qvel[:] = np.asarray(state.data.qvel[0])

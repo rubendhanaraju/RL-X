@@ -12,8 +12,8 @@ def get_config(environment_name):
         "control_type": "pd",
         "simulator": {
             "model_source": "rcssservermj",
-            "rcssservermj_root": "/home/ruben/Documents/GitHub/rcssservermj",
-            "disable_nonfoot_contacts": True,
+            "rcssservermj_root": "/home/ruben/Documents/GitHub/RoboCup/rcssservermj",
+            "world_source": "rlx",
         },
         "training_stage": "stage_1",
         "command": {
@@ -47,15 +47,15 @@ def get_config(environment_name):
                     "termination_coeff": -10.0,
                     "reference_joint_position_coeff": 1.2,
                     "symmetric_action_coeff": -0.001,
-                    "joint_torque_coeff": -0.005,
+                    "joint_torque_coeff": -0.003,
                     "joint_speed_coeff": -0.0001,
                     "action_smoothness_coeff": -0.01,
                     "collision_coeff": 2.0,
                     "active_sensing_coeff": 0.2,
                     "chasing_coeff": 2.0,
-                    "progress_to_ball_coeff": 10.0,
+                    "progress_to_ball_coeff": 20.0,
                     "progress_to_ball_clip": 0.05,
-                    "projected_ball_velocity_coeff": 0.2,
+                    "projected_ball_velocity_coeff": 0.0,
                     "yaw_alignment_coeff": 0.2,
                     "yaw_alignment_no_ball_coeff": -0.2,
                 },
@@ -239,7 +239,7 @@ def get_config(environment_name):
         },
         "termination": {
             "type": "below_height",
-            "height_percentage_threshold": 0.7,
+            "height_percentage_threshold": 0.6,
         },
         "terrain": {
             "type": "plane",
@@ -253,7 +253,7 @@ def get_config(environment_name):
         },
         "add_goal_arrow": False,
         "timestep": 0.005,
-        "episode_length_in_seconds": 30,
+        "episode_length_in_seconds": 20,
     }
 
     return config_dict.ConfigDict(config)

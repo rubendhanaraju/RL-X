@@ -10,11 +10,22 @@ def get_config(environment_name):
         "copy_train_env_for_eval": True,
         "train_robot": "booster_t1",
         "control_type": "pd",
+        "simulator": {
+            "model_source": "rcssservermj",
+            "rcssservermj_root": "/home/ruben/Documents/GitHub/RoboCup/rcssservermj",
+            "world_source": "rlx",
+        },
         "command": {
             "type": "random",
             "sampling_type": "step_probability",
-            "max_velocity_per_m_factor": 2.0,
-            "clip_max_velocity": 1.0,
+            "distribution": "uniform",  # uniform, magnitude_bands
+            "max_velocity_per_m_factor": 4.0,
+            "clip_max_velocity": 2.0,
+            "high_band_probability": 0.5,
+            "low_band_min_fraction": 0.0,
+            "low_band_max_fraction": 0.5,
+            "high_band_min_fraction": 0.5,
+            "high_band_max_fraction": 1.0,
             "zero_clip_threshold_percentage": 0.1,
             "all_zero_chance": 0.04,
             "single_zero_chance": 0.005,
@@ -24,6 +35,7 @@ def get_config(environment_name):
             "gait_period": 1.0,
             "gait_period_randomization_width": 0.1,
         },
+        "env_curriculum_enabled": True,
         "env_curriculum_nr_levels": 100,
         "env_curriculum_level_success_episode_return": 20.0,
         "domain_randomization": {

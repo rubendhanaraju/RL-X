@@ -71,11 +71,6 @@ class DribbleMasterEnv(gym.Env):
             self._add_robot_perception_sites_to_xml(xml_handle)
             self._add_ball_to_xml(xml_handle)
 
-            # Set the MuJoCo solver iterations, the XML uses very low values by default for MJX
-            xml_handle.option.iterations = 100
-            xml_handle.option.ls_iterations = 50
-            xml_handle.option.flag.eulerdamp = "enable"
-
         if "hfield" in env_config["terrain"]["type"]:
             if self.use_rcssservermj_model:
                 raise ValueError("rcssservermj model source currently supports only plane terrain.")
@@ -515,6 +510,53 @@ class DribbleMasterEnv(gym.Env):
         return Rotation.from_quat(quat_wxyz[[1, 2, 3, 0]])
 
 
+    def true_base_rotation(self):
+        quat_wxyz = self.internal_state["data"].qpos[3:7]
+        return Rotation.from_quat(quat_wxyz[[1, 2, 3, 0]])
+
+
+    def get_joint_positions_fcp(self):
+        return self.server_joint_position(self.internal_state["data"].qpos[self.actuator_joint_mask_qpos])
+
+
+    def get_joint_velocities_fcp(self):
+        return self.server_joint_velocity(self.internal_state["data"].qvel[self.actuator_joint_mask_qvel])
+
+
+    def get_imu_angular_velocity_fcp(self):
+        return self.server_imu_angular_velocity(
+            self.internal_state["data"].sensordata[self.imu_angular_velocity_sensor_adr:self.imu_angular_velocity_sensor_adr + self.imu_angular_velocity_sensor_dim]
+        )
+
+
+    def get_base_position_fcp(self):
+        return self.server_base_position_world()
+
+
+    def get_base_rotation_fcp(self):
+        return self.server_base_rotation()
+
+
+    def get_joint_positions_true(self):
+        return self.internal_state["data"].qpos[self.actuator_joint_mask_qpos]
+
+
+    def get_joint_velocities_true(self):
+        return self.internal_state["data"].qvel[self.actuator_joint_mask_qvel]
+
+
+    def get_imu_angular_velocity_true(self):
+        return self.internal_state["data"].sensordata[self.imu_angular_velocity_sensor_adr:self.imu_angular_velocity_sensor_adr + self.imu_angular_velocity_sensor_dim]
+
+
+    def get_base_position_true(self):
+        return self.base_position_world()
+
+
+    def get_base_rotation_true(self):
+        return self.true_base_rotation()
+
+
     def relative_ball_position_base(self, base_pos=None, base_yaw=None):
         ball_pos = self.ball_position_world()
         base_pos = self.base_position_world() if base_pos is None else base_pos
@@ -676,9 +718,6 @@ class DribbleMasterEnv(gym.Env):
 
         self.internal_state["data"].ctrl = self.target_joint_positions_to_ctrl(target_joint_positions)
         mujoco.mj_step(self.internal_state["mj_model"], self.internal_state["data"], self.nr_substeps)
-        max_qvel = 100 * np.ones(self.initial_mj_model.nv)
-        max_qvel[self.actuator_joint_mask_qvel] = self.internal_state["actuator_joint_max_velocities"]
-        self.internal_state["data"].qvel = np.clip(self.internal_state["data"].qvel, -max_qvel, max_qvel)
 
         self.internal_state["imu_orientation_rotation"] = Rotation.from_matrix(self.internal_state["data"].site_xmat[self.imu_site_id].reshape(3, 3))
         self.internal_state["imu_orientation_rotation_inverse"] = self.internal_state["imu_orientation_rotation"].inv()
@@ -699,7 +738,7 @@ class DribbleMasterEnv(gym.Env):
             self.command_function.get_next_command()
 
         next_observation = self.get_observation(chosen_action)
-        terminated = self.termination_function.should_terminate() | np.any(np.abs(self.internal_state["data"].qvel[:3]) == 100.0)
+        terminated = self.termination_function.should_terminate()
         truncated = self.internal_state["info_episode_store"]["episode_step"] >= (self.horizon - 1)
         done = terminated | truncated
 
@@ -723,13 +762,11 @@ class DribbleMasterEnv(gym.Env):
 
 
     def get_observation(self, action):
-        current_imu_angular_velocity = self.server_imu_angular_velocity(
-            self.internal_state["data"].sensordata[self.imu_angular_velocity_sensor_adr:self.imu_angular_velocity_sensor_adr + self.imu_angular_velocity_sensor_dim]
-        )
         ball_pos_world = self.ball_position_world()
         ball_vel_world = self.ball_velocity_world()
-        base_pos_world = self.server_base_position_world()
-        base_rotation = self.server_base_rotation()
+        current_imu_angular_velocity = self.get_imu_angular_velocity_fcp()
+        base_pos_world = self.get_base_position_fcp()
+        base_rotation = self.get_base_rotation_fcp()
         base_euler = base_rotation.as_euler("xyz")
         base_yaw = base_euler[2]
         base_yaw_rate = current_imu_angular_velocity[2]
@@ -737,10 +774,18 @@ class DribbleMasterEnv(gym.Env):
         relative_ball_position = self.relative_ball_position_base(base_pos_world, base_yaw)
         ball_visible = np.array([np.float32(self.internal_state["ball_visible"])])
         clock_signal = self.gait_manager_function.get_phase_features()[:2]
+        critic_imu_angular_velocity = self.get_imu_angular_velocity_true()
+        critic_base_pos_world = self.get_base_position_true()
+        critic_base_rotation = self.get_base_rotation_true()
+        critic_base_euler = critic_base_rotation.as_euler("xyz")
+        critic_base_yaw = critic_base_euler[2]
+        critic_base_yaw_rate = critic_imu_angular_velocity[2]
+        critic_body_orientation = np.array([critic_base_yaw, critic_base_euler[0], critic_base_euler[1]])
+        critic_relative_ball_position = self.relative_ball_position_base(critic_base_pos_world, critic_base_yaw)
 
         observation = np.concatenate([
-            self.server_joint_position(self.internal_state["data"].qpos[self.actuator_joint_mask_qpos]),
-            self.server_joint_velocity(self.internal_state["data"].qvel[self.actuator_joint_mask_qvel]),
+            self.get_joint_positions_fcp(),
+            self.get_joint_velocities_fcp(),
             action,
             self.terrain_function.check_feet_floor_contact(),
             self.internal_state["feet_time_on_ground"],
@@ -760,6 +805,14 @@ class DribbleMasterEnv(gym.Env):
             ball_vel_world,
             base_pos_world,
             np.array([base_yaw, base_yaw_rate]),
+            self.get_joint_positions_true(),
+            self.get_joint_velocities_true(),
+            critic_imu_angular_velocity,
+            critic_body_orientation,
+            critic_relative_ball_position,
+            critic_base_rotation.inv().apply(np.array([0.0, 0.0, -1.0])),
+            critic_base_pos_world,
+            np.array([critic_base_yaw, critic_base_yaw_rate]),
         ])
 
         # Add noise
@@ -788,6 +841,14 @@ class DribbleMasterEnv(gym.Env):
         observation[self.base_position_world_obs_idx] = np.clip(observation[self.base_position_world_obs_idx] / self.ball_spawn_radius, -1.0, 1.0)
         observation[self.base_yaw_obs_idx] = observation[self.base_yaw_obs_idx] / np.pi
         observation[self.base_yaw_rate_obs_idx] = np.clip(observation[self.base_yaw_rate_obs_idx] / 50.0, -1.0, 1.0)
+        observation[self.critic_joint_positions_true_obs_idx] = (observation[self.critic_joint_positions_true_obs_idx] - self.internal_state["actuator_joint_nominal_positions"]) / 3.14
+        observation[self.critic_joint_velocities_true_obs_idx] /= 100.0
+        observation[self.critic_imu_angular_vel_true_obs_idx] = np.clip(observation[self.critic_imu_angular_vel_true_obs_idx] / 50.0, -1.0, 1.0)
+        observation[self.critic_body_orientation_true_obs_idx] = observation[self.critic_body_orientation_true_obs_idx] / np.pi
+        observation[self.critic_relative_ball_position_true_obs_idx] = np.clip(observation[self.critic_relative_ball_position_true_obs_idx] / self.ball_spawn_radius, -1.0, 1.0)
+        observation[self.critic_base_position_world_true_obs_idx] = np.clip(observation[self.critic_base_position_world_true_obs_idx] / self.ball_spawn_radius, -1.0, 1.0)
+        observation[self.critic_base_yaw_true_obs_idx] = observation[self.critic_base_yaw_true_obs_idx] / np.pi
+        observation[self.critic_base_yaw_rate_true_obs_idx] = np.clip(observation[self.critic_base_yaw_rate_true_obs_idx] / 50.0, -1.0, 1.0)
 
         observation = np.nan_to_num(observation, nan=0.0, posinf=0.0, neginf=0.0)
         observation = np.clip(observation, -10.0, 10.0)
@@ -862,6 +923,24 @@ class DribbleMasterEnv(gym.Env):
         current_observation_idx += 1
         self.base_yaw_rate_obs_idx = np.array([current_observation_idx], dtype=int)
         current_observation_idx += 1
+        self.critic_joint_positions_true_obs_idx = np.array([current_observation_idx + i for i in range(self.nr_actuator_joints)], dtype=int)
+        current_observation_idx += self.nr_actuator_joints
+        self.critic_joint_velocities_true_obs_idx = np.array([current_observation_idx + i for i in range(self.nr_actuator_joints)], dtype=int)
+        current_observation_idx += self.nr_actuator_joints
+        self.critic_imu_angular_vel_true_obs_idx = np.array([current_observation_idx + i for i in range(self.imu_angular_velocity_sensor_dim)], dtype=int)
+        current_observation_idx += self.imu_angular_velocity_sensor_dim
+        self.critic_body_orientation_true_obs_idx = np.array([current_observation_idx + i for i in range(3)], dtype=int)
+        current_observation_idx += 3
+        self.critic_relative_ball_position_true_obs_idx = np.array([current_observation_idx + i for i in range(3)], dtype=int)
+        current_observation_idx += 3
+        self.critic_gravity_vector_true_obs_idx = np.array([current_observation_idx + i for i in range(3)], dtype=int)
+        current_observation_idx += 3
+        self.critic_base_position_world_true_obs_idx = np.array([current_observation_idx + i for i in range(3)], dtype=int)
+        current_observation_idx += 3
+        self.critic_base_yaw_true_obs_idx = np.array([current_observation_idx], dtype=int)
+        current_observation_idx += 1
+        self.critic_base_yaw_rate_true_obs_idx = np.array([current_observation_idx], dtype=int)
+        current_observation_idx += 1
 
         self.policy_observation_indices = np.concatenate([
             self.joint_positions_obs_idx,
@@ -877,27 +956,27 @@ class DribbleMasterEnv(gym.Env):
         ], dtype=int)
 
         self.critic_observation_indices = np.concatenate([
-            self.joint_positions_obs_idx,
-            self.joint_velocities_obs_idx,
+            self.critic_joint_positions_true_obs_idx,
+            self.critic_joint_velocities_true_obs_idx,
             self.joint_previous_actions_obs_idx,
             self.feet_ground_contact_obs_idx,
             self.feet_time_on_ground_obs_idx,
             self.feet_time_in_air_obs_idx,
             self.imu_linear_vel_obs_idx,
-            self.imu_angular_vel_obs_idx,
-            self.body_orientation_obs_idx,
+            self.critic_imu_angular_vel_true_obs_idx,
+            self.critic_body_orientation_true_obs_idx,
             self.ball_velocity_command_obs_idx,
-            self.relative_ball_position_obs_idx,
+            self.critic_relative_ball_position_true_obs_idx,
             self.ball_visible_obs_idx,
             self.clock_signal_obs_idx,
-            self.gravity_vector_obs_idx,
+            self.critic_gravity_vector_true_obs_idx,
             self.critic_exteroception_obs_idx,
             self.privileged_contact_obs_idx,
             self.ball_position_world_obs_idx,
             self.ball_velocity_world_obs_idx,
-            self.base_position_world_obs_idx,
-            self.base_yaw_obs_idx,
-            self.base_yaw_rate_obs_idx,
+            self.critic_base_position_world_true_obs_idx,
+            self.critic_base_yaw_true_obs_idx,
+            self.critic_base_yaw_rate_true_obs_idx,
         ], dtype=int)
 
         observation_space_low = -np.ones(current_observation_idx) * np.inf

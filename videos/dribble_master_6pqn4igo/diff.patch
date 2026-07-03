@@ -1,0 +1,554 @@
+diff --git a/console.log b/console.log
+index e69de29..ac93aa3 100644
+--- a/console.log
++++ b/console.log
+@@ -0,0 +1,6 @@
++2026-07-02 16:25:08 - INFO - rcsssmj.server.server - Starting server...
++2026-07-02 16:25:08 - INFO - rcsssmj.server.communication.tcp_connection_listener - Listening for agent connections on 127.0.0.1:6122
++2026-07-02 16:25:08 - INFO - rcsssmj.server.communication.tcp_connection_listener - Listening for monitor connections on 127.0.0.1:6123
++2026-07-02 16:25:08 - INFO - rcsssmj.server.server - Starting Simulation loop.
++2026-07-02 16:25:08 - INFO - rcsssmj.server.server - Starting server... DONE!
++2026-07-02 16:25:08 - INFO - rcsssmj.server.server - Running a parallel simulation update loop.
+diff --git a/experiments/render_locomotion_mjx.py b/experiments/render_locomotion_mjx.py
+index c46f98e..5d043a1 100644
+--- a/experiments/render_locomotion_mjx.py
++++ b/experiments/render_locomotion_mjx.py
+@@ -37,6 +37,8 @@ def parse_args():
+     parser.add_argument("--cmd-vx", type=float, default=0.5)
+     parser.add_argument("--cmd-vy", type=float, default=0.0)
+     parser.add_argument("--cmd-wz", type=float, default=0.0)
++    parser.add_argument("--clip-max-velocity", type=float, default=None)
++    parser.add_argument("--max-velocity-per-m-factor", type=float, default=None)
+     parser.add_argument("--eval-mode", action="store_true", help="Reset with eval-mode curriculum coefficient 1.0.")
+     return parser.parse_args()
+ 
+@@ -82,6 +84,10 @@ def make_env(args):
+     env_config.seed = args.seed
+     env_config.render = False
+     env_config.device = args.device
++    if args.clip_max_velocity is not None:
++        env_config.command.clip_max_velocity = args.clip_max_velocity
++    if args.max_velocity_per_m_factor is not None:
++        env_config.command.max_velocity_per_m_factor = args.max_velocity_per_m_factor
+ 
+     config = SimpleNamespace(
+         environment=env_config,
+diff --git a/rl_x/algorithms/ppo_gru/flax_full_jit/default_config.py b/rl_x/algorithms/ppo_gru/flax_full_jit/default_config.py
+index f942c6e..b072fb7 100644
+--- a/rl_x/algorithms/ppo_gru/flax_full_jit/default_config.py
++++ b/rl_x/algorithms/ppo_gru/flax_full_jit/default_config.py
+@@ -26,6 +26,7 @@ def get_config(algorithm_name):
+     config.gru_obs_combine_method = "concat"  # concat, film
+     config.share_gru_obs_encoder = False
+     config.action_clipping_and_rescaling = False
++    config.reset_optimizer_on_load = False
+     config.evaluation_and_save_frequency = 17301504  # -1 to disable
+     config.evaluation_active = True
+ 
+diff --git a/rl_x/algorithms/ppo_gru/flax_full_jit/ppo_gru.py b/rl_x/algorithms/ppo_gru/flax_full_jit/ppo_gru.py
+index afcda0b..b49d197 100644
+--- a/rl_x/algorithms/ppo_gru/flax_full_jit/ppo_gru.py
++++ b/rl_x/algorithms/ppo_gru/flax_full_jit/ppo_gru.py
+@@ -50,6 +50,7 @@ class PPO_GRU:
+         self.critic_coef = config.algorithm.critic_coef
+         self.max_grad_norm = config.algorithm.max_grad_norm
+         self.std_dev = config.algorithm.std_dev
++        self.reset_optimizer_on_load = config.algorithm.reset_optimizer_on_load
+         self.evaluation_and_save_frequency = config.algorithm.evaluation_and_save_frequency
+         self.evaluation_active = config.algorithm.evaluation_active
+         self.batch_size = config.environment.nr_envs * config.algorithm.nr_steps
+@@ -81,7 +82,7 @@ class PPO_GRU:
+ 
+         def linear_schedule(count):
+             fraction = 1.0 - (count // (self.nr_minibatches * self.nr_epochs)) / self.nr_updates
+-            return self.learning_rate * fraction
++            return self.learning_rate * jnp.maximum(fraction, 0.0)
+ 
+         learning_rate = linear_schedule if self.anneal_learning_rate else self.learning_rate
+ 
+@@ -412,16 +413,31 @@ class PPO_GRU:
+                 config.algorithm[key] = value
+         model = PPO_GRU(config, train_env, eval_env, run_path, writer)
+ 
+-        target = {
+-            "policy": model.policy_state,
+-            "critic": model.critic_state
+-        }
+-        restore_args = orbax_utils.restore_args_from_target(target)
+         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+-        checkpoint = checkpointer.restore(checkpoint_dir, item=target, restore_args=restore_args)
+-
+-        model.policy_state = checkpoint["policy"]
+-        model.critic_state = checkpoint["critic"]
++        if config.algorithm.reset_optimizer_on_load:
++            target = {
++                "policy": {"params": model.policy_state.params},
++                "critic": {"params": model.critic_state.params},
++            }
++            restore_args = orbax_utils.restore_args_from_target(target)
++            checkpoint = checkpointer.restore(
++                checkpoint_dir,
++                item=target,
++                restore_args=restore_args,
++                partial_restore=True,
++            )
++            model.policy_state = model.policy_state.replace(params=checkpoint["policy"]["params"])
++            model.critic_state = model.critic_state.replace(params=checkpoint["critic"]["params"])
++        else:
++            target = {
++                "policy": model.policy_state,
++                "critic": model.critic_state
++            }
++            restore_args = orbax_utils.restore_args_from_target(target)
++            checkpoint = checkpointer.restore(checkpoint_dir, item=target, restore_args=restore_args)
++
++            model.policy_state = checkpoint["policy"]
++            model.critic_state = checkpoint["critic"]
+ 
+         shutil.rmtree(checkpoint_dir)
+ 
+diff --git a/rl_x/environments/custom_mujoco/robocup_soccer/dribble_master/mjx/default_config.py b/rl_x/environments/custom_mujoco/robocup_soccer/dribble_master/mjx/default_config.py
+index 432801b..5dd37d0 100644
+--- a/rl_x/environments/custom_mujoco/robocup_soccer/dribble_master/mjx/default_config.py
++++ b/rl_x/environments/custom_mujoco/robocup_soccer/dribble_master/mjx/default_config.py
+@@ -12,7 +12,7 @@ def get_config(environment_name):
+         "train_robot": "booster_t1",
+         "control_type": "pd",
+         "simulator": {
+-            "model_source": "rcssservermj",
++            "model_source": "rlx",
+             "rcssservermj_root": "/home/ruben/Documents/GitHub/rcssservermj",
+         },
+         "training_stage": "stage_1",
+@@ -47,16 +47,15 @@ def get_config(environment_name):
+                     "termination_coeff": -10.0,
+                     "reference_joint_position_coeff": 1.2,
+                     "symmetric_action_coeff": -0.001,
+-                    "joint_torque_coeff":
+-                        -0.005,  #before for the one that was fast -0.003 ... increasing this penalty makes him go slower
++                    "joint_torque_coeff": -0.003,
+                     "joint_speed_coeff": -0.0001,
+                     "action_smoothness_coeff": -0.01,
+                     "collision_coeff": 2.0,
+                     "active_sensing_coeff": 0.2,
+                     "chasing_coeff": 2.0,
+-                    "progress_to_ball_coeff": 20.0,  #before 10
++                    "progress_to_ball_coeff": 20.0,
+                     "progress_to_ball_clip": 0.05,
+-                    "projected_ball_velocity_coeff": 0.2,
++                    "projected_ball_velocity_coeff": 0.0,
+                     "yaw_alignment_coeff": 0.2,
+                     "yaw_alignment_no_ball_coeff": -0.2,
+                 },
+@@ -234,7 +233,7 @@ def get_config(environment_name):
+             "yaw_alignment_no_ball_max_yaw_rate": 2.0,
+             "reference_joint_target_scale": 0.17,
+             "reference_joint_double_support_threshold": 0.1,
+-            "feet_phase_swing_height": 0.09,  #this was 0.12, maybe we need less
++            "feet_phase_swing_height": 0.12,
+             "feet_phase_tracking_sigma": 0.1,
+             "feet_height_on_flat_ground": 0.01,
+         },
+@@ -254,7 +253,7 @@ def get_config(environment_name):
+         },
+         "add_goal_arrow": False,
+         "timestep": 0.005,
+-        "episode_length_in_seconds": 30,
++        "episode_length_in_seconds": 20,
+     }
+ 
+     return config_dict.ConfigDict(config)
+diff --git a/rl_x/environments/custom_mujoco/robocup_soccer/dribble_master/mjx/environment.py b/rl_x/environments/custom_mujoco/robocup_soccer/dribble_master/mjx/environment.py
+index 7ef6f46..fefcd71 100644
+--- a/rl_x/environments/custom_mujoco/robocup_soccer/dribble_master/mjx/environment.py
++++ b/rl_x/environments/custom_mujoco/robocup_soccer/dribble_master/mjx/environment.py
+@@ -767,9 +767,6 @@ class DribbleMasterEnv:
+             length=self.nr_substeps,
+             unroll=True
+         )
+-        max_qvel = 100 * jnp.ones(self.initial_mj_model.nv)
+-        max_qvel = max_qvel.at[self.actuator_joint_mask_qvel].set(state.internal_state["actuator_joint_max_velocities"])
+-        data = data.replace(qvel=jnp.clip(data.qvel, -max_qvel, max_qvel))
+ 
+         state.internal_state["imu_orientation_rotation"] = Rotation.from_matrix(data.site_xmat[self.imu_site_id].reshape(3, 3))
+         state.internal_state["imu_orientation_rotation_inverse"] = state.internal_state["imu_orientation_rotation"].inv()
+@@ -790,7 +787,7 @@ class DribbleMasterEnv:
+         self.command_function.get_next_command(state.internal_state, should_sample_commands, command_key)
+         
+         next_observation = self.get_observation(data, mjx_model, state.internal_state, observation_key, chosen_action)
+-        terminated = self.termination_function.should_terminate(state.internal_state) | jnp.any(jnp.abs(data.qvel[:3]) == 100.0)
++        terminated = self.termination_function.should_terminate(state.internal_state)
+         truncated = state.info_episode_store["episode_step"] >= (self.horizon - 1)
+         done = terminated | truncated
+ 
+diff --git a/rl_x/environments/custom_mujoco/robocup_soccer/dribble_master/mujoco/default_config.py b/rl_x/environments/custom_mujoco/robocup_soccer/dribble_master/mujoco/default_config.py
+index 6b1aa04..faa16e5 100644
+--- a/rl_x/environments/custom_mujoco/robocup_soccer/dribble_master/mujoco/default_config.py
++++ b/rl_x/environments/custom_mujoco/robocup_soccer/dribble_master/mujoco/default_config.py
+@@ -11,7 +11,7 @@ def get_config(environment_name):
+         "train_robot": "booster_t1",
+         "control_type": "pd",
+         "simulator": {
+-            "model_source": "rcssservermj",
++            "model_source": "rlx",
+             "rcssservermj_root": "/home/ruben/Documents/GitHub/rcssservermj",
+             "disable_nonfoot_contacts": True,
+         },
+@@ -47,15 +47,15 @@ def get_config(environment_name):
+                     "termination_coeff": -10.0,
+                     "reference_joint_position_coeff": 1.2,
+                     "symmetric_action_coeff": -0.001,
+-                    "joint_torque_coeff": -0.005,
++                    "joint_torque_coeff": -0.003,
+                     "joint_speed_coeff": -0.0001,
+                     "action_smoothness_coeff": -0.01,
+                     "collision_coeff": 2.0,
+                     "active_sensing_coeff": 0.2,
+                     "chasing_coeff": 2.0,
+-                    "progress_to_ball_coeff": 10.0,
++                    "progress_to_ball_coeff": 20.0,
+                     "progress_to_ball_clip": 0.05,
+-                    "projected_ball_velocity_coeff": 0.2,
++                    "projected_ball_velocity_coeff": 0.0,
+                     "yaw_alignment_coeff": 0.2,
+                     "yaw_alignment_no_ball_coeff": -0.2,
+                 },
+@@ -239,7 +239,7 @@ def get_config(environment_name):
+         },
+         "termination": {
+             "type": "below_height",
+-            "height_percentage_threshold": 0.7,
++            "height_percentage_threshold": 0.6,
+         },
+         "terrain": {
+             "type": "plane",
+@@ -253,7 +253,7 @@ def get_config(environment_name):
+         },
+         "add_goal_arrow": False,
+         "timestep": 0.005,
+-        "episode_length_in_seconds": 30,
++        "episode_length_in_seconds": 20,
+     }
+ 
+     return config_dict.ConfigDict(config)
+diff --git a/rl_x/environments/custom_mujoco/robocup_soccer/dribble_master/mujoco/environment.py b/rl_x/environments/custom_mujoco/robocup_soccer/dribble_master/mujoco/environment.py
+index 911483f..9f4e26b 100644
+--- a/rl_x/environments/custom_mujoco/robocup_soccer/dribble_master/mujoco/environment.py
++++ b/rl_x/environments/custom_mujoco/robocup_soccer/dribble_master/mujoco/environment.py
+@@ -676,9 +676,6 @@ class DribbleMasterEnv(gym.Env):
+ 
+         self.internal_state["data"].ctrl = self.target_joint_positions_to_ctrl(target_joint_positions)
+         mujoco.mj_step(self.internal_state["mj_model"], self.internal_state["data"], self.nr_substeps)
+-        max_qvel = 100 * np.ones(self.initial_mj_model.nv)
+-        max_qvel[self.actuator_joint_mask_qvel] = self.internal_state["actuator_joint_max_velocities"]
+-        self.internal_state["data"].qvel = np.clip(self.internal_state["data"].qvel, -max_qvel, max_qvel)
+ 
+         self.internal_state["imu_orientation_rotation"] = Rotation.from_matrix(self.internal_state["data"].site_xmat[self.imu_site_id].reshape(3, 3))
+         self.internal_state["imu_orientation_rotation_inverse"] = self.internal_state["imu_orientation_rotation"].inv()
+@@ -699,7 +696,7 @@ class DribbleMasterEnv(gym.Env):
+             self.command_function.get_next_command()
+ 
+         next_observation = self.get_observation(chosen_action)
+-        terminated = self.termination_function.should_terminate() | np.any(np.abs(self.internal_state["data"].qvel[:3]) == 100.0)
++        terminated = self.termination_function.should_terminate()
+         truncated = self.internal_state["info_episode_store"]["episode_step"] >= (self.horizon - 1)
+         done = terminated | truncated
+ 
+diff --git a/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mjx/command_functions/random.py b/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mjx/command_functions/random.py
+index 64419d9..048d1b9 100644
+--- a/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mjx/command_functions/random.py
++++ b/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mjx/command_functions/random.py
+@@ -6,8 +6,14 @@ import jax.numpy as jnp
+ class RandomCommands:
+     def __init__(self, env):
+         self.env = env
++        self.distribution = self.env.env_config["command"]["distribution"]
+         self.max_velocity_per_m_factor = self.env.env_config["command"]["max_velocity_per_m_factor"]
+         self.clip_max_velocity = self.env.env_config["command"]["clip_max_velocity"]
++        self.high_band_probability = self.env.env_config["command"]["high_band_probability"]
++        self.low_band_min_fraction = self.env.env_config["command"]["low_band_min_fraction"]
++        self.low_band_max_fraction = self.env.env_config["command"]["low_band_max_fraction"]
++        self.high_band_min_fraction = self.env.env_config["command"]["high_band_min_fraction"]
++        self.high_band_max_fraction = self.env.env_config["command"]["high_band_max_fraction"]
+         self.zero_clip_threshold_percentage = self.env.env_config["command"]["zero_clip_threshold_percentage"]
+         self.all_zero_chance = self.env.env_config["command"]["all_zero_chance"]
+         self.single_zero_chance = self.env.env_config["command"]["single_zero_chance"]
+@@ -22,9 +28,29 @@ class RandomCommands:
+ 
+ 
+     def get_next_command(self, internal_state, should_sample_commands, subkey):
+-        velocity_sampling_key, all_zeroing_key, single_zeroing_key = jax.random.split(subkey, 3)
+-
+-        goal_velocities = jax.random.uniform(velocity_sampling_key, (3,), minval=-internal_state["max_command_velocity"], maxval=internal_state["max_command_velocity"])
++        velocity_sampling_key, band_key, low_fraction_key, high_fraction_key, sign_key, all_zeroing_key, single_zeroing_key = jax.random.split(subkey, 7)
++
++        if self.distribution == "magnitude_bands":
++            use_high_band = jax.random.bernoulli(band_key, self.high_band_probability, shape=(3,))
++            low_fraction = jax.random.uniform(
++                low_fraction_key,
++                (3,),
++                minval=self.low_band_min_fraction,
++                maxval=self.low_band_max_fraction,
++            )
++            high_fraction = jax.random.uniform(
++                high_fraction_key,
++                (3,),
++                minval=self.high_band_min_fraction,
++                maxval=self.high_band_max_fraction,
++            )
++            velocity_fraction = jnp.where(use_high_band, high_fraction, low_fraction)
++            velocity_sign = jnp.where(jax.random.bernoulli(sign_key, 0.5, shape=(3,)), 1.0, -1.0)
++            goal_velocities = velocity_sign * velocity_fraction * internal_state["max_command_velocity"]
++        elif self.distribution == "uniform":
++            goal_velocities = jax.random.uniform(velocity_sampling_key, (3,), minval=-internal_state["max_command_velocity"], maxval=internal_state["max_command_velocity"])
++        else:
++            raise ValueError(f"Unknown command distribution: {self.distribution}")
+         goal_velocities = jnp.where(jnp.abs(goal_velocities) < (self.zero_clip_threshold_percentage * internal_state["max_command_velocity"]), 0.0, goal_velocities)
+         goal_velocities = jnp.where(jax.random.bernoulli(all_zeroing_key, self.all_zero_chance), jnp.zeros(3), goal_velocities)
+         goal_velocities = jnp.where(jax.random.uniform(single_zeroing_key, (3,)) < self.single_zero_chance, 0.0, goal_velocities)
+diff --git a/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mjx/default_config.py b/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mjx/default_config.py
+index aa92c4a..1d2066d 100644
+--- a/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mjx/default_config.py
++++ b/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mjx/default_config.py
+@@ -14,8 +14,14 @@ def get_config(environment_name):
+         "command": {
+             "type": "random",
+             "sampling_type": "step_probability",
++            "distribution": "uniform",  # uniform, magnitude_bands
+             "max_velocity_per_m_factor": 2.0,
+             "clip_max_velocity": 1.0,
++            "high_band_probability": 0.5,
++            "low_band_min_fraction": 0.0,
++            "low_band_max_fraction": 0.5,
++            "high_band_min_fraction": 0.5,
++            "high_band_max_fraction": 1.0,
+             "zero_clip_threshold_percentage": 0.1,
+             "all_zero_chance": 0.04,
+             "single_zero_chance": 0.005,
+@@ -25,6 +31,7 @@ def get_config(environment_name):
+             "gait_period": 1.0,
+             "gait_period_randomization_width": 0.1,
+         },
++        "env_curriculum_enabled": True,
+         "env_curriculum_nr_levels": 100,
+         "env_curriculum_level_success_episode_return": 20.0,
+         "domain_randomization": {
+diff --git a/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mjx/environment.py b/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mjx/environment.py
+index c5f93ed..f0db308 100644
+--- a/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mjx/environment.py
++++ b/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mjx/environment.py
+@@ -143,6 +143,7 @@ class LocomotionEnv:
+ 
+         self.robot_dimensions_mean = 0.5  # This can be calculated smartly...
+ 
++        self.env_curriculum_enabled = env_config["env_curriculum_enabled"]
+         self.env_curriculum_nr_levels = env_config["env_curriculum_nr_levels"]
+         self.env_curriculum_level_success_episode_return = env_config["env_curriculum_level_success_episode_return"]
+ 
+@@ -278,7 +279,7 @@ class LocomotionEnv:
+ 
+         internal_state = {
+             "in_eval_mode": eval_mode,
+-            "env_curriculum_coeff": jnp.where(eval_mode, 1.0, 0.0),
++            "env_curriculum_coeff": jnp.where(eval_mode | (not self.env_curriculum_enabled), 1.0, 0.0),
+             "env_curriculum_levels_in_a_row": 0.0,
+             "actuator_joint_nominal_positions": self.initial_qpos[self.actuator_joint_mask_qpos],
+             "actuator_joint_max_velocities": self.actuator_joint_max_velocities,
+@@ -338,19 +339,23 @@ class LocomotionEnv:
+ 
+         new_state = state
+ 
+-        episode_success = new_state.info_episode_store["episode_return"] >= self.env_curriculum_level_success_episode_return
+-        new_state.internal_state["env_curriculum_levels_in_a_row"] = jnp.where(episode_success,
+-            jnp.where(new_state.internal_state["env_curriculum_levels_in_a_row"] >= 0,
+-                new_state.internal_state["env_curriculum_levels_in_a_row"] + 1,
+-                1
+-            ),
+-            jnp.where(new_state.internal_state["env_curriculum_levels_in_a_row"] < 0,
+-                new_state.internal_state["env_curriculum_levels_in_a_row"] - 1,
+-                -1
++        if self.env_curriculum_enabled:
++            episode_success = new_state.info_episode_store["episode_return"] >= self.env_curriculum_level_success_episode_return
++            new_state.internal_state["env_curriculum_levels_in_a_row"] = jnp.where(episode_success,
++                jnp.where(new_state.internal_state["env_curriculum_levels_in_a_row"] >= 0,
++                    new_state.internal_state["env_curriculum_levels_in_a_row"] + 1,
++                    1
++                ),
++                jnp.where(new_state.internal_state["env_curriculum_levels_in_a_row"] < 0,
++                    new_state.internal_state["env_curriculum_levels_in_a_row"] - 1,
++                    -1
++                )
+             )
+-        )
+-        new_state.internal_state["env_curriculum_coeff"] =  jnp.clip(new_state.internal_state["env_curriculum_coeff"] + new_state.internal_state["env_curriculum_levels_in_a_row"] / self.env_curriculum_nr_levels, 0.0, 1.0)
+-        new_state.internal_state["env_curriculum_coeff"] = jnp.where(new_state.internal_state["in_eval_mode"], 1.0, new_state.internal_state["env_curriculum_coeff"])
++            new_state.internal_state["env_curriculum_coeff"] =  jnp.clip(new_state.internal_state["env_curriculum_coeff"] + new_state.internal_state["env_curriculum_levels_in_a_row"] / self.env_curriculum_nr_levels, 0.0, 1.0)
++            new_state.internal_state["env_curriculum_coeff"] = jnp.where(new_state.internal_state["in_eval_mode"], 1.0, new_state.internal_state["env_curriculum_coeff"])
++        else:
++            new_state.internal_state["env_curriculum_levels_in_a_row"] = 0.0
++            new_state.internal_state["env_curriculum_coeff"] = 1.0
+ 
+         new_state.internal_state["imu_orientation_rotation"] = Rotation.from_matrix(data.site_xmat[self.imu_site_id].reshape(3, 3))
+         new_state.internal_state["imu_orientation_rotation_inverse"] = new_state.internal_state["imu_orientation_rotation"].inv()
+diff --git a/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mjx/termination_functions/below_height.py b/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mjx/termination_functions/below_height.py
+index d75e892..3eb62c4 100644
+--- a/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mjx/termination_functions/below_height.py
++++ b/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mjx/termination_functions/below_height.py
+@@ -6,6 +6,10 @@ class BelowHeightTermination:
+ 
+ 
+     def should_terminate(self, internal_state):
+-        below_height = internal_state["robot_imu_height_over_ground"] < ((1 - internal_state["env_curriculum_coeff"]) * self.height_percentage_threshold * internal_state["robot_nominal_imu_height_over_ground"])
++        if self.env.env_curriculum_enabled:
++            height_threshold = (1 - internal_state["env_curriculum_coeff"]) * self.height_percentage_threshold * internal_state["robot_nominal_imu_height_over_ground"]
++        else:
++            height_threshold = self.height_percentage_threshold * internal_state["robot_nominal_imu_height_over_ground"]
++        below_height = internal_state["robot_imu_height_over_ground"] < height_threshold
+ 
+         return below_height
+diff --git a/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mujoco/command_functions/random.py b/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mujoco/command_functions/random.py
+index efd3d79..43f7d0a 100644
+--- a/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mujoco/command_functions/random.py
++++ b/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mujoco/command_functions/random.py
+@@ -4,8 +4,14 @@ import numpy as np
+ class RandomCommands:
+     def __init__(self, env):
+         self.env = env
++        self.distribution = self.env.env_config["command"]["distribution"]
+         self.max_velocity_per_m_factor = self.env.env_config["command"]["max_velocity_per_m_factor"]
+         self.clip_max_velocity = self.env.env_config["command"]["clip_max_velocity"]
++        self.high_band_probability = self.env.env_config["command"]["high_band_probability"]
++        self.low_band_min_fraction = self.env.env_config["command"]["low_band_min_fraction"]
++        self.low_band_max_fraction = self.env.env_config["command"]["low_band_max_fraction"]
++        self.high_band_min_fraction = self.env.env_config["command"]["high_band_min_fraction"]
++        self.high_band_max_fraction = self.env.env_config["command"]["high_band_max_fraction"]
+         self.zero_clip_threshold_percentage = self.env.env_config["command"]["zero_clip_threshold_percentage"]
+         self.all_zero_chance = self.env.env_config["command"]["all_zero_chance"]
+         self.single_zero_chance = self.env.env_config["command"]["single_zero_chance"]
+@@ -20,7 +26,25 @@ class RandomCommands:
+ 
+ 
+     def get_next_command(self):
+-        goal_velocities = self.env.np_rng.uniform(size=(3,), low=-self.env.internal_state["max_command_velocity"], high=self.env.internal_state["max_command_velocity"])
++        if self.distribution == "magnitude_bands":
++            use_high_band = self.env.np_rng.uniform(size=(3,)) < self.high_band_probability
++            low_fraction = self.env.np_rng.uniform(
++                size=(3,),
++                low=self.low_band_min_fraction,
++                high=self.low_band_max_fraction,
++            )
++            high_fraction = self.env.np_rng.uniform(
++                size=(3,),
++                low=self.high_band_min_fraction,
++                high=self.high_band_max_fraction,
++            )
++            velocity_fraction = np.where(use_high_band, high_fraction, low_fraction)
++            velocity_sign = np.where(self.env.np_rng.uniform(size=(3,)) < 0.5, 1.0, -1.0)
++            goal_velocities = velocity_sign * velocity_fraction * self.env.internal_state["max_command_velocity"]
++        elif self.distribution == "uniform":
++            goal_velocities = self.env.np_rng.uniform(size=(3,), low=-self.env.internal_state["max_command_velocity"], high=self.env.internal_state["max_command_velocity"])
++        else:
++            raise ValueError(f"Unknown command distribution: {self.distribution}")
+         goal_velocities = np.where(np.abs(goal_velocities) < (self.zero_clip_threshold_percentage * self.env.internal_state["max_command_velocity"]), 0.0, goal_velocities)
+         goal_velocities = np.where(self.env.np_rng.binomial(n=1, p=self.all_zero_chance), np.zeros(3), goal_velocities)
+         goal_velocities = np.where(self.env.np_rng.uniform(size=(3,)) < self.single_zero_chance, 0.0, goal_velocities)
+diff --git a/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mujoco/default_config.py b/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mujoco/default_config.py
+index 1e221c6..0dd2348 100644
+--- a/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mujoco/default_config.py
++++ b/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mujoco/default_config.py
+@@ -13,8 +13,14 @@ def get_config(environment_name):
+         "command": {
+             "type": "random",
+             "sampling_type": "step_probability",
++            "distribution": "uniform",  # uniform, magnitude_bands
+             "max_velocity_per_m_factor": 2.0,
+             "clip_max_velocity": 1.0,
++            "high_band_probability": 0.5,
++            "low_band_min_fraction": 0.0,
++            "low_band_max_fraction": 0.5,
++            "high_band_min_fraction": 0.5,
++            "high_band_max_fraction": 1.0,
+             "zero_clip_threshold_percentage": 0.1,
+             "all_zero_chance": 0.04,
+             "single_zero_chance": 0.005,
+@@ -24,6 +30,7 @@ def get_config(environment_name):
+             "gait_period": 1.0,
+             "gait_period_randomization_width": 0.1,
+         },
++        "env_curriculum_enabled": True,
+         "env_curriculum_nr_levels": 100,
+         "env_curriculum_level_success_episode_return": 20.0,
+         "domain_randomization": {
+diff --git a/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mujoco/environment.py b/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mujoco/environment.py
+index d5612a4..f01feb8 100644
+--- a/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mujoco/environment.py
++++ b/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mujoco/environment.py
+@@ -127,6 +127,7 @@ class LocomotionEnv(gym.Env):
+ 
+         self.robot_dimensions_mean = 0.5  # This can be calculated smartly...
+ 
++        self.env_curriculum_enabled = env_config["env_curriculum_enabled"]
+         self.env_curriculum_nr_levels = env_config["env_curriculum_nr_levels"]
+         self.env_curriculum_level_success_episode_return = env_config["env_curriculum_level_success_episode_return"]
+ 
+@@ -170,7 +171,7 @@ class LocomotionEnv(gym.Env):
+             "mj_model": deepcopy(self.initial_mj_model),
+             "data": mujoco.MjData(self.initial_mj_model),
+             "in_eval_mode": eval_mode,
+-            "env_curriculum_coeff": np.where(eval_mode, 1.0, 0.0),
++            "env_curriculum_coeff": np.where(eval_mode or not self.env_curriculum_enabled, 1.0, 0.0),
+             "env_curriculum_levels_in_a_row": 0.0,
+             "actuator_joint_nominal_positions": self.initial_qpos[self.actuator_joint_mask_qpos],
+             "actuator_joint_max_velocities": self.actuator_joint_max_velocities,
+@@ -275,19 +276,23 @@ class LocomotionEnv(gym.Env):
+         self.internal_state["data"].ctrl = np.zeros(self.nr_actuator_joints)
+         mujoco.mj_forward(self.internal_state["mj_model"], self.internal_state["data"])
+ 
+-        episode_success = self.internal_state["info_episode_store"]["episode_return"] >= 10.0
+-        self.internal_state["env_curriculum_levels_in_a_row"] = np.where(episode_success,
+-            np.where(self.internal_state["env_curriculum_levels_in_a_row"] >= 0,
+-                self.internal_state["env_curriculum_levels_in_a_row"] + 1,
+-                1
+-            ),
+-            np.where(self.internal_state["env_curriculum_levels_in_a_row"] < 0,
+-                self.internal_state["env_curriculum_levels_in_a_row"] - 1,
+-                -1
++        if self.env_curriculum_enabled:
++            episode_success = self.internal_state["info_episode_store"]["episode_return"] >= self.env_curriculum_level_success_episode_return
++            self.internal_state["env_curriculum_levels_in_a_row"] = np.where(episode_success,
++                np.where(self.internal_state["env_curriculum_levels_in_a_row"] >= 0,
++                    self.internal_state["env_curriculum_levels_in_a_row"] + 1,
++                    1
++                ),
++                np.where(self.internal_state["env_curriculum_levels_in_a_row"] < 0,
++                    self.internal_state["env_curriculum_levels_in_a_row"] - 1,
++                    -1
++                )
+             )
+-        )
+-        self.internal_state["env_curriculum_coeff"] =  np.clip(self.internal_state["env_curriculum_coeff"] + self.internal_state["env_curriculum_levels_in_a_row"] / self.env_curriculum_nr_levels, 0.0, 1.0)
+-        self.internal_state["env_curriculum_coeff"] = np.where(self.internal_state["in_eval_mode"], 1.0, self.internal_state["env_curriculum_coeff"])
++            self.internal_state["env_curriculum_coeff"] =  np.clip(self.internal_state["env_curriculum_coeff"] + self.internal_state["env_curriculum_levels_in_a_row"] / self.env_curriculum_nr_levels, 0.0, 1.0)
++            self.internal_state["env_curriculum_coeff"] = np.where(self.internal_state["in_eval_mode"], 1.0, self.internal_state["env_curriculum_coeff"])
++        else:
++            self.internal_state["env_curriculum_levels_in_a_row"] = 0.0
++            self.internal_state["env_curriculum_coeff"] = 1.0
+         
+         self.internal_state["imu_orientation_rotation"] = Rotation.from_matrix(self.internal_state["data"].site_xmat[self.imu_site_id].reshape(3, 3))
+         self.internal_state["imu_orientation_rotation_inverse"] = self.internal_state["imu_orientation_rotation"].inv()
+diff --git a/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mujoco/termination_functions/below_height.py b/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mujoco/termination_functions/below_height.py
+index f98d5f4..89ea6cc 100644
+--- a/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mujoco/termination_functions/below_height.py
++++ b/rl_x/environments/custom_mujoco/robocup_soccer/locomotion/mujoco/termination_functions/below_height.py
+@@ -6,6 +6,10 @@ class BelowHeightTermination:
+ 
+ 
+     def should_terminate(self):
+-        below_height = self.env.internal_state["robot_imu_height_over_ground"] < ((1 - self.env.internal_state["env_curriculum_coeff"]) * self.height_percentage_threshold * self.env.internal_state["robot_nominal_imu_height_over_ground"])
++        if self.env.env_curriculum_enabled:
++            height_threshold = (1 - self.env.internal_state["env_curriculum_coeff"]) * self.height_percentage_threshold * self.env.internal_state["robot_nominal_imu_height_over_ground"]
++        else:
++            height_threshold = self.height_percentage_threshold * self.env.internal_state["robot_nominal_imu_height_over_ground"]
++        below_height = self.env.internal_state["robot_imu_height_over_ground"] < height_threshold
+ 
+         return below_height

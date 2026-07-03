@@ -1,0 +1,58 @@
+{
+  "os": "Linux-6.9.3-76060903-generic-x86_64-with-glibc2.35",
+  "python": "CPython 3.11.4",
+  "startedAt": "2026-07-02T17:03:05.191458Z",
+  "args": [
+    "--algorithm.total_timesteps=250000000",
+    "--algorithm.gamma=0.994",
+    "--algorithm.gae_lambda=0.7",
+    "--algorithm.entropy_coef=0.002",
+    "--algorithm.max_grad_norm=3.0",
+    "--environment.training_stage=stage_1",
+    "--environment.seed=0",
+    "--runner.track_console=False",
+    "--runner.track_tb=False",
+    "--runner.track_wandb=True",
+    "--runner.save_model=True",
+    "--runner.wandb_entity=rubendhanaraju-university-of-porto",
+    "--runner.project_name=robocup_soccer_dribble_master",
+    "--runner.exp_name=stage1_raw_server_dynamics_scratch",
+    "--runner.run_name=seed0_no_qvel_clamp_scratch",
+    "--runner.notes=DribbleMaster stage 1 from scratch with qvel clamp removed to match rcssservermj deployment"
+  ],
+  "program": "/home/ruben/Documents/GitHub/RoboCup/RL-X/experiments/experiment.py",
+  "codePath": "experiments/experiment.py",
+  "codePathLocal": "experiments/experiment.py",
+  "git": {
+    "remote": "https://github.com/rubendhanaraju/RL-X.git",
+    "commit": "6dec2adbaa8105c76db3dffc1076395ba0c957ed"
+  },
+  "email": "up201706353@edu.fc.up.pt",
+  "root": "/home/ruben/Documents/GitHub/RoboCup/RL-X",
+  "host": "pop-os",
+  "executable": "/home/ruben/anaconda3/envs/rlx/bin/python",
+  "cpu_count": 24,
+  "cpu_count_logical": 32,
+  "gpu": "NVIDIA GeForce RTX 4080 Laptop GPU",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "686456041472",
+      "used": "510997417984"
+    }
+  },
+  "memory": {
+    "total": "31218667520"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 4080 Laptop GPU",
+      "memoryTotal": "12878610432",
+      "cudaCores": 7424,
+      "architecture": "Ada",
+      "uuid": "GPU-8d19f654-f266-f6e5-234f-bf6d52d2a31d"
+    }
+  ],
+  "cudaVersion": "12.7",
+  "writerId": "v3me28holgopioj9lzfj1x1es8cm6ofq"
+}

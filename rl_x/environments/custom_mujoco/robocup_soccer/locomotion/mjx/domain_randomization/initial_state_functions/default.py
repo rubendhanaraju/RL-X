@@ -14,7 +14,7 @@ class DefaultDRInitialState:
 
         qvel = jnp.zeros(self.env.initial_mjx_model.nv)
 
-        data = self.env.mjx_data.replace(qpos=qpos, qvel=qvel, ctrl=jnp.zeros(self.env.nr_actuator_joints))
+        data = self.env.mjx_data.replace(qpos=qpos, qvel=qvel, ctrl=self.env.zero_ctrl())
         data, _ = jax.lax.scan(
             f=lambda data_, _: (mjx.forward(mjx_model, data_), None),
             init=data,

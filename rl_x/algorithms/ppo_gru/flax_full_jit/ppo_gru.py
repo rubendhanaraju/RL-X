@@ -50,6 +50,7 @@ class PPO_GRU:
         self.critic_coef = config.algorithm.critic_coef
         self.max_grad_norm = config.algorithm.max_grad_norm
         self.std_dev = config.algorithm.std_dev
+        self.reset_optimizer_on_load = config.algorithm.reset_optimizer_on_load
         self.evaluation_and_save_frequency = config.algorithm.evaluation_and_save_frequency
         self.evaluation_active = config.algorithm.evaluation_active
         self.batch_size = config.environment.nr_envs * config.algorithm.nr_steps
@@ -81,7 +82,7 @@ class PPO_GRU:
 
         def linear_schedule(count):
             fraction = 1.0 - (count // (self.nr_minibatches * self.nr_epochs)) / self.nr_updates
-            return self.learning_rate * fraction
+            return self.learning_rate * jnp.maximum(fraction, 0.0)
 
         learning_rate = linear_schedule if self.anneal_learning_rate else self.learning_rate
 
@@ -412,16 +413,31 @@ class PPO_GRU:
                 config.algorithm[key] = value
         model = PPO_GRU(config, train_env, eval_env, run_path, writer)
 
-        target = {
-            "policy": model.policy_state,
-            "critic": model.critic_state
-        }
-        restore_args = orbax_utils.restore_args_from_target(target)
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-        checkpoint = checkpointer.restore(checkpoint_dir, item=target, restore_args=restore_args)
+        if config.algorithm.reset_optimizer_on_load:
+            target = {
+                "policy": {"params": model.policy_state.params},
+                "critic": {"params": model.critic_state.params},
+            }
+            restore_args = orbax_utils.restore_args_from_target(target)
+            checkpoint = checkpointer.restore(
+                checkpoint_dir,
+                item=target,
+                restore_args=restore_args,
+                partial_restore=True,
+            )
+            model.policy_state = model.policy_state.replace(params=checkpoint["policy"]["params"])
+            model.critic_state = model.critic_state.replace(params=checkpoint["critic"]["params"])
+        else:
+            target = {
+                "policy": model.policy_state,
+                "critic": model.critic_state
+            }
+            restore_args = orbax_utils.restore_args_from_target(target)
+            checkpoint = checkpointer.restore(checkpoint_dir, item=target, restore_args=restore_args)
 
-        model.policy_state = checkpoint["policy"]
-        model.critic_state = checkpoint["critic"]
+            model.policy_state = checkpoint["policy"]
+            model.critic_state = checkpoint["critic"]
 
         shutil.rmtree(checkpoint_dir)
 

@@ -485,6 +485,53 @@ class VelocityMasterEnv(gym.Env):
         return Rotation.from_quat(quat_wxyz[[1, 2, 3, 0]])
 
 
+    def true_base_rotation(self):
+        quat_wxyz = self.internal_state["data"].qpos[3:7]
+        return Rotation.from_quat(quat_wxyz[[1, 2, 3, 0]])
+
+
+    def get_joint_positions_fcp(self):
+        return self.server_joint_position(self.internal_state["data"].qpos[self.actuator_joint_mask_qpos])
+
+
+    def get_joint_velocities_fcp(self):
+        return self.server_joint_velocity(self.internal_state["data"].qvel[self.actuator_joint_mask_qvel])
+
+
+    def get_imu_angular_velocity_fcp(self):
+        return self.server_imu_angular_velocity(
+            self.internal_state["data"].sensordata[self.imu_angular_velocity_sensor_adr:self.imu_angular_velocity_sensor_adr + self.imu_angular_velocity_sensor_dim]
+        )
+
+
+    def get_base_position_fcp(self):
+        return self.server_base_position_world()
+
+
+    def get_base_rotation_fcp(self):
+        return self.server_base_rotation()
+
+
+    def get_joint_positions_true(self):
+        return self.internal_state["data"].qpos[self.actuator_joint_mask_qpos]
+
+
+    def get_joint_velocities_true(self):
+        return self.internal_state["data"].qvel[self.actuator_joint_mask_qvel]
+
+
+    def get_imu_angular_velocity_true(self):
+        return self.internal_state["data"].sensordata[self.imu_angular_velocity_sensor_adr:self.imu_angular_velocity_sensor_adr + self.imu_angular_velocity_sensor_dim]
+
+
+    def get_base_position_true(self):
+        return self.base_position_world()
+
+
+    def get_base_rotation_true(self):
+        return self.true_base_rotation()
+
+
     def relative_point_position_base(self, base_pos=None, base_yaw=None):
         point_pos = self.point_position_world()
         base_pos = self.base_position_world() if base_pos is None else base_pos
@@ -759,20 +806,23 @@ class VelocityMasterEnv(gym.Env):
 
 
     def get_observation(self, action):
-        current_imu_angular_velocity = self.server_imu_angular_velocity(
-            self.internal_state["data"].sensordata[self.imu_angular_velocity_sensor_adr:self.imu_angular_velocity_sensor_adr + self.imu_angular_velocity_sensor_dim]
-        )
-        base_pos_world = self.server_base_position_world()
-        base_rotation = self.server_base_rotation()
+        current_imu_angular_velocity = self.get_imu_angular_velocity_fcp()
+        base_rotation = self.get_base_rotation_fcp()
         base_euler = base_rotation.as_euler("xyz")
         base_yaw = base_euler[2]
         base_yaw_rate = current_imu_angular_velocity[2]
         body_orientation = np.array([base_yaw, base_euler[0], base_euler[1]])
         clock_signal = self.gait_manager_function.get_phase_features()[:2]
+        critic_imu_angular_velocity = self.get_imu_angular_velocity_true()
+        critic_base_rotation = self.get_base_rotation_true()
+        critic_base_euler = critic_base_rotation.as_euler("xyz")
+        critic_base_yaw = critic_base_euler[2]
+        critic_base_yaw_rate = critic_imu_angular_velocity[2]
+        critic_body_orientation = np.array([critic_base_yaw, critic_base_euler[0], critic_base_euler[1]])
 
         observation = np.concatenate([
-            self.server_joint_position(self.internal_state["data"].qpos[self.actuator_joint_mask_qpos]),
-            self.server_joint_velocity(self.internal_state["data"].qvel[self.actuator_joint_mask_qvel]),
+            self.get_joint_positions_fcp(),
+            self.get_joint_velocities_fcp(),
             action,
             self.terrain_function.check_feet_floor_contact(),
             self.internal_state["feet_time_on_ground"],
@@ -787,6 +837,12 @@ class VelocityMasterEnv(gym.Env):
             np.array([self.critic_exteroceptive_observation_function.get_exteroceptive_observation()]).reshape(-1),
             self.privileged_contact_observation(),
             np.array([base_yaw, base_yaw_rate]),
+            self.get_joint_positions_true(),
+            self.get_joint_velocities_true(),
+            critic_imu_angular_velocity,
+            critic_body_orientation,
+            critic_base_rotation.inv().apply(np.array([0.0, 0.0, -1.0])),
+            np.array([critic_base_yaw, critic_base_yaw_rate]),
         ])
 
         # Add noise
@@ -810,6 +866,12 @@ class VelocityMasterEnv(gym.Env):
         observation[self.privileged_contact_obs_idx] = (observation[self.privileged_contact_obs_idx] / 0.5) - 1.0
         observation[self.base_yaw_obs_idx] = observation[self.base_yaw_obs_idx] / np.pi
         observation[self.base_yaw_rate_obs_idx] = np.clip(observation[self.base_yaw_rate_obs_idx] / 50.0, -1.0, 1.0)
+        observation[self.critic_joint_positions_true_obs_idx] = (observation[self.critic_joint_positions_true_obs_idx] - self.internal_state["actuator_joint_nominal_positions"]) / 3.14
+        observation[self.critic_joint_velocities_true_obs_idx] /= 100.0
+        observation[self.critic_imu_angular_vel_true_obs_idx] = np.clip(observation[self.critic_imu_angular_vel_true_obs_idx] / 50.0, -1.0, 1.0)
+        observation[self.critic_body_orientation_true_obs_idx] = observation[self.critic_body_orientation_true_obs_idx] / np.pi
+        observation[self.critic_base_yaw_true_obs_idx] = observation[self.critic_base_yaw_true_obs_idx] / np.pi
+        observation[self.critic_base_yaw_rate_true_obs_idx] = np.clip(observation[self.critic_base_yaw_rate_true_obs_idx] / 50.0, -1.0, 1.0)
 
         observation = np.nan_to_num(observation, nan=0.0, posinf=0.0, neginf=0.0)
         observation = np.clip(observation, -10.0, 10.0)
@@ -878,6 +940,20 @@ class VelocityMasterEnv(gym.Env):
         current_observation_idx += 1
         self.base_yaw_rate_obs_idx = np.array([current_observation_idx], dtype=int)
         current_observation_idx += 1
+        self.critic_joint_positions_true_obs_idx = np.array([current_observation_idx + i for i in range(self.nr_actuator_joints)], dtype=int)
+        current_observation_idx += self.nr_actuator_joints
+        self.critic_joint_velocities_true_obs_idx = np.array([current_observation_idx + i for i in range(self.nr_actuator_joints)], dtype=int)
+        current_observation_idx += self.nr_actuator_joints
+        self.critic_imu_angular_vel_true_obs_idx = np.array([current_observation_idx + i for i in range(self.imu_angular_velocity_sensor_dim)], dtype=int)
+        current_observation_idx += self.imu_angular_velocity_sensor_dim
+        self.critic_body_orientation_true_obs_idx = np.array([current_observation_idx + i for i in range(3)], dtype=int)
+        current_observation_idx += 3
+        self.critic_gravity_vector_true_obs_idx = np.array([current_observation_idx + i for i in range(3)], dtype=int)
+        current_observation_idx += 3
+        self.critic_base_yaw_true_obs_idx = np.array([current_observation_idx], dtype=int)
+        current_observation_idx += 1
+        self.critic_base_yaw_rate_true_obs_idx = np.array([current_observation_idx], dtype=int)
+        current_observation_idx += 1
 
         self.policy_observation_indices = np.concatenate([
             self.joint_positions_obs_idx,
@@ -891,22 +967,22 @@ class VelocityMasterEnv(gym.Env):
         ], dtype=int)
 
         self.critic_observation_indices = np.concatenate([
-            self.joint_positions_obs_idx,
-            self.joint_velocities_obs_idx,
+            self.critic_joint_positions_true_obs_idx,
+            self.critic_joint_velocities_true_obs_idx,
             self.joint_previous_actions_obs_idx,
             self.feet_ground_contact_obs_idx,
             self.feet_time_on_ground_obs_idx,
             self.feet_time_in_air_obs_idx,
             self.imu_linear_vel_obs_idx,
-            self.imu_angular_vel_obs_idx,
-            self.body_orientation_obs_idx,
+            self.critic_imu_angular_vel_true_obs_idx,
+            self.critic_body_orientation_true_obs_idx,
             self.goal_velocities_obs_idx,
             self.clock_signal_obs_idx,
-            self.gravity_vector_obs_idx,
+            self.critic_gravity_vector_true_obs_idx,
             self.critic_exteroception_obs_idx,
             self.privileged_contact_obs_idx,
-            self.base_yaw_obs_idx,
-            self.base_yaw_rate_obs_idx,
+            self.critic_base_yaw_true_obs_idx,
+            self.critic_base_yaw_rate_true_obs_idx,
         ], dtype=int)
 
         observation_space_low = -np.ones(current_observation_idx) * np.inf

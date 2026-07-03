@@ -6,6 +6,10 @@ class BelowHeightTermination:
 
 
     def should_terminate(self, internal_state):
-        below_height = internal_state["robot_imu_height_over_ground"] < ((1 - internal_state["env_curriculum_coeff"]) * self.height_percentage_threshold * internal_state["robot_nominal_imu_height_over_ground"])
+        if self.env.env_curriculum_enabled:
+            height_threshold = (1 - internal_state["env_curriculum_coeff"]) * self.height_percentage_threshold * internal_state["robot_nominal_imu_height_over_ground"]
+        else:
+            height_threshold = self.height_percentage_threshold * internal_state["robot_nominal_imu_height_over_ground"]
+        below_height = internal_state["robot_imu_height_over_ground"] < height_threshold
 
         return below_height

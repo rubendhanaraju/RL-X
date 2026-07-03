@@ -13,7 +13,8 @@ def get_config(environment_name):
         "control_type": "pd",
         "simulator": {
             "model_source": "rcssservermj",
-            "rcssservermj_root": "/home/ruben/Documents/GitHub/rcssservermj",
+            "rcssservermj_root": "/home/ruben/Documents/GitHub/RoboCup/rcssservermj",
+            "world_source": "rlx",
         },
         "training_stage": "stage_1",
         "command": {
@@ -47,16 +48,15 @@ def get_config(environment_name):
                     "termination_coeff": -10.0,
                     "reference_joint_position_coeff": 1.2,
                     "symmetric_action_coeff": -0.001,
-                    "joint_torque_coeff":
-                        -0.005,  #before for the one that was fast -0.003 ... increasing this penalty makes him go slower
+                    "joint_torque_coeff": -0.003,
                     "joint_speed_coeff": -0.0001,
                     "action_smoothness_coeff": -0.01,
                     "collision_coeff": 2.0,
                     "active_sensing_coeff": 0.2,
                     "chasing_coeff": 2.0,
-                    "progress_to_ball_coeff": 20.0,  #before 10
+                    "progress_to_ball_coeff": 20.0,
                     "progress_to_ball_clip": 0.05,
-                    "projected_ball_velocity_coeff": 0.2,
+                    "projected_ball_velocity_coeff": 0.0,
                     "yaw_alignment_coeff": 0.2,
                     "yaw_alignment_no_ball_coeff": -0.2,
                 },
@@ -234,7 +234,7 @@ def get_config(environment_name):
             "yaw_alignment_no_ball_max_yaw_rate": 2.0,
             "reference_joint_target_scale": 0.17,
             "reference_joint_double_support_threshold": 0.1,
-            "feet_phase_swing_height": 0.09,  #this was 0.12, maybe we need less
+            "feet_phase_swing_height": 0.12,
             "feet_phase_tracking_sigma": 0.1,
             "feet_height_on_flat_ground": 0.01,
         },
@@ -254,7 +254,7 @@ def get_config(environment_name):
         },
         "add_goal_arrow": False,
         "timestep": 0.005,
-        "episode_length_in_seconds": 30,
+        "episode_length_in_seconds": 20,
     }
 
     return config_dict.ConfigDict(config)
