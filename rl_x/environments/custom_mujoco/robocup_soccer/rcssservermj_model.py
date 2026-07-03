@@ -9,6 +9,8 @@ from dm_control import mjcf
 
 
 DEFAULT_RCSSSERVERMJ_ROOT = "/home/ruben/Documents/GitHub/RoboCup/rcssservermj"
+RCSSSERVERMJ_ROBOT_XML = Path("src") / "rcsssmj" / "resources" / "robots" / "T1" / "robot.xml"
+RCSSSERVERMJ_PACKAGE_DIR = Path("src") / "rcsssmj"
 
 
 SERVER_T1_NOMINAL_JOINT_POSITIONS = {
@@ -40,10 +42,43 @@ SERVER_T1_NOMINAL_JOINT_POSITIONS = {
 
 def rcssservermj_root(env_config):
     simulator_config = env_config.get("simulator", {})
-    root = simulator_config.get("rcssservermj_root")
-    if root:
-        return Path(root).expanduser()
-    return Path(os.environ.get("RCSSSERVERMJ_ROOT", DEFAULT_RCSSSERVERMJ_ROOT)).expanduser()
+    candidates = []
+
+    configured_root = simulator_config.get("rcssservermj_root")
+    if configured_root:
+        candidates.append(Path(configured_root).expanduser())
+
+    env_root = os.environ.get("RCSSSERVERMJ_ROOT")
+    if env_root:
+        candidates.append(Path(env_root).expanduser())
+
+    repo_root = Path(__file__).resolve().parents[4]
+    candidates.extend(
+        [
+            Path.cwd() / "rcssservermj",
+            Path.cwd().parent / "rcssservermj",
+            repo_root / "rcssservermj",
+            repo_root.parent / "rcssservermj",
+            repo_root.parent / "RoboCup" / "rcssservermj",
+            Path(DEFAULT_RCSSSERVERMJ_ROOT).expanduser(),
+        ]
+    )
+
+    tried = []
+    for candidate in candidates:
+        candidate = candidate.expanduser().resolve()
+        if candidate in tried:
+            continue
+        tried.append(candidate)
+        if (candidate / RCSSSERVERMJ_ROBOT_XML).is_file() or (candidate / RCSSSERVERMJ_PACKAGE_DIR).is_dir():
+            return candidate
+
+    tried_paths = "\n".join(f"  - {candidate}" for candidate in tried)
+    raise FileNotFoundError(
+        "Could not find rcssservermj. Set RCSSSERVERMJ_ROOT or "
+        "--environment.simulator.rcssservermj_root to the rcssservermj checkout.\n"
+        f"Tried:\n{tried_paths}"
+    )
 
 
 def uses_rcssservermj_model(env_config):
@@ -132,7 +167,7 @@ def build_server_soccer_world_spec(root, env_config, *, object_type):
 
 
 def build_rlx_training_world_xml(root, *, object_type):
-    robot_path = root / "src" / "rcsssmj" / "resources" / "robots" / "T1" / "robot.xml"
+    robot_path = root / RCSSSERVERMJ_ROBOT_XML
     if not robot_path.is_file():
         raise FileNotFoundError(f"Could not find rcssservermj T1 model: {robot_path}")
 

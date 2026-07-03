@@ -13,7 +13,7 @@ def get_config(environment_name):
         "control_type": "pd",
         "simulator": {
             "model_source": "rcssservermj",
-            "rcssservermj_root": "/home/ruben/Documents/GitHub/RoboCup/rcssservermj",
+            "rcssservermj_root": "",
             "world_source": "rlx",
         },
         "training_stage": "stage_1",
